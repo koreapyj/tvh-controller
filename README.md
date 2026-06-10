@@ -83,6 +83,14 @@ prediction for upcoming recordings, and Google Drive archiving via rclone.
   restarts — in-flight rclone jobs are re-attached, lost ones re-verified.
   A wrong-host guard refuses to upload a file whose size doesn't match the
   recording. One transfer at a time per host.
+- **Auto-upload** (`autoUpload` in config.yaml): every finished recording's
+  best copy is archived automatically. It waits while any instance is still
+  recording its copy of the same broadcast, ignores failed copies, never
+  second-guesses manual uploads, and never auto-retries a failed upload.
+  If an instance is unreachable at decision time the pick is marked
+  *incomplete*; once the instance returns, the pick is re-evaluated and a
+  strictly better copy replaces the archived one (the old remote object is
+  deleted only after the replacement verifies).
 
 ## Layout
 

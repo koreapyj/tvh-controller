@@ -31,6 +31,13 @@ instances:
 rclone:
   remote: "gdrive:tvh-archive"
 
+# Automatically archive every finished recording's best copy. Waits while a
+# sibling instance is still recording the same broadcast, ignores failed
+# copies; failed auto-uploads are retried manually only.
+# autoUpload: true
+# ...or with the post-finish settling grace (seconds, default 120):
+# autoUpload: { enabled: true, graceSeconds: 120 }
+
 # Autorec rule start times are displayed converted into broadcast (EIT) time
 # when it differs from the tvheadend host's timezone. The EIT zone is read
 # from tvheadend itself (each network's "EIT time offset"); the host timezone

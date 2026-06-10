@@ -34,6 +34,7 @@ import { EventBus } from './state/events.js';
 import { InstanceCache } from './state/instanceCache.js';
 import { SyncEngine } from './sync/engine.js';
 import { InstancePoller } from './tvh/poller.js';
+import { AutoUploader } from './uploads/autoUpload.js';
 import { UploadDispatcher } from './uploads/dispatcher.js';
 import { UploadLedger } from './uploads/ledger.js';
 
@@ -75,6 +76,10 @@ async function main(): Promise<void> {
 
   const ledger = db ? new UploadLedger(db, config.overlapThreshold) : null;
   const dispatcher = ledger ? new UploadDispatcher(config, ledger, bus) : null;
+  const autoUploader =
+    ledger && dispatcher && config.autoUpload.enabled
+      ? new AutoUploader(config, cache, ledger, dispatcher, bus)
+      : null;
 
   const ctx: AppContext = { config, db, cache, bus, pollers, sync, ledger, dispatcher };
 
@@ -108,8 +113,10 @@ async function main(): Promise<void> {
 
   for (const [, poller] of pollers) poller.start();
   if (dispatcher) await dispatcher.resume();
+  autoUploader?.start();
 
   const close = async (): Promise<void> => {
+    autoUploader?.stop();
     for (const [, poller] of pollers) poller.stop();
     // give in-flight upload loops a bounded chance to checkpoint before the
     // database goes away; resume() recovers anything still unfinished

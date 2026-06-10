@@ -19,8 +19,10 @@
 import { randomUUID } from 'node:crypto';
 import {
   compareRecordings,
+  type RecordingIdentity,
   type TvhDvrEntry,
   type UploadJob,
+  type UploadOrigin,
   type UploadStatus,
 } from '@tvhc/shared';
 import type { Db } from '../db/db.js';
@@ -32,6 +34,14 @@ export interface ClaimResult {
   existing?: UploadJob;
 }
 
+export interface ClaimOptions {
+  origin?: UploadOrigin;
+  incompletePick?: boolean;
+  /** remote object replaced by this upload; deleted after this one verifies */
+  supersedesPath?: string | null;
+}
+
+/** statuses that block a new claim for the same broadcast (superseded and failed do not) */
 const ACTIVE_OR_DONE: UploadStatus[] = ['queued', 'dispatched', 'uploading', 'verifying', 'done'];
 
 function rowToJob(r: {
@@ -51,6 +61,9 @@ function rowToJob(r: {
   attempts: number;
   error: string | null;
   possible_duplicate: number;
+  origin: string;
+  incomplete_pick: number;
+  supersedes_path: string | null;
   created_at: Date;
   updated_at: Date;
   completed_at: Date | null;
@@ -72,6 +85,9 @@ function rowToJob(r: {
     attempts: r.attempts,
     error: r.error,
     possibleDuplicate: !!r.possible_duplicate,
+    origin: (r.origin === 'auto' ? 'auto' : 'manual') as UploadOrigin,
+    incompletePick: !!r.incomplete_pick,
+    supersedesPath: r.supersedes_path,
     createdAt: r.created_at.toISOString(),
     updatedAt: r.updated_at.toISOString(),
     completedAt: r.completed_at?.toISOString() ?? null,
@@ -108,6 +124,7 @@ export class UploadLedger {
     entry: TvhDvrEntry,
     localPath: string,
     remotePath: string,
+    opts: ClaimOptions = {},
   ): Promise<ClaimResult> {
     return this.serialize(async () => {
       const channelname = entry.channelname ?? '';
@@ -172,6 +189,9 @@ export class UploadLedger {
           rclone_job_id: null,
           error: null,
           possible_duplicate: possibleDuplicate ? 1 : 0,
+          origin: opts.origin ?? 'manual',
+          incomplete_pick: opts.incompletePick ? 1 : 0,
+          supersedes_path: opts.supersedesPath ?? null,
           created_at: now(),
           updated_at: now(),
           completed_at: null,
@@ -221,6 +241,60 @@ export class UploadLedger {
     await this.db
       .updateTable('uploads')
       .set({ ...patch, updated_at: now() })
+      .where('id', '=', id)
+      .execute();
+  }
+
+  /**
+   * Any upload row covering the broadcast, INCLUDING failed and superseded
+   * ones. The auto-uploader uses this: a failed row means "manual retry
+   * only", a manual row means "never second-guess the user's pick".
+   */
+  async findAnyByIdentity(identity: RecordingIdentity): Promise<UploadJob | null> {
+    const candidates = await this.db
+      .selectFrom('uploads')
+      .selectAll()
+      .where('channelname', '=', identity.channelname)
+      .where('start', '<', identity.stop)
+      .where('stop', '>', identity.start)
+      .execute();
+    for (const c of candidates) {
+      const verdict = compareRecordings(
+        identity,
+        {
+          channelname: c.channelname,
+          start: Number(c.start),
+          stop: Number(c.stop),
+          title: c.title ?? undefined,
+        },
+        this.overlapThreshold,
+      );
+      if (verdict.isDuplicate) return rowToJob(c);
+    }
+    return null;
+  }
+
+  /** mark a row as replaced by a later upload of a better copy */
+  async supersede(id: string): Promise<void> {
+    await this.update(id, { status: 'superseded' });
+  }
+
+  /** done auto-uploads whose copy was picked while an instance was unreachable */
+  async listIncompletePicks(): Promise<UploadJob[]> {
+    const rows = await this.db
+      .selectFrom('uploads')
+      .selectAll()
+      .where('incomplete_pick', '=', 1)
+      .where('origin', '=', 'auto')
+      .where('status', '=', 'done')
+      .execute();
+    return rows.map(rowToJob);
+  }
+
+  async clearIncompletePick(id: string): Promise<void> {
+    await this.db
+      .updateTable('uploads')
+      .set({ incomplete_pick: 0, updated_at: now() })
       .where('id', '=', id)
       .execute();
   }

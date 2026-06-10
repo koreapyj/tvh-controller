@@ -21,7 +21,7 @@ import type { AppConfig } from '../config.js';
 import type { EventBus } from '../state/events.js';
 import { RcloneRcClient } from './rcloneRc.js';
 import { buildRemotePath } from './remotePath.js';
-import type { UploadLedger } from './ledger.js';
+import type { ClaimOptions, UploadLedger } from './ledger.js';
 
 const POLL_MS = 3000;
 const MAX_ATTEMPTS = 3;
@@ -84,6 +84,7 @@ export class UploadDispatcher {
     instanceId: string,
     entry: TvhDvrEntry,
     storageRoots: string[] = [],
+    claimOpts: ClaimOptions = {},
   ): Promise<{ job?: UploadJob; duplicateOf?: UploadJob }> {
     const client = this.clients.get(instanceId);
     if (!client) throw new Error(`instance "${instanceId}" has no rclone rcd configured`);
@@ -91,7 +92,7 @@ export class UploadDispatcher {
 
     const localPath = client.mapLocalPath(entry.filename);
     const remotePath = buildRemotePath(this.cfg.rclone.remote, entry, storageRoots);
-    const result = await this.ledger.claim(instanceId, entry, localPath, remotePath);
+    const result = await this.ledger.claim(instanceId, entry, localPath, remotePath, claimOpts);
     if (!result.claimed) return { duplicateOf: result.existing };
 
     void this.drive(result.upload!.id, instanceId);
@@ -296,6 +297,14 @@ export class UploadDispatcher {
             progress: localSize,
             completed_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
           });
+          // this upload replaced a previous copy of the same broadcast —
+          // remove the old remote object only now that the new one verified
+          const supersedes = job.supersedesPath;
+          if (supersedes && supersedes !== job.remotePath) {
+            await client.deleteFile(supersedes).catch((err) => {
+              console.error(`upload ${uploadId}: superseded object not removed (${supersedes}):`, err);
+            });
+          }
           await this.publish(uploadId);
           return;
         }

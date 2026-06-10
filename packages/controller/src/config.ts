@@ -48,6 +48,8 @@ export interface AppConfig {
   port: number;
   pollIntervals: { dvr: number; autorec: number; topology: number };
   overlapThreshold: number;
+  /** auto-archive every finished recording's best copy */
+  autoUpload: { enabled: boolean; graceSeconds: number };
   webDistDir?: string;
 }
 
@@ -61,6 +63,7 @@ interface RawConfig {
   database?: string;
   instances: RawInstance[];
   rclone?: { remote?: string };
+  autoUpload?: boolean | { enabled?: boolean; graceSeconds?: number };
   pollIntervals?: Partial<AppConfig['pollIntervals']>;
   overlapThreshold?: number;
 }
@@ -123,6 +126,10 @@ export function loadConfig(path = defaultConfigPath()): AppConfig {
       topology: raw.pollIntervals?.topology ?? 600_000,
     },
     overlapThreshold: raw.overlapThreshold ?? 0.7,
+    autoUpload:
+      typeof raw.autoUpload === 'object'
+        ? { enabled: raw.autoUpload.enabled ?? true, graceSeconds: raw.autoUpload.graceSeconds ?? 120 }
+        : { enabled: raw.autoUpload ?? false, graceSeconds: 120 },
     webDistDir: process.env.WEB_DIST_DIR,
   };
 }

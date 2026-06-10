@@ -161,4 +161,10 @@ export class RcloneRcClient {
     const dst = RcloneRcClient.splitRemote(remotePath);
     return this.statSize(dst.fs, dst.remote);
   }
+
+  /** delete a remote object (used when a better copy supersedes an upload) */
+  async deleteFile(remotePath: string): Promise<void> {
+    const dst = RcloneRcClient.splitRemote(remotePath);
+    await this.call('/operations/deletefile', { fs: dst.fs, remote: dst.remote });
+  }
 }

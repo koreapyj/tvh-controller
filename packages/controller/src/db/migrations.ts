@@ -130,6 +130,30 @@ migrations['004_soft_delete_rules'] = {
   },
 };
 
+migrations['005_auto_upload'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .alterTable('uploads')
+      .addColumn('origin', 'varchar(8)', (c) => c.notNull().defaultTo('manual'))
+      .execute();
+    // pick made while an instance was unreachable — re-evaluated on recovery
+    await db.schema
+      .alterTable('uploads')
+      .addColumn('incomplete_pick', 'boolean', (c) => c.notNull().defaultTo(0))
+      .execute();
+    // remote object replaced by this upload; deleted after this one verifies
+    await db.schema
+      .alterTable('uploads')
+      .addColumn('supersedes_path', 'varchar(1024)')
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('uploads').dropColumn('supersedes_path').execute();
+    await db.schema.alterTable('uploads').dropColumn('incomplete_pick').execute();
+    await db.schema.alterTable('uploads').dropColumn('origin').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

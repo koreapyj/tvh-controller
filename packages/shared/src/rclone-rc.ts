@@ -63,7 +63,11 @@ export type UploadStatus =
   | 'verifying'
   | 'done'
   | 'failed'
-  | 'cancelled';
+  | 'cancelled'
+  /** replaced by a later upload of a better copy of the same broadcast */
+  | 'superseded';
+
+export type UploadOrigin = 'manual' | 'auto';
 
 export interface UploadJob {
   id: string;
@@ -83,6 +87,15 @@ export interface UploadJob {
   error: string | null;
   /** advisory: a similar title was already uploaded around the same time */
   possibleDuplicate: boolean;
+  origin: UploadOrigin;
+  /**
+   * the copy was picked while some instance was unreachable; once every
+   * instance is reachable the pick is re-evaluated (and possibly superseded
+   * by a better copy)
+   */
+  incompletePick: boolean;
+  /** remote object this upload replaces; deleted after this upload verifies */
+  supersedesPath: string | null;
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;

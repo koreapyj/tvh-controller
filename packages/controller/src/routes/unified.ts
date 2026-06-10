@@ -151,7 +151,7 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
       for (const item of items) {
         const upload = uploads.find(
           (u) =>
-            (u.status !== 'failed' && u.status !== 'cancelled') &&
+            (u.status !== 'failed' && u.status !== 'cancelled' && u.status !== 'superseded') &&
             (item.uuids.has(u.dvrUuid) ||
               compareRecordings(
                 { channelname: item.channelname, start: item.start, stop: item.stop, title: item.title },

@@ -1,0 +1,289 @@
+/*
+ * tvh-controller - Centralized tvheadend controller
+ * Copyright (C) 2026 Yoonji Park
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import {
+  compareRecordings,
+  type RecordingIdentity,
+  type TvhDvrEntry,
+} from '@tvhc/shared';
+import type { AppConfig } from '../config.js';
+import type { EventBus } from '../state/events.js';
+import type { InstanceCache, InstanceSnapshot } from '../state/instanceCache.js';
+import type { UploadDispatcher } from './dispatcher.js';
+import type { UploadLedger } from './ledger.js';
+
+// ---------------------------------------------------------------------------
+// pure decision helpers (exported for tests)
+// ---------------------------------------------------------------------------
+
+export interface CandidateCopy {
+  instanceId: string;
+  entry: TvhDvrEntry;
+}
+
+export function identityOf(e: TvhDvrEntry): RecordingIdentity {
+  return { channelname: e.channelname ?? '', start: e.start, stop: e.stop, title: e.disp_title };
+}
+
+/**
+ * True while any instance still has a matching entry in its upcoming grid
+ * (scheduled or actively recording) — the broadcast is not settled yet and
+ * the upload must wait so best-copy selection sees every candidate.
+ */
+export function isStillPending(
+  identity: RecordingIdentity,
+  upcomingByInstance: Map<string, TvhDvrEntry[]>,
+  threshold: number,
+): boolean {
+  for (const entries of upcomingByInstance.values()) {
+    for (const e of entries) {
+      if (compareRecordings(identity, identityOf(e), threshold).isDuplicate) return true;
+    }
+  }
+  return false;
+}
+
+/** finished copies of the broadcast across instances (failed copies are simply absent here) */
+export function siblingCopies(
+  identity: RecordingIdentity,
+  finishedByInstance: Map<string, TvhDvrEntry[]>,
+  threshold: number,
+): CandidateCopy[] {
+  const copies: CandidateCopy[] = [];
+  for (const [instanceId, entries] of finishedByInstance) {
+    for (const entry of entries) {
+      if (!entry.filename) continue;
+      if (compareRecordings(identity, identityOf(entry), threshold).isDuplicate) {
+        copies.push({ instanceId, entry });
+      }
+    }
+  }
+  return copies;
+}
+
+/** fewest stream errors → fewest data errors → largest file (mirrors the UI's best-copy button) */
+export function copyRank(e: TvhDvrEntry): [number, number, number] {
+  return [e.errors ?? 0, e.data_errors ?? 0, -(e.filesize ?? 0)];
+}
+
+export function strictlyBetter(a: TvhDvrEntry, b: TvhDvrEntry): boolean {
+  const ra = copyRank(a);
+  const rb = copyRank(b);
+  for (let i = 0; i < ra.length; i++) {
+    if (ra[i]! < rb[i]!) return true;
+    if (ra[i]! > rb[i]!) return false;
+  }
+  return false;
+}
+
+export function pickBestCopy(
+  copies: CandidateCopy[],
+  instanceOrder: string[],
+): CandidateCopy | null {
+  if (!copies.length) return null;
+  return [...copies].sort((a, b) => {
+    const ra = copyRank(a.entry);
+    const rb = copyRank(b.entry);
+    for (let i = 0; i < ra.length; i++) {
+      if (ra[i]! !== rb[i]!) return ra[i]! - rb[i]!;
+    }
+    return instanceOrder.indexOf(a.instanceId) - instanceOrder.indexOf(b.instanceId);
+  })[0]!;
+}
+
+// ---------------------------------------------------------------------------
+// service
+// ---------------------------------------------------------------------------
+
+const DEBOUNCE_MS = 3_000;
+const STARTUP_DELAY_MS = 30_000;
+
+/**
+ * Automatically archives the best copy of every finished recording.
+ * Evaluation is STATELESS — recomputed from the instance cache and the
+ * upload ledger on every trigger — so restarts need no recovery logic:
+ * - waits while any instance still has the broadcast in its upcoming grid;
+ * - ignores failed copies entirely;
+ * - a failed auto-upload is never retried automatically (manual Retry only);
+ * - manual uploads are never second-guessed;
+ * - when an instance is unreachable, picks among the known copies but marks
+ *   the upload `incomplete_pick`; once every instance is reachable again the
+ *   pick is re-evaluated and a strictly better copy supersedes the upload
+ *   (the old remote object is deleted only after the new one verifies).
+ */
+export class AutoUploader {
+  private unsubscribe: (() => void) | null = null;
+  private debounceTimer: NodeJS.Timeout | null = null;
+  private startupTimer: NodeJS.Timeout | null = null;
+  private running = false;
+  private rerun = false;
+  private stopped = false;
+
+  constructor(
+    private readonly cfg: AppConfig,
+    private readonly cache: InstanceCache,
+    private readonly ledger: UploadLedger,
+    private readonly dispatcher: UploadDispatcher,
+    bus: EventBus,
+  ) {
+    this.unsubscribe = bus.subscribe((event) => {
+      if (event.type === 'recordings' || event.type === 'instance-status') this.schedule();
+    });
+  }
+
+  start(): void {
+    this.startupTimer = setTimeout(() => this.schedule(), STARTUP_DELAY_MS);
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.unsubscribe?.();
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    if (this.startupTimer) clearTimeout(this.startupTimer);
+  }
+
+  private schedule(): void {
+    if (this.stopped) return;
+    if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    this.debounceTimer = setTimeout(() => {
+      this.debounceTimer = null;
+      void this.runOnce();
+    }, DEBOUNCE_MS);
+  }
+
+  /** single-flight: a trigger during an evaluation queues exactly one rerun */
+  private async runOnce(): Promise<void> {
+    if (this.running) {
+      this.rerun = true;
+      return;
+    }
+    this.running = true;
+    try {
+      await this.evaluate();
+    } catch (err) {
+      console.error('auto-upload evaluation failed:', err);
+    } finally {
+      this.running = false;
+      if (this.rerun && !this.stopped) {
+        this.rerun = false;
+        this.schedule();
+      }
+    }
+  }
+
+  private storageRoots(snap: InstanceSnapshot): string[] {
+    return (snap.topology?.dvrConfigs ?? [])
+      .map((c) => c.storage)
+      .filter((s): s is string => !!s);
+  }
+
+  private async evaluate(): Promise<void> {
+    const threshold = this.cfg.overlapThreshold;
+    const snaps = this.cache.all();
+    const reachable = snaps.filter((s) => s.summary.reachable);
+    if (!reachable.length) return;
+    const anyUnreachable = reachable.length < snaps.length;
+    const instanceOrder = snaps.map((s) => s.summary.id);
+    const upcomingByInstance = new Map(reachable.map((s) => [s.summary.id, s.upcoming]));
+    const finishedByInstance = new Map(reachable.map((s) => [s.summary.id, s.finished]));
+    const nowEpoch = Date.now() / 1000;
+
+    // pass 1: enqueue settled broadcasts that the ledger has never seen
+    const seen: RecordingIdentity[] = [];
+    for (const snap of reachable) {
+      for (const entry of snap.finished) {
+        if (!entry.filename) continue;
+        const identity = identityOf(entry);
+        if (seen.some((s) => compareRecordings(s, identity, threshold).isDuplicate)) continue;
+        seen.push(identity);
+
+        // grace: let tvheadend finish post-processing before judging copies
+        const copies = siblingCopies(identity, finishedByInstance, threshold);
+        if (
+          copies.some(
+            (c) => nowEpoch - (c.entry.stop_real ?? c.entry.stop) < this.cfg.autoUpload.graceSeconds,
+          )
+        ) {
+          continue;
+        }
+        if (await this.ledger.findAnyByIdentity(identity)) continue;
+        if (isStillPending(identity, upcomingByInstance, threshold)) continue;
+
+        const best = pickBestCopy(copies, instanceOrder);
+        if (!best) continue;
+        try {
+          const result = await this.dispatcher.enqueue(
+            best.instanceId,
+            best.entry,
+            this.storageRoots(this.cache.get(best.instanceId)),
+            { origin: 'auto', incompletePick: anyUnreachable },
+          );
+          if (result.job) {
+            console.log(
+              `auto-upload: "${best.entry.disp_title ?? best.entry.uuid}" from ${best.instanceId}` +
+                (anyUnreachable ? ' (incomplete pick — some instance unreachable)' : ''),
+            );
+          }
+        } catch (err) {
+          console.error('auto-upload enqueue failed:', err);
+        }
+      }
+    }
+
+    // pass 2: with full visibility, re-judge picks made while an instance was down
+    if (anyUnreachable) return;
+    for (const row of await this.ledger.listIncompletePicks()) {
+      const identity: RecordingIdentity = {
+        channelname: row.channelname,
+        start: row.start,
+        stop: row.stop,
+        title: row.title ?? undefined,
+      };
+      if (isStillPending(identity, upcomingByInstance, threshold)) continue;
+      const copies = siblingCopies(identity, finishedByInstance, threshold);
+      const uploaded = copies.find(
+        (c) => c.instanceId === row.instanceId && c.entry.uuid === row.dvrUuid,
+      );
+      const best = pickBestCopy(copies, instanceOrder);
+      if (
+        uploaded &&
+        best &&
+        best.entry.uuid !== uploaded.entry.uuid &&
+        strictlyBetter(best.entry, uploaded.entry)
+      ) {
+        await this.ledger.supersede(row.id);
+        try {
+          await this.dispatcher.enqueue(
+            best.instanceId,
+            best.entry,
+            this.storageRoots(this.cache.get(best.instanceId)),
+            { origin: 'auto', supersedesPath: row.remotePath },
+          );
+          console.log(
+            `auto-upload: superseding "${row.title ?? row.id}" with the better copy from ${best.instanceId}`,
+          );
+        } catch (err) {
+          console.error('auto-upload supersede enqueue failed:', err);
+        }
+      } else {
+        // pick confirmed (or the uploaded entry is gone — the archive stands)
+        await this.ledger.clearIncompletePick(row.id);
+      }
+    }
+  }
+}

@@ -60,7 +60,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     switch (s) {
       case 'done': return 'ok';
       case 'failed': return 'bad';
-      case 'cancelled': return 'neutral';
+      case 'cancelled': case 'superseded': return 'neutral';
       case 'uploading': case 'verifying': return 'info';
       default: return 'neutral';
     }
@@ -103,7 +103,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       <tr>
         <td>
           {j.title ?? '—'}
+          {#if j.origin === 'auto'}<span class="badge neutral" title="queued by auto-upload">auto</span>{/if}
           {#if j.possibleDuplicate}<span class="badge warn" title="similar title already uploaded">dup?</span>{/if}
+          {#if j.incompletePick}
+            <span
+              class="badge warn"
+              title="copy was picked while an instance was unreachable — re-evaluated automatically once all instances are back"
+            >
+              incomplete pick
+            </span>
+          {/if}
           <div class="muted small">{ts(j.start)}</div>
         </td>
         <td class="small">{j.channelname}</td>

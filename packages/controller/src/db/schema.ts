@@ -66,6 +66,11 @@ export interface UploadsTable {
   attempts: Generated<number>;
   error: string | null;
   possible_duplicate: Generated<number>;
+  origin: Generated<string>;
+  /** pick made while an instance was unreachable; re-evaluated on recovery */
+  incomplete_pick: Generated<number>;
+  /** remote object this upload replaces; deleted after this one verifies */
+  supersedes_path: string | null;
   created_at: ColumnType<Date, string, never>;
   updated_at: ColumnType<Date, string, string>;
   completed_at: ColumnType<Date | null, string | null, string | null>;
