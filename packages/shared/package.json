@@ -1,0 +1,28 @@
+{
+  "name": "@tvhc/shared",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc -b --noEmit false --emitDeclarationOnly false",
+    "test": "vitest run",
+    "dev": "tsc -b -w"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.13"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "license": "AGPL-3.0-or-later"
+}

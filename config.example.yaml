@@ -1,0 +1,42 @@
+# Single configuration file for tvh-controller. Copy to config.yaml.
+# Lookup order: $TVHC_CONFIG, ./config.yaml, /etc/tvhc/config.yaml
+
+# port: 8080
+
+# MariaDB/MySQL DSN. Omit to run without persistence (overview only;
+# rule sync and uploads disabled).
+database: mysql://tvhc:CHANGEME@localhost:3306/tvhc
+
+instances:
+  - id: zone1
+    name: Zone 1
+    url: http://192.168.1.10:9981
+    # only when tvheadend requires auth:
+    # username: controller
+    # password: CHANGEME
+    rclone:
+      rcUrl: http://192.168.1.10:5572
+      # only when rcd runs without --rc-no-auth:
+      # user: tvhc
+      # pass: CHANGEME
+      # rewrite tvheadend's recording path to the path rclone rcd sees
+      # (identical when both run directly on the host):
+      # recordingPathPrefix: { from: /recordings, to: /recordings }
+  - id: zone2
+    name: Zone 2
+    url: http://192.168.2.10:9981
+    rclone:
+      rcUrl: http://192.168.2.10:5572
+
+rclone:
+  remote: "gdrive:tvh-archive"
+
+# Autorec rule start times are displayed converted into broadcast (EIT) time
+# when it differs from the tvheadend host's timezone. The EIT zone is read
+# from tvheadend itself (each network's "EIT time offset"); the host timezone
+# is auto-detected via the co-located rclone rcd, or set per instance:
+#   serverOffset: "+00:00"
+
+# optional overrides (milliseconds / ratio)
+# pollIntervals: { dvr: 15000, autorec: 60000, topology: 600000 }
+# overlapThreshold: 0.7

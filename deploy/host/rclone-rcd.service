@@ -1,0 +1,31 @@
+# rclone remote-control daemon for tvh-controller uploads.
+# Install on each tvheadend host:
+#   1. install the rclone binary (https://rclone.org/install/)
+#   2. place rclone.conf with the Google Drive remote (same one used manually)
+#   3. copy this file to /etc/systemd/system/rclone-rcd.service, edit User
+#      and paths
+#   4. systemctl daemon-reload && systemctl enable --now rclone-rcd
+#
+# The controller reaches this port over the zone VPN; --rc-no-auth relies on
+# that network isolation. --transfers 1 keeps host I/O and Drive quota impact
+# low.
+[Unit]
+Description=rclone remote control daemon (tvh-controller uploads)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hts
+ExecStart=/usr/bin/rclone rcd \
+  --rc-addr 0.0.0.0:5572 \
+  --rc-no-auth \
+  --config /home/hts/.config/rclone/rclone.conf \
+  --transfers 1 \
+  --bwlimit 5M \
+  --log-level NOTICE
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

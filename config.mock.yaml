@@ -1,0 +1,15 @@
+# Test config against scripts/mock-tvh.mjs (no auth, no database):
+#   node scripts/mock-tvh.mjs 19981 &
+#   node scripts/mock-tvh.mjs 19982 &
+#   TVHC_CONFIG=./config.mock.yaml node packages/controller/dist/main.js
+port: 8090
+instances:
+  - id: zone1
+    name: Zone 1 (mock)
+    url: http://localhost:19981
+  - id: zone2
+    name: Zone 2 (mock)
+    url: http://localhost:19982
+rclone:
+  remote: "gdrive:tvh-archive"
+pollIntervals: { dvr: 5000, autorec: 10000, topology: 30000 }

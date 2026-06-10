@@ -1,0 +1,53 @@
+# Controller deployment. Singleton (in-process pollers + upload mutex):
+# keep replicas at 1 and strategy Recreate.
+#
+# All configuration — including the database DSN and any credentials — lives
+# in one config.yaml, mounted from the Secret below (see
+# secrets.example.yaml / config.example.yaml in the repo root).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tvh-controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tvh-controller
+  template:
+    metadata:
+      labels:
+        app: tvh-controller
+    spec:
+      # graceful shutdown checkpoints in-flight uploads before the pod dies
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: controller
+          image: ghcr.io/koreapyj/tvh-controller:latest
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tvhc
+              readOnly: true
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+      volumes:
+        - name: config
+          secret:
+            secretName: tvhc-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tvh-controller
+spec:
+  selector:
+    app: tvh-controller
+  ports:
+    - port: 80
+      targetPort: 8080
