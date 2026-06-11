@@ -162,6 +162,113 @@ button.badge-button { border: none; cursor: pointer; font-family: inherit; }
   padding: 6px 10px; cursor: pointer;
 }
 .row-menu > button:hover { background: var(--panel); }
+
+/* ---------------------------------------------------------------------------
+ * Mobile (≤ 768px). Everything below is additive: the desktop layout above
+ * is intentionally untouched, and the mobile bar/backdrop are display:none
+ * outside the media query.
+ * ------------------------------------------------------------------------ */
+
+header.mobile-bar { display: none; }
+.nav-backdrop { display: none; }
+/* mobile-only field labels inside card-ified grids — inert on desktop */
+.m-only { display: none; }
+
+@media (max-width: 768px) {
+  header.mobile-bar {
+    display: flex; align-items: center; gap: 10px;
+    position: sticky; top: 0; z-index: 20;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    padding: 10px 12px;
+  }
+  header.mobile-bar .brand { font-weight: 700; font-size: 16px; flex: 1; }
+  header.mobile-bar .hamburger {
+    background: none; border: none; color: var(--text);
+    font-size: 20px; padding: 2px 8px; cursor: pointer;
+  }
+
+  .nav-backdrop {
+    display: block; position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.5); z-index: 24;
+  }
+
+  .layout { display: block; }
+  nav.sidebar {
+    position: fixed; top: 0; left: 0; bottom: 0; z-index: 25;
+    width: 230px; overflow-y: auto;
+    transform: translateX(-100%); transition: transform 0.2s ease;
+  }
+  nav.sidebar.open { transform: translateX(0); }
+
+  main { padding: 12px; max-width: 100%; }
+
+  /* simple tables (no .m-cards) keep every column and scroll horizontally
+     instead of overflowing the viewport; one-line cells so the scroll
+     actually engages instead of CJK text wrapping per character */
+  main table:not(.m-cards), .modal table {
+    display: block; overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  main table:not(.m-cards) th, main table:not(.m-cards) td,
+  .modal table th, .modal table td { white-space: nowrap; }
+  main table:not(.m-cards) td, .modal table td {
+    max-width: 60vw; overflow: hidden; text-overflow: ellipsis;
+  }
+  .subtable td:nth-child(5) { max-width: 60vw; }
+
+  /* dense grids carry .m-cards: the SAME table markup renders as a card
+     list — rows become cards, cells stack (or inline via .m-inline), and
+     hidden .m-only spans become the field labels */
+  table.m-cards, table.m-cards > thead, table.m-cards > tbody { display: block; }
+  table.m-cards > thead > tr {
+    display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px;
+  }
+  /* sortable column headers survive as a chip strip; the rest are labels
+     inside the cards now */
+  table.m-cards > thead th { border: none; padding: 0; }
+  table.m-cards > thead th:not(.sortable) { display: none; }
+  table.m-cards > thead th.sortable {
+    display: inline-block; background: var(--panel2);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 4px 10px; font-size: 12px;
+  }
+  table.m-cards > tbody > tr { display: block; }
+  table.m-cards > tbody > tr > td {
+    display: block; border-bottom: none; padding: 2px 0; white-space: normal;
+  }
+  tr.m-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; margin-bottom: 10px;
+  }
+  tr.m-card:hover > td { background: transparent; }
+  tr.m-card > td.m-inline { display: inline-block; margin-right: 12px; }
+  tr.m-card > td:empty { display: none; }
+  .m-only { display: inline; color: var(--muted); font-size: 12px; margin-right: 4px; }
+  /* placeholder dashes are noise once cells are inline chips */
+  tr.m-card .m-hide { display: none; }
+  /* expanded per-instance details attach under their card */
+  table.m-cards tr.subrow {
+    background: var(--panel); border: 1px solid var(--border); border-top: none;
+    border-radius: 0 0 8px 8px; margin: -12px 0 10px; padding: 2px 8px 6px;
+  }
+  table.m-cards .subtable { display: block; overflow-x: auto; }
+  table.m-cards .subtable td { white-space: nowrap; }
+
+  .cards { grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); }
+
+  .modal-backdrop { padding: 12px 8px; z-index: 30; }
+  .modal { width: 100%; padding: 14px; }
+  .form-grid { grid-template-columns: 1fr; }
+  .form-grid .wide { grid-column: auto; }
+  .form-grid > div > div[style] { flex-wrap: wrap; }
+
+  .tabs { overflow-x: auto; }
+  .toolbar select { max-width: 100%; }
+
+  /* friendlier touch targets */
+  button { padding: 7px 12px; }
+  button.expander { padding: 4px 8px 4px 2px; }
+  .row-menu > button { min-height: 36px; }
+}
 tr.subrow > td { background: var(--panel); padding: 4px 8px 8px 24px; }
 .subtable td { border-bottom: none; padding: 3px 8px; }
 .subtable tr:hover td { background: transparent; }

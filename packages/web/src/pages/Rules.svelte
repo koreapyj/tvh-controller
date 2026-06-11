@@ -412,7 +412,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   {/if}
 </div>
 
-<table>
+<table class="m-cards">
   <thead>
     <tr>
       <th class="sortable" onclick={() => clickSort('name')}>Rule{arrow('name')}</th>
@@ -431,7 +431,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <tbody>
     {#each ordered as rule (rule.id)}
       {@const p = rule.effectivePayload}
-      <tr>
+      <tr class="m-card">
         <td>
           {#if rule.parentId}<span class="muted">↳ </span>{/if}
           <button
@@ -454,7 +454,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </button>
           {/if}
         </td>
-        <td class="small">
+        <td class="small m-inline">
           {#if p.channel}
             <button class="linklike" title="filter by this channel" onclick={() => (filterChannel = p.channel)}>
               {p.channel}
@@ -462,27 +462,31 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {:else}any{/if}
           {#if rule.parentId && rule.overlay && 'channel' in rule.overlay}<span class="badge warn" title="overrides parent">override</span>{/if}
         </td>
-        {#each [eitTimeCell(p.start, p.channel), eitTimeCell(p.start_window, p.channel)] as cell}
-          <td class="small" title={cell.title}>{cell.text}</td>
+        {#each [eitTimeCell(p.start, p.channel), eitTimeCell(p.start_window, p.channel)] as cell, ci}
+          <td class="small m-inline" title={cell.title}>
+            <span class="m-only">{ci === 0 ? 'after' : 'before'}</span>{cell.text}
+          </td>
         {/each}
-        <td class="small">{weekdays(p.weekdays)}</td>
-        <td class="small">
+        <td class="small m-inline">{weekdays(p.weekdays)}</td>
+        <td class="small m-inline">
           {#if p.comment}
             <button class="linklike" title="filter by this comment" onclick={() => (filterComment = p.comment)}>
               {p.comment}
             </button>
-          {:else}<span class="muted">—</span>{/if}
+          {:else}<span class="muted m-hide">—</span>{/if}
         </td>
-        <td class="small">
+        <td class="small m-inline">
+          <span class="m-only">on</span>
           <span class="badge {rule.instances === 'all' ? 'neutral' : 'info'}">{instancesLabel(rule)}</span>
         </td>
         {#each $instances as inst}
           {@const st = rule.perInstance[inst.id]}
-          <td style="white-space:nowrap">
+          <td style="white-space:nowrap" class="m-inline">
             {#if st}
+              <span class="m-only">{inst.name}</span>
               <span class="badge {badgeClass(st.state)}" title={st.blockedReason ?? ''}>{st.state}</span>
             {:else}
-              <span class="muted small" title="not targeted by this rule">—</span>
+              <span class="muted small m-hide" title="not targeted by this rule">—</span>
             {/if}
           </td>
         {/each}
@@ -519,7 +523,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   Deleted rules were removed from the instances (their scheduled recordings cancelled) but are
   kept here. Restore pushes a rule back to its instances; purge removes it permanently.
 </p>
-<table>
+<table class="m-cards">
   <thead>
     <tr>
       <th>Rule</th>
@@ -530,19 +534,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   </thead>
   <tbody>
     {#each deletedRules as rule (rule.id)}
-      <tr>
+      <tr class="m-card">
         <td>
           <button class="linklike" style="color:var(--text)" title="details" onclick={() => openDeletedDetails(rule)}>
             {rule.name}
           </button>
           {#if rule.parentId}<span class="badge info">linked clone</span>{/if}
         </td>
-        <td class="small">
+        <td class="small m-inline">
+          <span class="m-only">on</span>
           <span class="badge {rule.instances === 'all' ? 'neutral' : 'info'}">
             {rule.instances === 'all' ? 'All' : rule.instances.join(', ')}
           </span>
         </td>
-        <td class="small muted">{rule.deletedAt ? dateTime(rule.deletedAt) : '—'}</td>
+        <td class="small muted m-inline">
+          <span class="m-only">deleted</span>{rule.deletedAt ? dateTime(rule.deletedAt) : '—'}
+        </td>
         <td style="white-space:nowrap">
           <button disabled={busy} onclick={() => restore(rule)}>Restore</button>
           <button class="danger" disabled={busy} onclick={() => purge(rule)}>Delete forever</button>

@@ -41,12 +41,29 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       await new Promise((r) => setTimeout(r, 5000));
     }
   });
+
+  // mobile-only off-canvas drawer (the bar and backdrop are display:none on desktop)
+  let navOpen = $state(false);
+  $effect(() => {
+    void $route;
+    navOpen = false;
+  });
 </script>
 
 <svelte:window onclick={interceptLinkClicks} />
 
+<header class="mobile-bar">
+  <button class="hamburger" aria-label="menu" onclick={() => (navOpen = !navOpen)}>☰</button>
+  <span class="brand">tvh controller</span>
+  {#if $sseConnected}<span class="badge ok">live</span>{:else}<span class="badge warn">reconnecting…</span>{/if}
+</header>
+
+{#if navOpen}
+  <div class="nav-backdrop" role="presentation" onclick={() => (navOpen = false)}></div>
+{/if}
+
 <div class="layout">
-  <nav class="sidebar">
+  <nav class="sidebar" class:open={navOpen}>
     <div class="brand">tvh controller</div>
     <a href="/" class:active={$route.page === 'dashboard'}>Dashboard</a>
     <a href="/recordings" class:active={$route.page === 'recordings'}>Recordings</a>

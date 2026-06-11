@@ -241,7 +241,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   {/if}
 </div>
 
-<table>
+<table class="m-cards">
   <thead>
     <tr>
       <th class="sortable" onclick={() => clickSort('title')}>Title{arrow('title')}</th>
@@ -265,7 +265,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <tbody>
     {#each rows as { rule, ruleComment, item } (rowKey(item))}
       {@const key = rowKey(item)}
-      <tr>
+      <tr class="m-card">
         <td>
           <button class="expander" onclick={() => toggle(key)} title="per-instance details">
             {expanded[key] ? '▾' : '▸'}
@@ -277,30 +277,31 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <button class="linklike muted" title="filter by this rule" onclick={() => (filterRule = rule)}>{rule}</button>
           {#if ruleComment}<span class="muted small"> ({ruleComment})</span>{/if}
         </td>
-        <td class="small">
+        <td class="small m-inline">
           {#if item.channelname}
             <button class="linklike" title="filter by this channel" onclick={() => (filterChannel = item.channelname)}>
               {item.channelname}
             </button>
           {/if}
         </td>
-        <td class="small">
+        <td class="small m-inline">
           <button class="linklike muted" title="filter by this date" onclick={() => (filterDate = dateOf(item.start))}>
             {ts(item.start)}
           </button>
         </td>
-        <td class="small muted">{duration(item.start, item.stop)}</td>
+        <td class="small muted m-inline">{duration(item.start, item.stop)}</td>
         {#if tab === 'failed'}
           {@const c = item.copies[0]}
-          <td class="small">{c?.instanceId ?? '—'}</td>
-          <td style="white-space:nowrap">
+          <td class="small m-inline"><span class="m-only">on</span>{c?.instanceId ?? '—'}</td>
+          <td style="white-space:nowrap" class="m-inline">
             {#if c}
               <span class="badge bad">{c.status ?? 'failed'}</span>
               <span class="muted small">{bytes(c.filesize)}</span>
             {/if}
           </td>
-          <td style="white-space:nowrap">
+          <td style="white-space:nowrap" class="m-inline">
             {#if c}
+              <span class="m-only">err</span>
               <span
                 class="badge {errClass(c)}"
                 title="{c.errors} stream errors · {c.dataErrors} data (TS) errors"
@@ -312,7 +313,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         {:else}
           {#each $instances as inst (inst.id)}
             {@const c = copyFor(item, inst.id)}
-            <td style="white-space:nowrap">
+            <td style="white-space:nowrap" class="m-inline">
+              <span class="m-only">{inst.name}</span>
               {#if !c}
                 <span class="badge bad" title="this broadcast is not {tab} on {inst.name}">missing</span>
               {:else if tab === 'upcoming'}
@@ -328,8 +330,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 <span class="muted small">{bytes(c.filesize)}</span>
               {/if}
             </td>
-            <td style="white-space:nowrap">
+            <td style="white-space:nowrap" class="m-inline">
               {#if c && hasErrorInfo(c)}
+                <span class="m-only">err</span>
                 <span
                   class="badge {errClass(c)}"
                   title="{c.errors} stream errors · {c.dataErrors} data (TS) errors"

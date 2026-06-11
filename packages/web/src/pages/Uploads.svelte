@@ -81,12 +81,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 <h1>Uploads</h1>
 <p class="muted small">
-  Uploads run via rclone rcd on each tvheadend host and are verified by MD5 checksum against
-  Google Drive. The shared ledger prevents the same broadcast from being uploaded twice.
+  Uploads run via rclone rcd on each tvheadend host and are size-verified against Google Drive
+  (rclone checksums each transfer in flight). The shared ledger prevents the same broadcast
+  from being uploaded twice.
 </p>
 {#if error}<div class="error-banner">{error}</div>{/if}
 
-<table>
+<table class="m-cards">
   <thead>
     <tr>
       <th>Recording</th>
@@ -100,7 +101,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   </thead>
   <tbody>
     {#each jobs as j (j.id)}
-      <tr>
+      <tr class="m-card">
         <td>
           {j.title ?? '—'}
           {#if j.origin === 'auto'}<span class="badge neutral" title="queued by auto-upload">auto</span>{/if}
@@ -115,13 +116,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {/if}
           <div class="muted small">{ts(j.start)}</div>
         </td>
-        <td class="small">{j.channelname}</td>
-        <td class="small">{instName(j.instanceId)}</td>
-        <td>
+        <td class="small m-inline">{j.channelname}</td>
+        <td class="small m-inline"><span class="m-only">from</span>{instName(j.instanceId)}</td>
+        <td class="m-inline">
           <span class="badge {statusBadge(j.status)}">{j.status}</span>
           {#if j.error}<div class="small" style="color:var(--bad)">{j.error}</div>{/if}
         </td>
-        <td>
+        <td class="m-inline">
           {#if j.status === 'uploading' && j.filesize}
             <div class="progress"><div style="width:{pct(j.progress, j.filesize)}%"></div></div>
             <span class="muted small">{bytes(j.progress)} / {bytes(j.filesize)}</span>
