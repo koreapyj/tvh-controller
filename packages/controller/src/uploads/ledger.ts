@@ -39,6 +39,12 @@ export interface ClaimOptions {
   incompletePick?: boolean;
   /** remote object replaced by this upload; deleted after this one verifies */
   supersedesPath?: string | null;
+  /**
+   * manual overwrite: skip duplicate detection and always insert a fresh row.
+   * The caller (dispatcher.enqueue) is responsible for cancelling/superseding
+   * the rows this one replaces.
+   */
+  overwrite?: boolean;
 }
 
 /** statuses that block a new claim for the same broadcast (superseded and failed do not) */
@@ -64,6 +70,8 @@ function rowToJob(r: {
   origin: string;
   incomplete_pick: number;
   supersedes_path: string | null;
+  failure_kind: string | null;
+  auto_retries: number;
   created_at: Date;
   updated_at: Date;
   completed_at: Date | null;
@@ -88,6 +96,9 @@ function rowToJob(r: {
     origin: (r.origin === 'auto' ? 'auto' : 'manual') as UploadOrigin,
     incompletePick: !!r.incomplete_pick,
     supersedesPath: r.supersedes_path,
+    failureKind:
+      r.failure_kind === 'transient' || r.failure_kind === 'permanent' ? r.failure_kind : null,
+    autoRetries: r.auto_retries,
     createdAt: r.created_at.toISOString(),
     updatedAt: r.updated_at.toISOString(),
     completedAt: r.completed_at?.toISOString() ?? null,
@@ -131,28 +142,32 @@ export class UploadLedger {
       const start = entry.start;
       const stop = entry.stop;
 
-      const candidates = await this.db
-        .selectFrom('uploads')
-        .selectAll()
-        .where('channelname', '=', channelname)
-        .where('status', 'in', ACTIVE_OR_DONE)
-        .where('start', '<', stop)
-        .where('stop', '>', start)
-        .execute();
+      // manual overwrite bypasses dedup entirely — the caller has already
+      // cancelled/superseded whatever this row replaces
+      if (!opts.overwrite) {
+        const candidates = await this.db
+          .selectFrom('uploads')
+          .selectAll()
+          .where('channelname', '=', channelname)
+          .where('status', 'in', ACTIVE_OR_DONE)
+          .where('start', '<', stop)
+          .where('stop', '>', start)
+          .execute();
 
-      for (const c of candidates) {
-        const verdict = compareRecordings(
-          { channelname, start, stop, title: entry.disp_title },
-          {
-            channelname: c.channelname,
-            start: Number(c.start),
-            stop: Number(c.stop),
-            title: c.title ?? undefined,
-          },
-          this.overlapThreshold,
-        );
-        if (verdict.isDuplicate) {
-          return { claimed: false, existing: rowToJob(c) };
+        for (const c of candidates) {
+          const verdict = compareRecordings(
+            { channelname, start, stop, title: entry.disp_title },
+            {
+              channelname: c.channelname,
+              start: Number(c.start),
+              stop: Number(c.stop),
+              title: c.title ?? undefined,
+            },
+            this.overlapThreshold,
+          );
+          if (verdict.isDuplicate) {
+            return { claimed: false, existing: rowToJob(c) };
+          }
         }
       }
 
@@ -236,6 +251,8 @@ export class UploadLedger {
       error: string | null;
       attempts: number;
       completed_at: string | null;
+      failure_kind: string | null;
+      auto_retries: number;
     }>,
   ): Promise<void> {
     await this.db
@@ -246,11 +263,12 @@ export class UploadLedger {
   }
 
   /**
-   * Any upload row covering the broadcast, INCLUDING failed and superseded
-   * ones. The auto-uploader uses this: a failed row means "manual retry
-   * only", a manual row means "never second-guess the user's pick".
+   * Every upload row covering the broadcast (any status). The auto-uploader
+   * uses this to advance to the next-best copy after a permanent failure:
+   * each row records its (instanceId, dvrUuid), so already-tried copies are
+   * excluded from the next pick.
    */
-  async findAnyByIdentity(identity: RecordingIdentity): Promise<UploadJob | null> {
+  async findAllByIdentity(identity: RecordingIdentity): Promise<UploadJob[]> {
     const candidates = await this.db
       .selectFrom('uploads')
       .selectAll()
@@ -258,20 +276,37 @@ export class UploadLedger {
       .where('start', '<', identity.stop)
       .where('stop', '>', identity.start)
       .execute();
-    for (const c of candidates) {
-      const verdict = compareRecordings(
-        identity,
-        {
-          channelname: c.channelname,
-          start: Number(c.start),
-          stop: Number(c.stop),
-          title: c.title ?? undefined,
-        },
-        this.overlapThreshold,
-      );
-      if (verdict.isDuplicate) return rowToJob(c);
-    }
-    return null;
+    return candidates
+      .filter(
+        (c) =>
+          compareRecordings(
+            identity,
+            {
+              channelname: c.channelname,
+              start: Number(c.start),
+              stop: Number(c.stop),
+              title: c.title ?? undefined,
+            },
+            this.overlapThreshold,
+          ).isDuplicate,
+      )
+      .map(rowToJob);
+  }
+
+  /**
+   * Failed uploads eligible for an automatic retry: a transient failure that
+   * has not yet exhausted its retry budget. The dispatcher applies the
+   * per-row backoff window on `updatedAt`.
+   */
+  async listRetriable(maxRetries: number): Promise<UploadJob[]> {
+    const rows = await this.db
+      .selectFrom('uploads')
+      .selectAll()
+      .where('status', '=', 'failed')
+      .where('failure_kind', '=', 'transient')
+      .where('auto_retries', '<', maxRetries)
+      .execute();
+    return rows.map(rowToJob);
   }
 
   /** mark a row as replaced by a later upload of a better copy */

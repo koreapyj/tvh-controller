@@ -71,6 +71,10 @@ export interface UploadsTable {
   incomplete_pick: Generated<number>;
   /** remote object this upload replaces; deleted after this one verifies */
   supersedes_path: string | null;
+  /** 'transient' (auto-retryable) | 'permanent' (manual-only); NULL until failed */
+  failure_kind: string | null;
+  /** times the transient auto-retry sweep has re-driven this row */
+  auto_retries: Generated<number>;
   created_at: ColumnType<Date, string, never>;
   updated_at: ColumnType<Date, string, string>;
   completed_at: ColumnType<Date | null, string | null, string | null>;

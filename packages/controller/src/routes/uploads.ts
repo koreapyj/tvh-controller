@@ -57,7 +57,11 @@ export function registerUploadRoutes(app: FastifyInstance, ctx: AppContext): voi
         continue;
       }
       try {
-        const r = await dispatcher().enqueue(instanceId, entry, storageRoots);
+        // a manual upload always overwrites any previous copy of this programme
+        const r = await dispatcher().enqueue(instanceId, entry, storageRoots, {
+          origin: 'manual',
+          overwrite: true,
+        });
         results.push({
           dvrUuid: uuid,
           jobId: r.job?.id,

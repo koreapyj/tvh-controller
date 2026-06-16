@@ -154,6 +154,24 @@ migrations['005_auto_upload'] = {
   },
 };
 
+migrations['006_upload_retry'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // classify a failed upload so the dispatcher can auto-retry transient
+    // failures (rcd unreachable, remote blips) while leaving permanent ones
+    // (missing file, wrong path) terminal/manual-only
+    await db.schema.alterTable('uploads').addColumn('failure_kind', 'varchar(10)').execute();
+    // how many times the transient auto-retry sweep has re-driven this row
+    await db.schema
+      .alterTable('uploads')
+      .addColumn('auto_retries', 'integer', (c) => c.notNull().defaultTo(0))
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('uploads').dropColumn('auto_retries').execute();
+    await db.schema.alterTable('uploads').dropColumn('failure_kind').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

@@ -20,6 +20,7 @@ import {
   compareRecordings,
   type RecordingIdentity,
   type TvhDvrEntry,
+  type UploadStatus,
 } from '@tvhc/shared';
 import type { AppConfig } from '../config.js';
 import type { EventBus } from '../state/events.js';
@@ -113,23 +114,39 @@ export function pickBestCopy(
 const DEBOUNCE_MS = 3_000;
 const STARTUP_DELAY_MS = 30_000;
 
+/** an existing upload in one of these states already covers the broadcast */
+const COVERED_STATUSES: UploadStatus[] = [
+  'queued',
+  'dispatched',
+  'uploading',
+  'verifying',
+  'done',
+];
+
 /**
  * Automatically archives the best copy of every finished recording.
  * Evaluation is STATELESS — recomputed from the instance cache and the
  * upload ledger on every trigger — so restarts need no recovery logic:
  * - waits while any instance still has the broadcast in its upcoming grid;
  * - ignores failed copies entirely;
- * - a failed auto-upload is never retried automatically (manual Retry only);
+ * - a *transient* upload failure auto-retries the same copy (dispatcher sweep);
+ *   a *permanent* failure advances to the next-best untried copy, and only when
+ *   every copy is exhausted (or a manual upload exists) does it stop;
  * - manual uploads are never second-guessed;
  * - when an instance is unreachable, picks among the known copies but marks
  *   the upload `incomplete_pick`; once every instance is reachable again the
  *   pick is re-evaluated and a strictly better copy supersedes the upload
  *   (the old remote object is deleted only after the new one verifies).
+ *
+ * Evaluation is triggered by recordings/instance-status events; a recording
+ * deferred by the grace window arms a one-shot re-check timer for when the
+ * window elapses, since no further event may fire once the grids settle.
  */
 export class AutoUploader {
   private unsubscribe: (() => void) | null = null;
   private debounceTimer: NodeJS.Timeout | null = null;
   private startupTimer: NodeJS.Timeout | null = null;
+  private recheckTimer: NodeJS.Timeout | null = null;
   private running = false;
   private rerun = false;
   private stopped = false;
@@ -155,6 +172,22 @@ export class AutoUploader {
     this.unsubscribe?.();
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
     if (this.startupTimer) clearTimeout(this.startupTimer);
+    if (this.recheckTimer) clearTimeout(this.recheckTimer);
+  }
+
+  /**
+   * Re-run evaluation once at `atEpoch` (seconds) — the moment a grace-deferred
+   * recording becomes eligible. The grids may settle and fire no more events,
+   * so without this the upload would stall until unrelated activity nudged it.
+   */
+  private armRecheck(atEpoch: number): void {
+    if (this.stopped) return;
+    if (this.recheckTimer) clearTimeout(this.recheckTimer);
+    const delayMs = Math.max(1_000, (atEpoch - Date.now() / 1000) * 1000 + 500);
+    this.recheckTimer = setTimeout(() => {
+      this.recheckTimer = null;
+      this.schedule();
+    }, delayMs);
   }
 
   private schedule(): void {
@@ -205,6 +238,7 @@ export class AutoUploader {
 
     // pass 1: enqueue settled broadcasts that the ledger has never seen
     const seen: RecordingIdentity[] = [];
+    let earliestEligible = Infinity;
     for (const snap of reachable) {
       for (const entry of snap.finished) {
         if (!entry.filename) continue;
@@ -214,17 +248,28 @@ export class AutoUploader {
 
         // grace: let tvheadend finish post-processing before judging copies
         const copies = siblingCopies(identity, finishedByInstance, threshold);
-        if (
-          copies.some(
-            (c) => nowEpoch - (c.entry.stop_real ?? c.entry.stop) < this.cfg.autoUpload.graceSeconds,
-          )
-        ) {
+        const graceSeconds = this.cfg.autoUpload.graceSeconds;
+        if (copies.some((c) => nowEpoch - (c.entry.stop_real ?? c.entry.stop) < graceSeconds)) {
+          // eligible once the youngest copy clears the grace window; remember
+          // the soonest such instant so we can re-check without a fresh event
+          const youngest = Math.max(...copies.map((c) => c.entry.stop_real ?? c.entry.stop));
+          earliestEligible = Math.min(earliestEligible, youngest + graceSeconds);
           continue;
         }
-        if (await this.ledger.findAnyByIdentity(identity)) continue;
         if (isStillPending(identity, upcomingByInstance, threshold)) continue;
 
-        const best = pickBestCopy(copies, instanceOrder);
+        // per-copy bookkeeping: a permanent failure for one copy must not block
+        // trying the next-best copy of the same broadcast
+        const rows = await this.ledger.findAllByIdentity(identity);
+        if (rows.some((r) => r.origin === 'manual')) continue; // never second-guess the user
+        if (rows.some((r) => COVERED_STATUSES.includes(r.status))) continue; // covered or in-flight
+        if (rows.some((r) => r.status === 'failed' && r.failureKind === 'transient')) continue; // sweep retries it
+
+        const tried = new Set(rows.map((r) => `${r.instanceId}:${r.dvrUuid}`));
+        const best = pickBestCopy(
+          copies.filter((c) => !tried.has(`${c.instanceId}:${c.entry.uuid}`)),
+          instanceOrder,
+        );
         if (!best) continue;
         try {
           const result = await this.dispatcher.enqueue(
@@ -244,6 +289,10 @@ export class AutoUploader {
         }
       }
     }
+
+    // a recording deferred by the grace window won't fire another event once
+    // its grids settle — re-check exactly when it becomes eligible
+    if (earliestEligible < Infinity) this.armRecheck(earliestEligible);
 
     // pass 2: with full visibility, re-judge picks made while an instance was down
     if (anyUnreachable) return;

@@ -167,4 +167,21 @@ export class RcloneRcClient {
     const dst = RcloneRcClient.splitRemote(remotePath);
     await this.call('/operations/deletefile', { fs: dst.fs, remote: dst.remote });
   }
+
+  /**
+   * Rename a remote object within the same remote (metadata-only on Drive).
+   * Used to atomically commit an upload: the file is copied to a temp name,
+   * verified, then moved onto its final name so the final path only ever
+   * holds one object and an overwrite never blanks the live copy.
+   */
+  async moveFile(from: string, to: string): Promise<void> {
+    const src = RcloneRcClient.splitRemote(from);
+    const dst = RcloneRcClient.splitRemote(to);
+    await this.call('/operations/movefile', {
+      srcFs: src.fs,
+      srcRemote: src.remote,
+      dstFs: dst.fs,
+      dstRemote: dst.remote,
+    });
+  }
 }

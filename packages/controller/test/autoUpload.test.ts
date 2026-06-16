@@ -16,15 +16,17 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { describe, expect, it } from 'vitest';
-import type { TvhDvrEntry } from '@tvhc/shared';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { TvhDvrEntry, UploadJob } from '@tvhc/shared';
 import {
+  AutoUploader,
   identityOf,
   isStillPending,
   pickBestCopy,
   siblingCopies,
   strictlyBetter,
 } from '../src/uploads/autoUpload.js';
+import { EventBus } from '../src/state/events.js';
 
 const THRESHOLD = 0.7;
 
@@ -133,5 +135,102 @@ describe('pickBestCopy / strictlyBetter', () => {
     expect(strictlyBetter(entry({}), entry({}))).toBe(false);
     expect(strictlyBetter(entry({ filesize: 2 }), entry({ filesize: 1 }))).toBe(true);
     expect(strictlyBetter(entry({ errors: 1, filesize: 999 }), entry({ errors: 0 }))).toBe(false);
+  });
+});
+
+// --- AutoUploader evaluation (Parts 1 & 3) ----------------------------------
+
+const DEBOUNCE_MS = 3_000;
+
+function snap(id: string, finished: TvhDvrEntry[], upcoming: TvhDvrEntry[] = []) {
+  return {
+    summary: { id, reachable: true },
+    finished,
+    upcoming,
+    topology: { dvrConfigs: [] },
+  };
+}
+
+function makeAuto(snaps: ReturnType<typeof snap>[], rows: Partial<UploadJob>[]) {
+  const cfg = { overlapThreshold: THRESHOLD, autoUpload: { enabled: true, graceSeconds: 120 } };
+  const cache = {
+    all: () => snaps,
+    get: (id: string) => snaps.find((s) => s.summary.id === id),
+  };
+  const ledger = {
+    findAllByIdentity: vi.fn(async () => rows),
+    listIncompletePicks: vi.fn(async () => [] as UploadJob[]),
+  };
+  const dispatcher = { enqueue: vi.fn(async () => ({ job: { id: 'j' } })) };
+  const bus = new EventBus();
+  const auto = new AutoUploader(
+    cfg as never,
+    cache as never,
+    ledger as never,
+    dispatcher as never,
+    bus,
+  );
+  return { auto, ledger, dispatcher, bus };
+}
+
+function fireRecordings(bus: EventBus, instanceId = 'tyo1') {
+  bus.publish({ type: 'recordings', data: { instanceId, state: 'finished' } } as never);
+}
+
+describe('AutoUploader candidate fallback (Part 3)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('skips a copy that already failed permanently and uploads the next-best one', async () => {
+    vi.setSystemTime((2800 + 1000) * 1000); // well past the 120s grace window
+    const best = entry({ uuid: 'a1', errors: 0 }); // best copy, but it failed permanently
+    const other = entry({ uuid: 'a2', errors: 5 }); // worse, on another instance
+    const { auto, dispatcher, bus } = makeAuto(
+      [snap('tyo1', [best]), snap('tyo2', [other])],
+      [{ instanceId: 'tyo1', dvrUuid: 'a1', status: 'failed', failureKind: 'permanent', origin: 'auto' }],
+    );
+
+    fireRecordings(bus);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
+
+    expect(dispatcher.enqueue).toHaveBeenCalledTimes(1);
+    expect(dispatcher.enqueue.mock.calls[0]![0]).toBe('tyo2');
+    expect((dispatcher.enqueue.mock.calls[0]![1] as TvhDvrEntry).uuid).toBe('a2');
+    auto.stop();
+  });
+
+  it('does not re-upload while the only copy is failed-transient (the sweep handles it)', async () => {
+    vi.setSystemTime((2800 + 1000) * 1000);
+    const { auto, dispatcher, bus } = makeAuto(
+      [snap('tyo1', [entry({ uuid: 'a1' })])],
+      [{ instanceId: 'tyo1', dvrUuid: 'a1', status: 'failed', failureKind: 'transient', origin: 'auto' }],
+    );
+
+    fireRecordings(bus);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
+
+    expect(dispatcher.enqueue).not.toHaveBeenCalled();
+    auto.stop();
+  });
+});
+
+describe('AutoUploader grace re-check (Part 1)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('uploads a grace-deferred recording without any further event', async () => {
+    vi.setSystemTime((2800 + 60) * 1000); // 60s after stop, inside the 120s grace
+    const { auto, dispatcher, bus } = makeAuto([snap('tyo1', [entry({ uuid: 'a1' })])], []);
+
+    fireRecordings(bus);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
+    // still inside grace → deferred, nothing enqueued yet
+    expect(dispatcher.enqueue).not.toHaveBeenCalled();
+
+    // no new event fires; only the armed re-check timer drives the next pass
+    await vi.advanceTimersByTimeAsync(61_000 + DEBOUNCE_MS + 100);
+    expect(dispatcher.enqueue).toHaveBeenCalledTimes(1);
+    expect(dispatcher.enqueue.mock.calls[0]![0]).toBe('tyo1');
+    auto.stop();
   });
 });

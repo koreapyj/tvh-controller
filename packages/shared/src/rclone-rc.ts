@@ -96,6 +96,13 @@ export interface UploadJob {
   incompletePick: boolean;
   /** remote object this upload replaces; deleted after this upload verifies */
   supersedesPath: string | null;
+  /**
+   * why a failed upload failed: 'transient' is auto-retried by the dispatcher
+   * sweep; 'permanent' is terminal (manual retry only). null until failed.
+   */
+  failureKind: 'transient' | 'permanent' | null;
+  /** times the transient auto-retry sweep has re-driven this upload */
+  autoRetries: number;
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;

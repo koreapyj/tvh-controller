@@ -16,10 +16,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import type { TvhDvrEntry, UploadJob } from '@tvhc/shared';
+import type { TvhDvrEntry, UploadJob, UploadStatus } from '@tvhc/shared';
 import type { AppConfig } from '../config.js';
 import type { EventBus } from '../state/events.js';
-import { RcloneRcClient } from './rcloneRc.js';
+import { RcloneRcClient, RcloneRcError } from './rcloneRc.js';
 import { buildRemotePath } from './remotePath.js';
 import type { ClaimOptions, UploadLedger } from './ledger.js';
 
@@ -27,6 +27,28 @@ const POLL_MS = 3000;
 const MAX_ATTEMPTS = 3;
 const VERIFY_RETRY_MIN_MS = 5_000;
 const VERIFY_RETRY_MAX_MS = 300_000;
+const MAX_AUTO_RETRIES = 5;
+const RETRY_SWEEP_MS = 60_000;
+const AUTO_RETRY_BACKOFF_BASE_MS = 60_000;
+const AUTO_RETRY_BACKOFF_MAX_MS = 30 * 60_000;
+
+const INFLIGHT_STATUSES: UploadStatus[] = ['queued', 'dispatched', 'uploading', 'verifying'];
+
+/**
+ * A failure is transient (worth auto-retrying) when the rcd was unreachable or
+ * returned a server error: any non-HTTP throw is a network/connection failure,
+ * and an `RcloneRcError` is transient only for status 0 / 5xx. A 4xx (bad path,
+ * bad request) is a terminal, permanent failure.
+ */
+export function isTransientRcError(err: unknown): boolean {
+  if (err instanceof RcloneRcError) return err.status === 0 || err.status >= 500;
+  return true;
+}
+
+/** deterministic per-upload temp object, so it survives a controller restart */
+export function tempRemotePath(job: Pick<UploadJob, 'id' | 'remotePath'>): string {
+  return `${job.remotePath}.tvhc-part-${job.id.slice(0, 8)}`;
+}
 
 export class UploadDispatcher {
   private readonly clients = new Map<string, RcloneRcClient>();
@@ -38,6 +60,7 @@ export class UploadDispatcher {
    */
   private readonly instanceQueues = new Map<string, Promise<void>>();
   private stopped = false;
+  private retrySweepTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly cfg: AppConfig,
@@ -47,6 +70,11 @@ export class UploadDispatcher {
     for (const inst of cfg.instances) {
       if (inst.rclone) this.clients.set(inst.id, new RcloneRcClient(inst.rclone));
     }
+    // periodically re-drive transiently-failed uploads (rcd outages, remote
+    // blips) with an exponential per-row backoff; permanent failures are left
+    // terminal (manual retry only)
+    this.retrySweepTimer = setInterval(() => void this.sweepRetries(), RETRY_SWEEP_MS);
+    this.retrySweepTimer.unref?.();
   }
 
   hasClient(instanceId: string): boolean {
@@ -73,10 +101,46 @@ export class UploadDispatcher {
    */
   async stop(graceMs = 5_000): Promise<void> {
     this.stopped = true;
+    if (this.retrySweepTimer) clearInterval(this.retrySweepTimer);
     await Promise.race([
       Promise.allSettled([...this.instanceQueues.values()]),
       sleep(graceMs),
     ]);
+  }
+
+  /**
+   * Re-drive transiently-failed uploads whose per-row backoff has elapsed.
+   * Backoff grows with the number of automatic retries already spent and is
+   * keyed on `updatedAt`; after MAX_AUTO_RETRIES a row stays failed.
+   */
+  private async sweepRetries(): Promise<void> {
+    if (this.stopped) return;
+    let rows: UploadJob[];
+    try {
+      rows = await this.ledger.listRetriable(MAX_AUTO_RETRIES);
+    } catch (err) {
+      console.error('auto-retry sweep failed:', err);
+      return;
+    }
+    const nowMs = Date.now();
+    for (const job of rows) {
+      const backoff = Math.min(
+        AUTO_RETRY_BACKOFF_BASE_MS * 2 ** job.autoRetries,
+        AUTO_RETRY_BACKOFF_MAX_MS,
+      );
+      if (nowMs - new Date(job.updatedAt).getTime() < backoff) continue;
+      // start at verify (like retry()): a transfer that actually completed
+      // resolves to done without re-uploading
+      await this.ledger.update(job.id, {
+        status: 'verifying',
+        error: null,
+        attempts: 0,
+        rclone_job_id: null,
+        failure_kind: null,
+        auto_retries: job.autoRetries + 1,
+      });
+      void this.drive(job.id, job.instanceId);
+    }
   }
 
   /** queue an upload for a finished DVR entry; returns the job or the existing duplicate */
@@ -92,6 +156,23 @@ export class UploadDispatcher {
 
     const localPath = client.mapLocalPath(entry.filename);
     const remotePath = buildRemotePath(this.cfg.rclone.remote, entry, storageRoots);
+
+    // manual overwrite: become the sole writer for this programme — stop any
+    // in-flight transfer (deleting its temp) and supersede a completed copy
+    // (whose object stays live until this new copy commits, Part 5)
+    if (claimOpts.overwrite) {
+      const existing = await this.ledger.findAllByIdentity({
+        channelname: entry.channelname ?? '',
+        start: entry.start,
+        stop: entry.stop,
+        title: entry.disp_title,
+      });
+      for (const row of existing) {
+        if (INFLIGHT_STATUSES.includes(row.status)) await this.cancel(row.id);
+        else if (row.status === 'done') await this.ledger.supersede(row.id);
+      }
+    }
+
     const result = await this.ledger.claim(instanceId, entry, localPath, remotePath, claimOpts);
     if (!result.claimed) return { duplicateOf: result.existing };
 
@@ -119,6 +200,7 @@ export class UploadDispatcher {
       error: null,
       attempts: 0,
       rclone_job_id: null,
+      failure_kind: null,
     });
     void this.drive(uploadId, job.instanceId);
   }
@@ -130,6 +212,9 @@ export class UploadDispatcher {
     if (client && job.status === 'uploading' && job.rcloneJobId !== null) {
       await client.stopJob(job.rcloneJobId).catch(() => {});
     }
+    // drop the partial temp object — the cancelled transfer never reached the
+    // final path, so the live copy (if any) is untouched
+    if (client) await client.deleteFile(tempRemotePath(job)).catch(() => {});
     await this.ledger.update(uploadId, { status: 'cancelled' });
     await this.publish(uploadId);
   }
@@ -157,12 +242,17 @@ export class UploadDispatcher {
     } catch (err) {
       // the failure handler itself may throw (e.g. database briefly down) —
       // it must never escape: drive() is fired void and an unhandled
-      // rejection would kill the process
+      // rejection would kill the process. transient causes are handled inline
+      // in driveInner, so an escape here is treated as a permanent failure.
       try {
         await this.ledger.update(uploadId, {
           status: 'failed',
           error: err instanceof Error ? err.message : String(err),
+          failure_kind: 'permanent',
         });
+        const job = await this.ledger.get(uploadId);
+        const client = job && this.clients.get(job.instanceId);
+        if (job && client) await client.deleteFile(tempRemotePath(job)).catch(() => {});
         await this.publish(uploadId);
       } catch (inner) {
         console.error(`upload ${uploadId}: failed to record error state:`, inner);
@@ -172,16 +262,49 @@ export class UploadDispatcher {
     }
   }
 
+  /** mark an upload done, then clear any superseded (different) old object */
+  private async commitDone(
+    uploadId: string,
+    client: RcloneRcClient,
+    job: UploadJob,
+    size: number,
+  ): Promise<void> {
+    await this.ledger.update(uploadId, {
+      status: 'done',
+      progress: size,
+      completed_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+    });
+    // this upload replaced a previous copy of the same broadcast at a
+    // DIFFERENT path (incomplete-pick supersede) — remove it now that the new
+    // one verified. A same-path overwrite is already handled by the swap.
+    const supersedes = job.supersedesPath;
+    if (supersedes && supersedes !== job.remotePath) {
+      await client.deleteFile(supersedes).catch((err) => {
+        console.error(`upload ${uploadId}: superseded object not removed (${supersedes}):`, err);
+      });
+    }
+    await this.publish(uploadId);
+  }
+
   private async driveInner(uploadId: string): Promise<void> {
     let verifyRetryDelay = VERIFY_RETRY_MIN_MS;
+    let transientDelay = VERIFY_RETRY_MIN_MS;
     let job = await this.ledger.get(uploadId);
     if (!job) return;
     const client = this.clients.get(job.instanceId);
     if (!client) {
-      await this.ledger.update(uploadId, { status: 'failed', error: 'no rclone rcd configured' });
+      await this.ledger.update(uploadId, {
+        status: 'failed',
+        error: 'no rclone rcd configured',
+        failure_kind: 'permanent',
+      });
       await this.publish(uploadId);
       return;
     }
+    // copy to a per-upload temp object and rename it onto the final path only
+    // after verification — an overwrite never blanks the live copy, and the
+    // final name never holds two same-name objects (Part 5)
+    const tempPath = tempRemotePath(job);
 
     while (!this.stopped) {
       job = await this.ledger.get(uploadId);
@@ -189,7 +312,13 @@ export class UploadDispatcher {
 
       if (job.status === 'queued' || job.status === 'dispatched') {
         if (job.attempts >= MAX_ATTEMPTS) {
-          await this.ledger.update(uploadId, { status: 'failed', error: 'max attempts exceeded' });
+          // repeated rclone job failures are transient (remote blips/quota) —
+          // the auto-retry sweep re-drives this row later with backoff
+          await this.ledger.update(uploadId, {
+            status: 'failed',
+            error: 'max attempts exceeded',
+            failure_kind: 'transient',
+          });
           await this.publish(uploadId);
           return;
         }
@@ -204,21 +333,52 @@ export class UploadDispatcher {
         // means the rcd would upload a DIFFERENT file (e.g. another zone's
         // copy at the same path on a misconfigured host).
         if (job.filesize !== null) {
-          const localSize = await client.localSize(job.localPath).catch(() => null);
+          let localSize: number | null;
+          try {
+            localSize = await client.localSize(job.localPath);
+          } catch (err) {
+            // rcd unreachable — wait it out instead of failing (resume() and
+            // the verify step share this "transient never fails" contract)
+            if (isTransientRcError(err)) {
+              await sleep(transientDelay);
+              transientDelay = Math.min(transientDelay * 2, VERIFY_RETRY_MAX_MS);
+              continue;
+            }
+            throw err;
+          }
+          transientDelay = VERIFY_RETRY_MIN_MS;
           const tolerance = Math.max(2_000_000, job.filesize * 0.01);
-          if (localSize === null || Math.abs(localSize - job.filesize) > tolerance) {
+          if (localSize === null) {
             await this.ledger.update(uploadId, {
               status: 'failed',
-              error:
-                localSize === null
-                  ? `local file not found on the rcd host: ${job.localPath}`
-                  : `file on rcd host is ${localSize} bytes but the recording is ${job.filesize} — wrong host or stale path?`,
+              error: `local file not found on the rcd host: ${job.localPath}`,
+              failure_kind: 'permanent',
+            });
+            await this.publish(uploadId);
+            return;
+          }
+          if (Math.abs(localSize - job.filesize) > tolerance) {
+            await this.ledger.update(uploadId, {
+              status: 'failed',
+              error: `file on rcd host is ${localSize} bytes but the recording is ${job.filesize} — wrong host or stale path?`,
+              failure_kind: 'permanent',
             });
             await this.publish(uploadId);
             return;
           }
         }
-        const jobid = await client.startCopy(job.localPath, job.remotePath);
+        let jobid: number;
+        try {
+          jobid = await client.startCopy(job.localPath, tempPath);
+        } catch (err) {
+          if (isTransientRcError(err)) {
+            await sleep(transientDelay);
+            transientDelay = Math.min(transientDelay * 2, VERIFY_RETRY_MAX_MS);
+            continue;
+          }
+          throw err;
+        }
+        transientDelay = VERIFY_RETRY_MIN_MS;
         await this.ledger.update(uploadId, {
           status: 'uploading',
           rclone_job_id: jobid,
@@ -272,16 +432,16 @@ export class UploadDispatcher {
       }
 
       if (job.status === 'verifying') {
-        // size comparison local vs Drive. rclone already checksum-verifies
-        // each transfer in flight, so a size match on a finished copy means
-        // a verified upload; this also recovers jobs lost to rcd/controller
-        // restarts without needing hashsum support on the rcd.
+        // size comparison local vs the temp object on Drive. rclone already
+        // checksum-verifies each transfer in flight, so a size match on the
+        // finished temp means a verified upload; this also recovers jobs lost
+        // to rcd/controller restarts without needing hashsum support.
         let localSize: number | null;
-        let remoteSize: number | null;
+        let tempSize: number | null;
         try {
-          [localSize, remoteSize] = await Promise.all([
+          [localSize, tempSize] = await Promise.all([
             client.localSize(job.localPath),
-            client.remoteSize(job.remotePath),
+            client.remoteSize(tempPath),
           ]);
         } catch {
           // transient rc error must not fail the upload — retry the verify
@@ -291,36 +451,58 @@ export class UploadDispatcher {
           continue;
         }
         verifyRetryDelay = VERIFY_RETRY_MIN_MS;
-        if (localSize !== null && remoteSize !== null && localSize === remoteSize) {
-          await this.ledger.update(uploadId, {
-            status: 'done',
-            progress: localSize,
-            completed_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
-          });
-          // this upload replaced a previous copy of the same broadcast —
-          // remove the old remote object only now that the new one verified
-          const supersedes = job.supersedesPath;
-          if (supersedes && supersedes !== job.remotePath) {
-            await client.deleteFile(supersedes).catch((err) => {
-              console.error(`upload ${uploadId}: superseded object not removed (${supersedes}):`, err);
-            });
+        if (localSize !== null && tempSize === localSize) {
+          // commit: atomically replace the final object with the verified temp
+          try {
+            await client.deleteFile(job.remotePath).catch(() => {});
+            await client.moveFile(tempPath, job.remotePath);
+          } catch (err) {
+            // the old object may already be gone; a transient swap failure
+            // just retries — the live final object is only removed in the
+            // same step that renames the verified temp in
+            if (isTransientRcError(err)) {
+              await sleep(verifyRetryDelay);
+              verifyRetryDelay = Math.min(verifyRetryDelay * 2, VERIFY_RETRY_MAX_MS);
+              continue;
+            }
+            throw err;
           }
-          await this.publish(uploadId);
+          await this.commitDone(uploadId, client, job, localSize);
           return;
+        }
+        if (localSize !== null && tempSize === null) {
+          // temp gone — a previous run may have already swapped it onto the
+          // final path (crash between move and status update); accept that
+          let finalSize: number | null;
+          try {
+            finalSize = await client.remoteSize(job.remotePath);
+          } catch {
+            await sleep(verifyRetryDelay);
+            verifyRetryDelay = Math.min(verifyRetryDelay * 2, VERIFY_RETRY_MAX_MS);
+            continue;
+          }
+          if (finalSize === localSize) {
+            await this.commitDone(uploadId, client, job, localSize);
+            return;
+          }
         }
         if (localSize === null) {
           await this.ledger.update(uploadId, {
             status: 'failed',
             error: `local file missing: ${job.localPath}`,
+            failure_kind: 'permanent',
           });
+          await client.deleteFile(tempPath).catch(() => {});
           await this.publish(uploadId);
           return;
         }
         if (job.attempts >= MAX_ATTEMPTS) {
           await this.ledger.update(uploadId, {
             status: 'failed',
-            error: `size mismatch after upload (local ${localSize}, remote ${remoteSize ?? 'missing'})`,
+            error: `size mismatch after upload (local ${localSize}, temp ${tempSize ?? 'missing'})`,
+            failure_kind: 'permanent',
           });
+          await client.deleteFile(tempPath).catch(() => {});
           await this.publish(uploadId);
           return;
         }
