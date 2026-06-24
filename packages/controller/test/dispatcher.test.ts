@@ -23,6 +23,7 @@ import { RcloneRcError } from '../src/uploads/rcloneRc.js';
 import {
   UploadDispatcher,
   isTransientRcError,
+  rcErrorText,
   tempRemotePath,
 } from '../src/uploads/dispatcher.js';
 
@@ -37,6 +38,18 @@ describe('isTransientRcError', () => {
   it('treats 4xx as terminal (bad path/request)', () => {
     expect(isTransientRcError(new RcloneRcError(400, '/x', 'bad'))).toBe(false);
     expect(isTransientRcError(new RcloneRcError(404, '/x', 'missing'))).toBe(false);
+  });
+});
+
+describe('rcErrorText', () => {
+  it('surfaces a network syscall code as-is', () => {
+    const e = Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+    expect(rcErrorText(e)).toContain('ECONNREFUSED');
+  });
+  it('uses the RcloneRcError message (with the failing path)', () => {
+    expect(rcErrorText(new RcloneRcError(500, '/operations/stat', 'boom'))).toContain(
+      'operations/stat',
+    );
   });
 });
 
@@ -59,6 +72,7 @@ const SNAKE_TO_CAMEL: Record<string, string> = {
 class FakeLedger {
   jobs = new Map<string, UploadJob>();
   preExisting: UploadJob[] = [];
+  seenErrors: string[] = [];
   private seq = 0;
 
   async claim(
@@ -104,6 +118,7 @@ class FakeLedger {
   }
 
   async update(id: string, patch: Record<string, unknown>) {
+    if (typeof patch.error === 'string') this.seenErrors.push(patch.error);
     const j = this.jobs.get(id) as unknown as Record<string, unknown> | undefined;
     if (!j) return;
     for (const [k, v] of Object.entries(patch)) j[SNAKE_TO_CAMEL[k] ?? k] = v;
@@ -234,6 +249,40 @@ describe('UploadDispatcher manual overwrite (Part 4)', () => {
     expect(client.stopJob).toHaveBeenCalledWith(5);
     expect(job!.id).not.toBe('old-inflight');
     await dispatcher.stop(0);
+  });
+});
+
+describe('UploadDispatcher transient-error reporting', () => {
+  it('reports a connection failure as-is (not "file not found") and retries to success', async () => {
+    vi.useFakeTimers();
+    try {
+      const ledger = new FakeLedger();
+      const dispatcher = makeDispatcher(ledger);
+      const order: string[] = [];
+      const client = makeClient(order);
+      let calls = 0;
+      client.localSize = vi.fn(async () => {
+        // first reachability check fails as if the rcd were firewalled off
+        if (++calls === 1) {
+          throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+        }
+        return 100;
+      });
+      (dispatcher as unknown as { clients: Map<string, unknown> }).clients.set('tyo1', client);
+
+      const { job } = await dispatcher.enqueue('tyo1', entry(), []);
+      await vi.advanceTimersByTimeAsync(6_000); // let the transient backoff elapse
+      await (dispatcher as unknown as { instanceQueues: Map<string, Promise<void>> }).instanceQueues.get('tyo1');
+
+      // the real cause was surfaced, the misleading message never was
+      expect(ledger.seenErrors.some((e) => e.includes('ECONNREFUSED'))).toBe(true);
+      expect(ledger.seenErrors.some((e) => /file not found/i.test(e))).toBe(false);
+      // and once the rcd was reachable again it completed without manual help
+      expect(ledger.jobs.get(job!.id)!.status).toBe('done');
+      await dispatcher.stop(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

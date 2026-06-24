@@ -45,6 +45,20 @@ export function isTransientRcError(err: unknown): boolean {
   return true;
 }
 
+/**
+ * Human-readable cause of an rc failure, reported AS-IS so a network/firewall
+ * problem never masquerades as something else (e.g. "file not found"). Network
+ * throws surface their syscall code (ECONNREFUSED, ETIMEDOUT, …).
+ */
+export function rcErrorText(err: unknown): string {
+  if (err instanceof RcloneRcError) return err.message;
+  const code =
+    (err as { cause?: { code?: string }; code?: string })?.cause?.code ??
+    (err as { code?: string })?.code;
+  const msg = err instanceof Error ? err.message : String(err);
+  return code ? `${msg} (${code})` : msg;
+}
+
 /** deterministic per-upload temp object, so it survives a controller restart */
 export function tempRemotePath(job: Pick<UploadJob, 'id' | 'remotePath'>): string {
   return `${job.remotePath}.tvhc-part-${job.id.slice(0, 8)}`;
@@ -224,6 +238,16 @@ export class UploadDispatcher {
     if (job) this.bus.publish({ type: 'upload-progress', data: job });
   }
 
+  /**
+   * Record the real cause of a transient stall on the job (and publish it) so a
+   * network/firewall block is reported as-is while the upload keeps retrying —
+   * instead of silently sitting queued or, worse, a misleading "file not found".
+   */
+  private async noteTransient(uploadId: string, message: string): Promise<void> {
+    await this.ledger.update(uploadId, { error: message });
+    await this.publish(uploadId);
+  }
+
   /** queue an upload's state machine behind others on the same instance */
   private drive(uploadId: string, instanceId?: string): Promise<void> {
     const key = instanceId ?? '';
@@ -272,6 +296,7 @@ export class UploadDispatcher {
     await this.ledger.update(uploadId, {
       status: 'done',
       progress: size,
+      error: null, // clear any transient note recorded while retrying
       completed_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
     });
     // this upload replaced a previous copy of the same broadcast at a
@@ -338,8 +363,11 @@ export class UploadDispatcher {
             localSize = await client.localSize(job.localPath);
           } catch (err) {
             // rcd unreachable — wait it out instead of failing (resume() and
-            // the verify step share this "transient never fails" contract)
+            // the verify step share this "transient never fails" contract).
+            // record the REAL cause so a network/firewall block is reported
+            // as-is, not as a bogus "file not found".
             if (isTransientRcError(err)) {
+              await this.noteTransient(uploadId, `rcd unreachable while checking the file: ${rcErrorText(err)}`);
               await sleep(transientDelay);
               transientDelay = Math.min(transientDelay * 2, VERIFY_RETRY_MAX_MS);
               continue;
@@ -372,6 +400,7 @@ export class UploadDispatcher {
           jobid = await client.startCopy(job.localPath, tempPath);
         } catch (err) {
           if (isTransientRcError(err)) {
+            await this.noteTransient(uploadId, `rcd unreachable while starting the copy: ${rcErrorText(err)}`);
             await sleep(transientDelay);
             transientDelay = Math.min(transientDelay * 2, VERIFY_RETRY_MAX_MS);
             continue;
@@ -443,9 +472,11 @@ export class UploadDispatcher {
             client.localSize(job.localPath),
             client.remoteSize(tempPath),
           ]);
-        } catch {
+        } catch (err) {
           // transient rc error must not fail the upload — retry the verify
-          // with backoff so an unreachable rcd doesn't hot-loop
+          // with backoff so an unreachable rcd doesn't hot-loop; report the
+          // real cause meanwhile rather than leaving it blank
+          await this.noteTransient(uploadId, `rcd unreachable while verifying: ${rcErrorText(err)}`);
           await sleep(verifyRetryDelay);
           verifyRetryDelay = Math.min(verifyRetryDelay * 2, VERIFY_RETRY_MAX_MS);
           continue;
@@ -461,6 +492,7 @@ export class UploadDispatcher {
             // just retries — the live final object is only removed in the
             // same step that renames the verified temp in
             if (isTransientRcError(err)) {
+              await this.noteTransient(uploadId, `rcd unreachable while committing the upload: ${rcErrorText(err)}`);
               await sleep(verifyRetryDelay);
               verifyRetryDelay = Math.min(verifyRetryDelay * 2, VERIFY_RETRY_MAX_MS);
               continue;
