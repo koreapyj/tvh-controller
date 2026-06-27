@@ -16,28 +16,21 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
-  import type { DvrState, InstanceOverview, RecordingGroup } from '@tvhc/shared';
+  import type { InstanceOverview } from '@tvhc/shared';
   import { api } from '../lib/api.js';
-  import { bytes, duration, ts } from '../lib/format.js';
+  import { ts } from '../lib/format.js';
   import { instances, recordingsTick, statusByInstance } from '../lib/stores.js';
 
   let { instanceId }: { instanceId: string } = $props();
 
-  let tab: DvrState = $state('upcoming');
-  let groups: RecordingGroup[] = $state([]);
   let overview: InstanceOverview | null = $state(null);
   let error = $state('');
-  let busy = $state(false);
-  let notice = $state('');
 
   const inst = $derived($instances.find((i) => i.id === instanceId));
 
   async function refresh(): Promise<void> {
     try {
-      [overview, groups] = await Promise.all([
-        api.overview(instanceId),
-        api.recordings(instanceId, tab),
-      ]);
+      overview = await api.overview(instanceId);
       error = '';
     } catch (err) {
       error = err instanceof Error ? err.message : String(err);
@@ -46,46 +39,40 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   $effect(() => {
     void instanceId;
-    void tab;
     if ($recordingsTick.n === 0 || $recordingsTick.instanceId === instanceId) {
       void refresh();
     }
   });
 
-  async function upload(dvrUuid: string): Promise<void> {
-    busy = true;
-    notice = '';
-    try {
-      const results = await api.startUploads(instanceId, [dvrUuid]);
-      const r = results[0];
-      if (r?.error) notice = `Upload not started: ${r.error}`;
-      else if (r?.duplicateOf) notice = 'Already uploaded (or uploading) from another instance.';
-      else notice = 'Upload queued.';
-      await refresh();
-    } catch (err) {
-      notice = err instanceof Error ? err.message : String(err);
-    } finally {
-      busy = false;
-    }
+  function snr(v: number | undefined, scale: number | undefined): string {
+    if (!v) return '';
+    return (v / (scale === 2 ? 1000 : 1)).toFixed(1);
   }
 </script>
 
 <h1>{inst?.name ?? instanceId}</h1>
 {#if error}<div class="error-banner">{error}</div>{/if}
-{#if notice}<div class="card" style="margin-bottom:12px">{notice}</div>{/if}
 
 {#if overview}
+  {@const live = $statusByInstance[instanceId]}
+  {@const inputs = live?.inputs ?? overview.inputs}
+  {@const subs = live?.subscriptions ?? overview.subscriptions}
   <div class="toolbar">
     <span class="badge {overview.instance.reachable ? 'ok' : 'bad'}">
       {overview.instance.reachable ? 'online' : 'offline'}
     </span>
     <span class="muted small">{overview.instance.url}</span>
     {#if overview.instance.version}<span class="muted small">v{overview.instance.version}</span>{/if}
+    {#if overview.instance.lastPollAt}
+      <span class="muted small">polled {ts(Date.parse(overview.instance.lastPollAt) / 1000)}</span>
+    {/if}
     <span class="spacer"></span>
-    <span class="muted small">
-      {($statusByInstance[instanceId]?.subscriptions ?? overview.subscriptions).length} active subscriptions
-    </span>
+    <a class="muted small" href="/recordings">
+      {overview.counts.upcoming} upcoming · {overview.counts.finished} finished · {overview.counts.failed} failed
+    </a>
   </div>
+
+  {#if overview.instance.error}<div class="error-banner">{overview.instance.error}</div>{/if}
 
   {#if overview.conflicts.length}
     <div class="error-banner">
@@ -97,91 +84,53 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       {/each}
     </div>
   {/if}
-{/if}
 
-<div class="tabs">
-  {#each ['upcoming', 'finished', 'failed'] as t}
-    <button class:active={tab === t} onclick={() => (tab = t as DvrState)}>
-      {t}
-      {#if overview}({overview.counts[t as DvrState]}){/if}
-    </button>
-  {/each}
-</div>
-
-{#each groups as group (group.label)}
-  <details class="group" open>
-    <summary>
-      <b>{group.label}</b>
-      <span class="badge neutral">{group.entries.length}</span>
-      {#if group.masterRuleId}<span class="badge info">managed</span>{/if}
-    </summary>
+  <h2>Tuners / inputs</h2>
+  {#if inputs.length}
     <table>
       <thead>
-        <tr>
-          <th>Title</th>
-          <th>Channel</th>
-          <th>Time</th>
-          <th>Duration</th>
-          {#if tab === 'finished'}<th>Size</th><th>Errors</th><th></th>{/if}
-          {#if tab === 'failed'}<th>Status</th>{/if}
-          {#if tab === 'upcoming'}<th></th>{/if}
-        </tr>
+        <tr><th>Input</th><th>Stream</th><th>Subs</th><th>Weight</th><th>SNR</th><th>Signal</th></tr>
       </thead>
       <tbody>
-        {#each group.entries as e (e.uuid)}
+        {#each inputs as input (input.uuid)}
           <tr>
-            <td>
-              {e.disp_title}
-              {#if e.disp_subtitle}<span class="muted small"> · {e.disp_subtitle}</span>{/if}
-            </td>
-            <td class="small">{e.channelname}</td>
-            <td class="small muted">{ts(e.start_real ?? e.start)}</td>
-            <td class="small muted">{duration(e.start, e.stop)}</td>
-            {#if tab === 'finished'}
-              <td class="small muted">{bytes(e.filesize)}</td>
-              <td style="white-space:nowrap">
-                {#if (e.errors ?? 0) === 0 && (e.data_errors ?? 0) === 0}
-                  <span class="badge ok">clean</span>
-                {:else}
-                  <span
-                    class="badge {(e.errors ?? 0) > 0 ? 'bad' : 'warn'}"
-                    title="{e.errors ?? 0} stream errors, {e.data_errors ?? 0} data (TS) errors"
-                  >
-                    {e.errors ?? 0} err · {e.data_errors ?? 0} data
-                  </span>
-                {/if}
-              </td>
-              <td>
-                {#if e.upload}
-                  <span class="badge {e.upload.status === 'done' ? 'ok' : 'info'}">
-                    {e.upload.status === 'done' ? 'uploaded' : e.upload.status}
-                    {#if e.upload.byInstanceId !== instanceId}(by {e.upload.byInstanceId}){/if}
-                  </span>
-                {:else}
-                  <button disabled={busy} onclick={() => upload(e.uuid)}>Upload</button>
-                {/if}
-              </td>
-            {/if}
-            {#if tab === 'failed'}
-              <td style="white-space:nowrap"><span class="badge bad">{e.status ?? 'failed'}</span>
-                {#if e.errors || e.data_errors}
-                  <span class="muted small" title="{e.errors ?? 0} stream errors, {e.data_errors ?? 0} data (TS) errors">
-                    {e.errors ?? 0} err · {e.data_errors ?? 0} data
-                  </span>
-                {/if}
-              </td>
-            {/if}
-            {#if tab === 'upcoming'}
-              <td>
-                {#if e.conflictLevel === 'conflict'}<span class="badge bad">conflict</span>
-                {:else if e.conflictLevel === 'low-margin'}<span class="badge warn">low margin</span>{/if}
-              </td>
-            {/if}
+            <td class="small">{input.input}</td>
+            <td class="small muted">{input.stream ?? ''}</td>
+            <td class="small muted">{input.subs ?? 0}</td>
+            <td class="small muted">{input.weight ?? ''}</td>
+            <td class="small muted">{snr(input.snr, input.snr_scale)}</td>
+            <td class="small muted">{snr(input.signal, input.signal_scale)}</td>
           </tr>
         {/each}
       </tbody>
     </table>
-  </details>
+  {:else}
+    <div class="muted">No active inputs.</div>
+  {/if}
+
+  <h2>Active subscriptions <span class="badge neutral">{subs.length}</span></h2>
+  {#if subs.length}
+    <table>
+      <thead>
+        <tr><th>Title</th><th>Channel</th><th>Client</th><th>State</th><th>Errors</th></tr>
+      </thead>
+      <tbody>
+        {#each subs as s (s.id)}
+          <tr>
+            <td class="small">{s.title ?? ''}</td>
+            <td class="small muted">{s.channel ?? s.service ?? ''}</td>
+            <td class="small muted">{s.client ?? s.hostname ?? s.username ?? ''}</td>
+            <td class="small muted">{s.state ?? ''}</td>
+            <td class="small muted" style="color:{(s.errors ?? 0) > 0 ? 'var(--bad)' : 'inherit'}">
+              {s.errors ?? 0}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {:else}
+    <div class="muted">No active subscriptions.</div>
+  {/if}
 {:else}
-  <div class="muted">No {tab} recordings.</div>
-{/each}
+  <div class="muted">loading…</div>
+{/if}

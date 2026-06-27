@@ -130,6 +130,60 @@ export interface TvhDvrConfig {
   pathname?: string;
 }
 
+/**
+ * One EPG broadcast from /api/epg/events/grid (and /load). Field names match
+ * tvheadend's JSON exactly (see .claude/ref/tvheadend/src/api/api_epg.c).
+ * Boolean-ish flags are emitted as 0/1.
+ */
+export interface TvhEpgEvent {
+  eventId: number;
+  eventId_xmltv?: string;
+  episodeUri?: string;
+  serieslinkUri?: string;
+  channelName: string;
+  channelUuid: string;
+  channelNumber?: string;
+  channelIcon?: string;
+  start: number;
+  stop: number;
+  title?: string;
+  subtitle?: string;
+  summary?: string;
+  description?: string;
+  credits?: Record<string, string>;
+  category?: string[];
+  keyword?: string[];
+  new?: number;
+  repeat?: number;
+  widescreen?: number;
+  deafsigned?: number;
+  subtitled?: number;
+  audiodesc?: number;
+  hd?: number;
+  bw?: number;
+  lines?: number;
+  aspect?: number;
+  seasonNumber?: number;
+  seasonCount?: number;
+  episodeNumber?: number;
+  episodeCount?: number;
+  partNumber?: number;
+  partCount?: number;
+  episodeOnscreen?: string;
+  image?: string;
+  starRating?: number;
+  ageRating?: number;
+  ratingLabel?: string;
+  ratingLabelIcon?: string;
+  first_aired?: number;
+  copyright_year?: number;
+  genre?: number[];
+  /** present when this broadcast already has a DVR entry */
+  dvrUuid?: string;
+  dvrState?: string;
+  nextEventId?: number;
+}
+
 export interface TvhInputStatus {
   uuid: string;
   input: string;

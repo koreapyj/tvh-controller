@@ -16,7 +16,13 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import type { TvhDvrEntry, TvhInputStatus, TvhSubscription, DvrState } from './tvh-types.js';
+import type {
+  TvhDvrEntry,
+  TvhEpgEvent,
+  TvhInputStatus,
+  TvhSubscription,
+  DvrState,
+} from './tvh-types.js';
 import type { DriftItem, MasterRulePayload, RuleInstances, SyncState } from './master-rule.js';
 import type { UploadJob, UploadStatus } from './rclone-rc.js';
 
@@ -150,6 +156,42 @@ export interface ChannelOption {
   eitOffsetMinutes: number | null;
 }
 
+/** one instance's copy of an EPG broadcast in the unified EPG view */
+export interface UnifiedEpgCopy {
+  instanceId: string;
+  eventId: number;
+  /** present when this broadcast is already scheduled/recording on the instance */
+  dvrUuid?: string;
+  dvrState?: string;
+}
+
+/** an EPG broadcast, deduplicated across instances by channel + time overlap */
+export interface UnifiedEpgEvent {
+  channelName: string;
+  /** tvheadend channel number, e.g. "5.1" — part of the channel identity */
+  channelNumber: string | null;
+  title: string;
+  subtitle?: string;
+  start: number;
+  stop: number;
+  /** representative full event for the Broadcast Details modal */
+  details: TvhEpgEvent;
+  copies: UnifiedEpgCopy[];
+  /** instance auto-picked to record (capacity-aware); null when none reachable */
+  recommendedInstanceId: string | null;
+}
+
+export interface EpgRecordRequest {
+  instanceId: string;
+  eventId: number;
+}
+
+/** a distinct EPG channel (name + number), for the EPG channel filter */
+export interface EpgChannel {
+  name: string;
+  number: string | null;
+}
+
 export type SseEvent =
   | { type: 'instance-status'; data: InstanceSummary }
   | {
@@ -157,6 +199,7 @@ export type SseEvent =
       data: { instanceId: string; inputs: TvhInputStatus[]; subscriptions: TvhSubscription[] };
     }
   | { type: 'recordings'; data: { instanceId: string; state: DvrState } }
+  | { type: 'epg'; data: { instanceId: string } }
   | { type: 'drift'; data: { items: DriftItem[] } }
   | { type: 'conflicts'; data: { instanceId: string; windows: ConflictWindow[] } }
   | { type: 'upload-progress'; data: UploadJob };

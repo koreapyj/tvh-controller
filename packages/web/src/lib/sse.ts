@@ -27,6 +27,7 @@ import type {
 import {
   conflictsByInstance,
   driftItems,
+  epgTick,
   instances,
   recordingsTick,
   sseConnected,
@@ -66,6 +67,10 @@ export function connectSse(): void {
   source.addEventListener('recordings', (e) => {
     const { instanceId } = JSON.parse(e.data) as { instanceId: string };
     recordingsTick.update((t) => ({ instanceId, n: t.n + 1 }));
+  });
+
+  source.addEventListener('epg', () => {
+    epgTick.update((n) => n + 1);
   });
 
   source.addEventListener('conflicts', (e) => {

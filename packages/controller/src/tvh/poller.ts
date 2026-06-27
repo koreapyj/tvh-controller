@@ -19,6 +19,7 @@
 import type {
   DvrState,
   TvhDvrEntry,
+  TvhEpgEvent,
   TvhHardwareNode,
   TvhInputStatus,
   TvhSubscription,
@@ -47,6 +48,27 @@ function dvrChanged(prev: TvhDvrEntry[], next: TvhDvrEntry[]): boolean {
   });
 }
 
+/** meaningful EPG change for the guide view (ignores churn like description edits) */
+function epgChanged(prev: TvhEpgEvent[], next: TvhEpgEvent[]): boolean {
+  if (prev.length !== next.length) return true;
+  const prevById = new Map(prev.map((e) => [e.eventId, e]));
+  return next.some((e) => {
+    const p = prevById.get(e.eventId);
+    return (
+      !p ||
+      p.start !== e.start ||
+      p.stop !== e.stop ||
+      p.title !== e.title ||
+      p.dvrUuid !== e.dvrUuid ||
+      p.dvrState !== e.dvrState
+    );
+  });
+}
+
+/** EPG cache window: current + next ~7 days (the usual EIT horizon), capped */
+const EPG_WINDOW_SECONDS = 7 * 24 * 3600;
+const EPG_LIMIT = 20000;
+
 export class InstancePoller {
   readonly client: TvhClient;
   private timers: NodeJS.Timeout[] = [];
@@ -56,6 +78,7 @@ export class InstancePoller {
   private statusPublishTimer: NodeJS.Timeout | null = null;
   private dvrPollPending = false;
   private autorecPollPending = false;
+  private epgPollPending = false;
   /** subscribers notified when upcoming entries or topology changed */
   onCapacityInputsChanged: (() => void) | null = null;
   onAutorecsChanged: (() => void) | null = null;
@@ -93,15 +116,20 @@ export class InstancePoller {
     this.schedule(() => this.pollDvrAndStatus(), this.intervals.dvr, jitter);
     this.schedule(() => this.pollAutorecs(), this.intervals.autorec, jitter + 500);
     this.schedule(() => this.pollTopology(), this.intervals.topology, jitter + 1000);
+    this.schedule(() => this.pollEpg(), this.intervals.epg, jitter + 1500);
 
-    // comet push (same channel the tvheadend web UI uses) for sub-second
-    // input/subscription updates; periodic polling stays as the fallback
-    // and consistency pass. WebSocket cannot carry auth headers, so comet
-    // is only attempted for credential-less instances.
-    if (!this.instance.username) {
-      this.comet = new CometClient(this.instance.url, (n) => this.handleComet(n));
-      this.comet.start();
-    }
+    // comet push (same channel the tvheadend web UI uses) drives sub-second
+    // input/subscription updates and triggers DVR/autorec/EPG refreshes;
+    // periodic polling stays only as the fallback/consistency pass. The comet
+    // upgrade is authenticated (Basic→Digest) so it works for all instances.
+    this.comet = new CometClient(
+      this.instance.url,
+      (n) => this.handleComet(n),
+      undefined,
+      this.instance.username,
+      this.instance.password,
+    );
+    this.comet.start();
   }
 
   stop(): void {
@@ -122,8 +150,12 @@ export class InstancePoller {
       this.mergeSubscription(n);
     } else if (cls === 'dvrentry') {
       this.triggerDvrPoll();
+      // a new/removed recording also flips an EPG event's dvrState
+      this.triggerEpgPoll();
     } else if (cls.includes('autorec')) {
       this.triggerAutorecPoll();
+    } else if (cls === 'epg') {
+      this.triggerEpgPoll();
     }
   }
 
@@ -185,6 +217,18 @@ export class InstancePoller {
       setTimeout(() => {
         this.autorecPollPending = false;
         void this.pollAutorecs().catch(() => {});
+      }, 1500),
+    );
+  }
+
+  /** re-poll the EPG grid shortly after a comet `epg`/`dvrentry` notification */
+  private triggerEpgPoll(): void {
+    if (this.epgPollPending || this.stopped) return;
+    this.epgPollPending = true;
+    this.timers.push(
+      setTimeout(() => {
+        this.epgPollPending = false;
+        void this.pollEpg().catch(() => {});
       }, 1500),
     );
   }
@@ -271,6 +315,22 @@ export class InstancePoller {
     if (prevKey !== JSON.stringify(autorecs)) {
       this.onAutorecsChanged?.();
     }
+  }
+
+  /** refresh the bounded EPG window; comet `epg` push drives this between polls */
+  async pollEpg(): Promise<void> {
+    const snap = this.cache.get(this.instance.id);
+    const now = Math.floor(Date.now() / 1000);
+    const horizon = now + EPG_WINDOW_SECONDS;
+    // server-side filter to currently-airing + future events so the row budget
+    // isn't spent on broadcasts that already ended (EPG holds ~weeks of events)
+    const all = await this.client.epgEventsGrid(EPG_LIMIT, {
+      filter: [{ field: 'stop', type: 'numeric', comparison: 'gt', value: now }],
+    });
+    const epg = all.filter((e) => e.start <= horizon);
+    const changed = epgChanged(snap.epg, epg);
+    snap.epg = epg;
+    if (changed) this.bus.publish({ type: 'epg', data: { instanceId: this.instance.id } });
   }
 
   /** the tree endpoint returns one level per call — walk it breadth-first */

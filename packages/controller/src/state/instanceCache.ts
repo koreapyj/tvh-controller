@@ -22,6 +22,7 @@ import type {
   TvhChannelTag,
   TvhDvrConfig,
   TvhDvrEntry,
+  TvhEpgEvent,
   TvhHardwareNode,
   TvhInputStatus,
   TvhMux,
@@ -50,6 +51,8 @@ export interface InstanceSnapshot {
   upcoming: TvhDvrEntry[];
   finished: TvhDvrEntry[];
   failed: TvhDvrEntry[];
+  /** upcoming EPG broadcasts (bounded window), refreshed via comet push + slow poll */
+  epg: TvhEpgEvent[];
   inputs: TvhInputStatus[];
   subscriptions: TvhSubscription[];
   autorecs: TvhAutorecRule[];
@@ -77,6 +80,7 @@ export function emptySnapshot(
     upcoming: [],
     finished: [],
     failed: [],
+    epg: [],
     inputs: [],
     subscriptions: [],
     autorecs: [],

@@ -20,7 +20,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { api } from './lib/api.js';
   import { interceptLinkClicks, route } from './lib/router.js';
   import { channelOptions, instances, sseConnected } from './lib/stores.js';
-  import Dashboard from './pages/Dashboard.svelte';
+  import EPG from './pages/EPG.svelte';
+  import Instances from './pages/Instances.svelte';
   import Recordings from './pages/Recordings.svelte';
   import Instance from './pages/Instance.svelte';
   import Rules from './pages/Rules.svelte';
@@ -65,22 +66,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <div class="layout">
   <nav class="sidebar" class:open={navOpen}>
     <div class="brand">tvh controller</div>
-    <a href="/" class:active={$route.page === 'dashboard'}>Dashboard</a>
+    <a href="/epg" class:active={$route.page === 'epg'}>EPG</a>
+    <a
+      href="/instances"
+      class:active={$route.page === 'instances' || $route.page === 'instance'}>Instances</a
+    >
     <a href="/recordings" class:active={$route.page === 'recordings'}>Recordings</a>
     <a href="/rules" class:active={$route.page === 'rules'}>Autorec Rules</a>
     <a href="/drift" class:active={$route.page === 'drift'}>Drift</a>
     <a href="/conflicts" class:active={$route.page === 'conflicts'}>Conflicts</a>
     <a href="/uploads" class:active={$route.page === 'uploads'}>Uploads</a>
-    <div class="section">Instances</div>
-    {#each $instances as inst (inst.id)}
-      <a
-        href="/instance/{inst.id}"
-        class:active={$route.page === 'instance' && $route.instanceId === inst.id}
-      >
-        {inst.name}
-        <span class="badge {inst.reachable ? 'ok' : 'bad'}">{inst.reachable ? 'up' : 'down'}</span>
-      </a>
-    {/each}
     <div style="flex:1"></div>
     <div class="section">
       {#if $sseConnected}<span class="badge ok">live</span>{:else}<span class="badge warn">reconnecting…</span>{/if}
@@ -88,8 +83,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   </nav>
 
   <main>
-    {#if $route.page === 'dashboard'}
-      <Dashboard />
+    {#if $route.page === 'epg'}
+      <EPG />
+    {:else if $route.page === 'instances'}
+      <Instances />
     {:else if $route.page === 'recordings'}
       <Recordings />
     {:else if $route.page === 'instance' && $route.instanceId}

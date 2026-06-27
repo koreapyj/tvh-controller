@@ -22,6 +22,7 @@ import type {
   TvhChannelTag,
   TvhDvrConfig,
   TvhDvrEntry,
+  TvhEpgEvent,
   TvhGridResponse,
   TvhHardwareNode,
   TvhInputStatus,
@@ -198,5 +199,34 @@ export class TvhClient {
       '/api/mpegts/input/network_list',
       { uuid: frontendUuid },
     ).then((r) => r.entries ?? []);
+  }
+
+  /**
+   * EPG broadcasts, sorted by start ascending (tvheadend only keeps current +
+   * future events, so this is effectively the upcoming guide). Callers trim to
+   * a window; `extra` can carry `channel`, `title`, `mode`, etc.
+   */
+  epgEventsGrid(limit = 2000, extra: Params = {}): Promise<TvhEpgEvent[]> {
+    return this.grid<TvhEpgEvent>('/api/epg/events/grid', limit, {
+      sort: 'start',
+      dir: 'ASC',
+      ...extra,
+    });
+  }
+
+  /** full details for one broadcast (description/credits/etc.) */
+  epgEventLoad(eventId: number): Promise<TvhEpgEvent | null> {
+    return this.call<{ entries?: TvhEpgEvent[] }>('/api/epg/events/load', { eventId }).then(
+      (r) => r.entries?.[0] ?? null,
+    );
+  }
+
+  /** schedule a one-time recording from an EPG event; '' config = instance default */
+  async dvrEntryCreateByEvent(eventId: number, configUuid = ''): Promise<string[]> {
+    const res = await this.call<{ uuid?: string[] | string }>('/api/dvr/entry/create_by_event', {
+      event_id: eventId,
+      config_uuid: configUuid,
+    });
+    return Array.isArray(res.uuid) ? res.uuid : res.uuid ? [res.uuid] : [];
   }
 }

@@ -18,7 +18,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import type { InstanceOverview } from '@tvhc/shared';
   import { api } from '../lib/api.js';
-  import { duration, ts } from '../lib/format.js';
   import { conflictsByInstance, instances, recordingsTick, statusByInstance } from '../lib/stores.js';
 
   let overviews: Record<string, InstanceOverview> = $state({});
@@ -47,7 +46,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   });
 </script>
 
-<h1>Dashboard</h1>
+<h1>Instances</h1>
 {#if error}<div class="error-banner">{error}</div>{/if}
 
 <div class="cards">
@@ -79,23 +78,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           </div>
           <div><b>{subs.length}</b> <span class="muted small">subs</span></div>
         </div>
-
-        {#if o.nextRecordings.length}
-          <h2>Next recordings</h2>
-          <table>
-            <tbody>
-              {#each o.nextRecordings as rec}
-                <tr>
-                  <td class="small">
-                    {#if rec.sched_status === 'recording'}<span class="rec-dot rec-blink" title="recording"></span> {/if}{rec.disp_title}
-                  </td>
-                  <td class="small muted">{rec.channelname}</td>
-                  <td class="small muted">{ts(rec.start_real ?? rec.start)} · {duration(rec.start, rec.stop)}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        {/if}
 
         {#if inputs.length}
           <h2>Inputs</h2>

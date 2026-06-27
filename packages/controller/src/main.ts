@@ -24,6 +24,7 @@ import fastifyStatic from '@fastify/static';
 import { loadConfig } from './config.js';
 import { initDb } from './db/db.js';
 import { ConflictService } from './capacity/service.js';
+import { registerEpgRoutes } from './routes/epg.js';
 import { registerEventRoutes } from './routes/events.js';
 import { registerInstanceRoutes } from './routes/instances.js';
 import { registerRuleRoutes } from './routes/rules.js';
@@ -87,6 +88,7 @@ async function main(): Promise<void> {
   // few seconds, which would drown real errors in noise
   const app = Fastify({ logger: true, disableRequestLogging: true });
   registerInstanceRoutes(app, ctx);
+  registerEpgRoutes(app, ctx);
   registerUnifiedRoutes(app, ctx);
   registerRuleRoutes(app, ctx);
   registerUploadRoutes(app, ctx);

@@ -31,6 +31,9 @@ import type {
   ReconcileAction,
   RecordingGroup,
   RuleWithStatus,
+  EpgChannel,
+  TvhEpgEvent,
+  UnifiedEpgEvent,
   UnifiedGroup,
   UploadJob,
   UploadStatus,
@@ -74,6 +77,21 @@ export const api = {
   unifiedRecordings: (state: 'upcoming' | 'finished' | 'failed') =>
     http<UnifiedGroup[]>('GET', `/api/recordings?state=${state}`),
   conflicts: (id: string) => http<ConflictWindow[]>('GET', `/api/instances/${id}/conflicts`),
+
+  epg: (params?: { channels?: string[]; q?: string; offset?: number; limit?: number }) => {
+    const sp = new URLSearchParams();
+    if (params?.channels?.length) sp.set('channels', JSON.stringify(params.channels));
+    if (params?.q) sp.set('q', params.q);
+    if (params?.offset !== undefined) sp.set('offset', String(params.offset));
+    if (params?.limit !== undefined) sp.set('limit', String(params.limit));
+    const qs = sp.toString();
+    return http<{ items: UnifiedEpgEvent[]; total: number }>('GET', `/api/epg${qs ? `?${qs}` : ''}`);
+  },
+  epgChannels: () => http<EpgChannel[]>('GET', '/api/epg/channels'),
+  epgEvent: (instanceId: string, eventId: number) =>
+    http<TvhEpgEvent>('GET', `/api/epg/event/${instanceId}/${eventId}`),
+  recordEvent: (instanceId: string, eventId: number) =>
+    http<{ uuid: string[] }>('POST', '/api/epg/record', { instanceId, eventId }),
 
   rules: () => http<RuleWithStatus[]>('GET', '/api/rules'),
   createRule: (input: RuleInput) => http<RuleWithStatus>('POST', '/api/rules', input),

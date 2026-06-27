@@ -38,6 +38,8 @@ export const statusByInstance = writable<
 export const driftItems = writable<DriftItem[] | null>(null);
 /** bumped when a recordings grid changed on some instance — pages refetch */
 export const recordingsTick = writable<{ instanceId: string; n: number }>({ instanceId: '', n: 0 });
+/** bumped when EPG changed on some instance (comet `epg` push) — the EPG page refetches */
+export const epgTick = writable<number>(0);
 /** last upload progress event — Uploads page merges it in */
 export const uploadEvent = writable<UploadJob | null>(null);
 export const sseConnected = writable(false);

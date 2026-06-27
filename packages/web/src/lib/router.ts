@@ -19,7 +19,15 @@
 import { writable } from 'svelte/store';
 
 export interface Route {
-  page: 'dashboard' | 'recordings' | 'instance' | 'rules' | 'drift' | 'conflicts' | 'uploads';
+  page:
+    | 'epg'
+    | 'instances'
+    | 'recordings'
+    | 'instance'
+    | 'rules'
+    | 'drift'
+    | 'conflicts'
+    | 'uploads';
   instanceId?: string;
   /** query string at NAVIGATION time (in-page filter changes update the URL via replaceState without touching this) */
   search: string;
@@ -28,10 +36,14 @@ export interface Route {
 function parse(pathname: string, search: string): Route {
   const segs = pathname.replace(/^\/+|\/+$/g, '').split('/');
   switch (segs[0]) {
+    case 'epg':
+      return { page: 'epg', search };
+    case 'instances':
+      return { page: 'instances', search };
     case 'instance':
       return segs[1]
         ? { page: 'instance', instanceId: decodeURIComponent(segs[1]), search }
-        : { page: 'dashboard', search };
+        : { page: 'instances', search };
     case 'recordings':
       return { page: 'recordings', search };
     case 'rules':
@@ -43,7 +55,7 @@ function parse(pathname: string, search: string): Route {
     case 'uploads':
       return { page: 'uploads', search };
     default:
-      return { page: 'dashboard', search };
+      return { page: 'epg', search };
   }
 }
 

@@ -17,6 +17,7 @@
  */
 
 import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { parse } from 'yaml';
 
 export interface InstanceRcloneConfig {
@@ -46,7 +47,7 @@ export interface AppConfig {
   /** null = run without persistence: overview only, rule sync and uploads disabled */
   databaseUrl: string | null;
   port: number;
-  pollIntervals: { dvr: number; autorec: number; topology: number };
+  pollIntervals: { dvr: number; autorec: number; topology: number; epg: number };
   overlapThreshold: number;
   /** auto-archive every finished recording's best copy */
   autoUpload: { enabled: boolean; graceSeconds: number };
@@ -80,7 +81,17 @@ export function parseOffset(v: string | number | undefined): number | undefined 
 
 function defaultConfigPath(): string {
   if (process.env.TVHC_CONFIG) return process.env.TVHC_CONFIG;
-  return existsSync('./config.yaml') ? './config.yaml' : '/etc/tvhc/config.yaml';
+  // walk up from the cwd so `pnpm dev` (run inside packages/controller) still
+  // finds the repo-root config.yaml; fall back to the system path otherwise
+  let dir = process.cwd();
+  for (let i = 0; i < 6; i++) {
+    const candidate = join(dir, 'config.yaml');
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return '/etc/tvhc/config.yaml';
 }
 
 export function loadConfig(path = defaultConfigPath()): AppConfig {
@@ -124,6 +135,8 @@ export function loadConfig(path = defaultConfigPath()): AppConfig {
       dvr: raw.pollIntervals?.dvr ?? 15_000,
       autorec: raw.pollIntervals?.autorec ?? 60_000,
       topology: raw.pollIntervals?.topology ?? 600_000,
+      // EPG refreshes via the comet `epg` push; this is only the slow fallback
+      epg: raw.pollIntervals?.epg ?? 600_000,
     },
     overlapThreshold: raw.overlapThreshold ?? 0.7,
     autoUpload:
