@@ -115,6 +115,10 @@ export interface RuleWithStatus {
 export interface UnifiedCopy {
   instanceId: string;
   uuid: string;
+  /** false = recording disabled on this instance */
+  enabled: boolean;
+  /** true when the source DVR entry was created by an autorec rule */
+  fromRule: boolean;
   schedStatus?: string;
   status?: string;
   filesize: number | null;
@@ -122,6 +126,13 @@ export interface UnifiedCopy {
   errors: number;
   dataErrors: number;
   conflictLevel?: 'conflict' | 'low-margin';
+  /** editable scalars — drive the batch-edit modal pre-fill and the "differs" badge */
+  pri?: number;
+  comment?: string;
+  startExtra?: number;
+  stopExtra?: number;
+  removal?: number;
+  retention?: number;
 }
 
 /** a broadcast, deduplicated across instances by channel + time overlap */
@@ -190,6 +201,27 @@ export interface EpgRecordRequest {
 export interface EpgChannel {
   name: string;
   number: string | null;
+}
+
+/** one instance's slice of a recordings batch edit (uuids share the same fields) */
+export interface RecordingEditOp {
+  instanceId: string;
+  uuids: string[];
+  /** allowlisted DVR fields to write: enabled, comment, pri, start_extra, stop_extra, removal, retention */
+  fields: Record<string, unknown>;
+}
+
+export interface RecordingTarget {
+  instanceId: string;
+  uuid: string;
+}
+
+/** per-target outcome of a recordings edit/delete, after read-back verification */
+export interface RecordingBatchResult {
+  instanceId: string;
+  uuid: string;
+  ok: boolean;
+  error?: string;
 }
 
 export type SseEvent =

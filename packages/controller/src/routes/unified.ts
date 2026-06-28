@@ -132,12 +132,20 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
           const copy: UnifiedCopy = {
             instanceId: snap.summary.id,
             uuid: e.uuid,
+            enabled: e.enabled !== false,
+            fromRule: !!e.autorec,
             schedStatus: e.sched_status,
             status: e.status,
             filesize: e.filesize ?? null,
             filename: e.filename ?? null,
             errors: e.errors ?? 0,
             dataErrors: e.data_errors ?? 0,
+            pri: e.pri,
+            comment: e.comment,
+            startExtra: e.start_extra,
+            stopExtra: e.stop_extra,
+            removal: e.removal,
+            retention: e.retention,
           };
           const level = conflictByEntry.get(e.uuid);
           if (level) copy.conflictLevel = level;

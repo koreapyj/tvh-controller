@@ -27,6 +27,7 @@ import { ConflictService } from './capacity/service.js';
 import { registerEpgRoutes } from './routes/epg.js';
 import { registerEventRoutes } from './routes/events.js';
 import { registerInstanceRoutes } from './routes/instances.js';
+import { registerRecordingsRoutes } from './routes/recordings.js';
 import { registerRuleRoutes } from './routes/rules.js';
 import { registerUnifiedRoutes } from './routes/unified.js';
 import { registerUploadRoutes } from './routes/uploads.js';
@@ -90,6 +91,7 @@ async function main(): Promise<void> {
   registerInstanceRoutes(app, ctx);
   registerEpgRoutes(app, ctx);
   registerUnifiedRoutes(app, ctx);
+  registerRecordingsRoutes(app, ctx);
   registerRuleRoutes(app, ctx);
   registerUploadRoutes(app, ctx);
   registerEventRoutes(app, ctx);

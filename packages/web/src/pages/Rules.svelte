@@ -24,6 +24,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { conversionFor, offsetLabel, toEitTime } from '../lib/eit.js';
   import RuleEditor from './RuleEditor.svelte';
   import RuleDetails from '../components/RuleDetails.svelte';
+  import BatchEditModal from '../components/BatchEditModal.svelte';
+  import { RULE_FIELDS } from '../components/batchFields.js';
 
   let rules: RuleWithStatus[] = $state([]);
   let error = $state('');
@@ -344,6 +346,51 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       return;
     await run(() => api.deleteRule(rule.id));
   }
+
+  // ---------- selection & batch ----------
+
+  let selected: Record<string, boolean> = $state({});
+  let batchEditing = $state(false);
+
+  const selectedIds = $derived(ordered.filter((r) => selected[r.id]).map((r) => r.id));
+  const allSelected = $derived(ordered.length > 0 && ordered.every((r) => selected[r.id]));
+
+  function toggleSelect(id: string, checked: boolean): void {
+    selected = { ...selected, [id]: checked };
+  }
+  function toggleAll(checked: boolean): void {
+    const next = { ...selected };
+    for (const r of ordered) next[r.id] = checked;
+    selected = next;
+  }
+
+  async function runRuleBatch(
+    action: 'enable' | 'disable' | 'edit' | 'push',
+    ids: string[],
+    patch?: Partial<MasterRulePayload>,
+  ): Promise<void> {
+    if (!ids.length) return;
+    busy = true;
+    try {
+      const res = await api.batchRules(action, ids, patch);
+      const fails = res.filter((r) => !r.ok);
+      error = fails.length
+        ? `${fails.length} of ${res.length} failed: ${fails.slice(0, 3).map((f) => f.error ?? 'failed').join('; ')}`
+        : '';
+      selected = {};
+      await refresh();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function batchEditSave(out: { fields: Record<string, unknown> }): void {
+    const ids = selectedIds;
+    batchEditing = false;
+    void runRuleBatch('edit', ids, out.fields as Partial<MasterRulePayload>);
+  }
 </script>
 
 <svelte:window onclick={() => (menuFor = null)} />
@@ -412,9 +459,28 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   {/if}
 </div>
 
+{#if selectedIds.length}
+  <div class="toolbar">
+    <span class="muted small">{selectedIds.length} selected</span>
+    <button disabled={busy} onclick={() => runRuleBatch('enable', selectedIds)}>Enable</button>
+    <button disabled={busy} onclick={() => runRuleBatch('disable', selectedIds)}>Disable</button>
+    <button disabled={busy} onclick={() => (batchEditing = true)}>Edit…</button>
+    <button disabled={busy} onclick={() => runRuleBatch('push', selectedIds)}>Push selected</button>
+    <button onclick={() => (selected = {})}>Clear selection</button>
+  </div>
+{/if}
+
 <table class="m-cards">
   <thead>
     <tr>
+      <th style="width:28px">
+        <input
+          type="checkbox"
+          checked={allSelected}
+          onchange={(e) => toggleAll(e.currentTarget.checked)}
+          title="select all"
+        />
+      </th>
       <th class="sortable" onclick={() => clickSort('name')}>Rule{arrow('name')}</th>
       <th class="sortable" onclick={() => clickSort('channel')}>Channel{arrow('channel')}</th>
       <th class="sortable" onclick={() => clickSort('start')}>Start after{arrow('start')}</th>
@@ -432,6 +498,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {#each ordered as rule (rule.id)}
       {@const p = rule.effectivePayload}
       <tr class="m-card">
+        <td>
+          <input
+            type="checkbox"
+            checked={selected[rule.id] ?? false}
+            onchange={(e) => toggleSelect(rule.id, e.currentTarget.checked)}
+            title="select"
+          />
+        </td>
         <td>
           {#if rule.parentId}<span class="muted">↳ </span>{/if}
           <button
@@ -673,4 +747,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       </div>
     </div>
   </div>
+{/if}
+
+{#if batchEditing}
+  <BatchEditModal
+    title={`Edit ${selectedIds.length} rule${selectedIds.length === 1 ? '' : 's'}`}
+    subtitle="Ticked fields are applied to every selected rule; rules stay pending until you push."
+    fields={RULE_FIELDS}
+    onsave={batchEditSave}
+    oncancel={() => (batchEditing = false)}
+  />
 {/if}

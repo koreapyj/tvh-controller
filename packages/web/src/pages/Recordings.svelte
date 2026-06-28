@@ -21,6 +21,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { bytes, duration, ts } from '../lib/format.js';
   import { route } from '../lib/router.js';
   import { instances, recordingsTick } from '../lib/stores.js';
+  import BatchEditModal from '../components/BatchEditModal.svelte';
+  import { RECORDING_FIELDS } from '../components/batchFields.js';
 
   let tab: 'upcoming' | 'finished' | 'failed' = $state('upcoming');
   let groups: UnifiedGroup[] = $state([]);
@@ -36,6 +38,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     tab = t;
     sortKey = 'time';
     sortDir = t === 'upcoming' ? 1 : -1; // past tabs newest-first
+    selected = {};
+    menuFor = null;
   }
 
   function clickSort(key: SortKey): void {
@@ -207,7 +211,198 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       busy = false;
     }
   }
+
+  // ---------- selection & batch ----------
+
+  let selected: Record<string, boolean> = $state({});
+  let menuFor: string | null = $state(null);
+
+  const selectedRows = $derived(rows.filter((r) => selected[rowKey(r.item)]));
+  const allSelected = $derived(rows.length > 0 && rows.every((r) => selected[rowKey(r.item)]));
+
+  function toggleSelect(key: string, checked: boolean): void {
+    selected = { ...selected, [key]: checked };
+  }
+  function toggleAll(checked: boolean): void {
+    const next = { ...selected };
+    for (const r of rows) next[rowKey(r.item)] = checked;
+    selected = next;
+  }
+  function clearSelection(): void {
+    selected = {};
+  }
+
+  /** which tracked editable fields disagree across an item's copies (for the "differs" badge) */
+  function differingFields(item: UnifiedItem): string[] {
+    const cs = item.copies;
+    if (cs.length < 2) return [];
+    const out: string[] = [];
+    if (new Set(cs.map((c) => c.enabled)).size > 1) out.push('enabled');
+    const scalars: Array<[keyof UnifiedCopy, string]> = [
+      ['pri', 'priority'],
+      ['comment', 'comment'],
+      ['startExtra', 'start padding'],
+      ['stopExtra', 'stop padding'],
+      ['removal', 'removal'],
+      ['retention', 'retention'],
+    ];
+    for (const [k, label] of scalars) {
+      const vals = cs.map((c) => c[k]).filter((v) => v !== undefined && v !== null);
+      if (vals.length > 1 && new Set(vals).size > 1) out.push(label);
+    }
+    return out;
+  }
+
+  // ---------- edit / delete modal ----------
+
+  let editRows: Row[] | null = $state(null);
+
+  function openEdit(target: Row[]): void {
+    if (!target.length) return;
+    menuFor = null;
+    editRows = target;
+  }
+
+  const editInstances = $derived.by(() => {
+    if (!editRows) return [] as Array<{ id: string; name: string; initial: boolean | 'mixed' }>;
+    const states = new Map<string, boolean[]>();
+    for (const row of editRows) {
+      for (const c of row.item.copies) {
+        const list = states.get(c.instanceId) ?? [];
+        list.push(c.enabled);
+        states.set(c.instanceId, list);
+      }
+    }
+    return $instances
+      .filter((i) => states.has(i.id))
+      .map((i) => {
+        const en = states.get(i.id)!;
+        const initial: boolean | 'mixed' = en.every(Boolean)
+          ? true
+          : en.every((x) => !x)
+            ? false
+            : 'mixed';
+        return { id: i.id, name: i.name, initial };
+      });
+  });
+
+  const editInstanceSelector = $derived({
+    instances: editInstances.map(({ id, name }) => ({ id, name })),
+    initial: Object.fromEntries(editInstances.map((e) => [e.id, e.initial])),
+  });
+
+  async function runRecordingBatch(
+    fn: () => Promise<Array<{ instanceId: string; uuid: string; ok: boolean; error?: string }>>,
+    okVerb: string,
+  ): Promise<void> {
+    busy = true;
+    notice = '';
+    try {
+      const res = await fn();
+      const fails = res.filter((r) => !r.ok);
+      if (fails.length === 0) {
+        notice = `${okVerb} ${res.length} cop${res.length === 1 ? 'y' : 'ies'}.`;
+      } else {
+        const sample = fails.slice(0, 3).map((f) => `${f.instanceId}: ${f.error ?? 'failed'}`).join('; ');
+        notice = `${res.length - fails.length} ok, ${fails.length} failed — ${sample}${fails.length > 3 ? '…' : ''}`;
+      }
+      selected = {};
+      await refresh();
+    } catch (err) {
+      notice = err instanceof Error ? err.message : String(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function applyEdit(out: { fields: Record<string, unknown>; instanceEnabled: Record<string, boolean> }): void {
+    const target = editRows ?? [];
+    editRows = null;
+    const uniform = { ...out.fields };
+    const enabledOverride = 'enabled' in uniform ? (uniform.enabled as boolean) : undefined;
+    delete uniform.enabled;
+
+    const opsByInstance = new Map<string, { uuids: string[]; fields: Record<string, unknown> }>();
+    for (const row of target) {
+      for (const c of row.item.copies) {
+        const enabledForInst =
+          enabledOverride !== undefined ? enabledOverride : out.instanceEnabled[c.instanceId];
+        const fields: Record<string, unknown> = { ...uniform };
+        if (enabledForInst !== undefined) fields.enabled = enabledForInst;
+        if (Object.keys(fields).length === 0) continue;
+        const acc = opsByInstance.get(c.instanceId) ?? { uuids: [], fields };
+        acc.uuids.push(c.uuid);
+        acc.fields = fields; // identical for every copy on this instance
+        opsByInstance.set(c.instanceId, acc);
+      }
+    }
+    const ops = [...opsByInstance.entries()].map(([instanceId, v]) => ({
+      instanceId,
+      uuids: v.uuids,
+      fields: v.fields,
+    }));
+    if (!ops.length) {
+      notice = 'No changes to apply.';
+      return;
+    }
+    void runRecordingBatch(() => api.editRecordings(ops), 'Updated');
+  }
+
+  function deleteEdit(): void {
+    const target = editRows ?? [];
+    const targets = target.flatMap((row) =>
+      row.item.copies.map((c) => ({ instanceId: c.instanceId, uuid: c.uuid })),
+    );
+    if (!targets.length) return;
+    const instCount = new Set(targets.map((t) => t.instanceId)).size;
+    const ruleUpcoming =
+      tab === 'upcoming' && target.some((row) => row.item.copies.some((c) => c.fromRule));
+    const msg =
+      `Delete ${targets.length} recording cop${targets.length === 1 ? 'y' : 'ies'} across ${instCount} instance(s)?` +
+      (tab === 'finished' ? '\n\nThis permanently deletes the recording files.' : '') +
+      (ruleUpcoming
+        ? '\n\nSome were created by an autorec rule and may be re-created on the next EPG scan — disable instead to skip durably.'
+        : '');
+    if (!confirm(msg)) return;
+    editRows = null;
+    void runRecordingBatch(() => api.deleteRecordings(targets), 'Deleted');
+  }
+
+  async function uploadSelected(): Promise<void> {
+    const picks = selectedRows.map((r) => bestCopy(r.item)).filter((c): c is UnifiedCopy => !!c);
+    if (!picks.length) return;
+    const byInstance = new Map<string, string[]>();
+    for (const c of picks) {
+      const list = byInstance.get(c.instanceId) ?? [];
+      list.push(c.uuid);
+      byInstance.set(c.instanceId, list);
+    }
+    busy = true;
+    notice = '';
+    try {
+      let queued = 0;
+      let dup = 0;
+      let err = 0;
+      for (const [instanceId, uuids] of byInstance) {
+        const res = await api.startUploads(instanceId, uuids);
+        for (const r of res) {
+          if (r.error) err++;
+          else if (r.duplicateOf) dup++;
+          else queued++;
+        }
+      }
+      notice = `Upload: ${queued} queued, ${dup} already uploaded, ${err} failed.`;
+      selected = {};
+      await refresh();
+    } catch (e) {
+      notice = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = false;
+    }
+  }
 </script>
+
+<svelte:window onclick={() => (menuFor = null)} />
 
 <h1>Recordings</h1>
 {#if error}<div class="error-banner">{error}</div>{/if}
@@ -241,9 +436,28 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   {/if}
 </div>
 
+{#if selectedRows.length}
+  <div class="toolbar">
+    <span class="muted small">{selectedRows.length} selected</span>
+    <button disabled={busy} onclick={() => openEdit(selectedRows)}>Edit…</button>
+    {#if tab === 'finished'}
+      <button disabled={busy} onclick={uploadSelected}>Upload selected</button>
+    {/if}
+    <button onclick={clearSelection}>Clear selection</button>
+  </div>
+{/if}
+
 <table class="m-cards">
   <thead>
     <tr>
+      <th style="width:28px">
+        <input
+          type="checkbox"
+          checked={allSelected}
+          onchange={(e) => toggleAll(e.currentTarget.checked)}
+          title="select all"
+        />
+      </th>
       <th class="sortable" onclick={() => clickSort('title')}>Title{arrow('title')}</th>
       <th class="sortable" onclick={() => clickSort('rule')}>Rule{arrow('rule')}</th>
       <th class="sortable" onclick={() => clickSort('channel')}>Channel{arrow('channel')}</th>
@@ -260,18 +474,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         {/each}
       {/if}
       {#if tab === 'finished'}<th>Archive</th>{/if}
+      <th></th>
     </tr>
   </thead>
   <tbody>
     {#each rows as { rule, ruleComment, item } (rowKey(item))}
       {@const key = rowKey(item)}
+      {@const diffs = differingFields(item)}
       <tr class="m-card">
+        <td>
+          <input
+            type="checkbox"
+            checked={selected[key] ?? false}
+            onchange={(e) => toggleSelect(key, e.currentTarget.checked)}
+            title="select"
+          />
+        </td>
         <td>
           <button class="expander" onclick={() => toggle(key)} title="per-instance details">
             {expanded[key] ? '▾' : '▸'}
           </button>
           {item.title}
           {#if item.subtitle}<span class="muted small"> · {item.subtitle}</span>{/if}
+          {#if item.copies.some((c) => !c.enabled)}<span class="badge neutral" title="recording disabled on one or more instances">disabled</span>{/if}
+          {#if diffs.length}<span class="badge warn" title="copies differ on: {diffs.join(', ')}">differs</span>{/if}
         </td>
         <td class="small">
           <button class="linklike muted" title="filter by this rule" onclick={() => (filterRule = rule)}>{rule}</button>
@@ -329,6 +555,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               {:else}
                 <span class="muted small">{bytes(c.filesize)}</span>
               {/if}
+              {#if c && !c.enabled}<span class="badge neutral" title="recording disabled on {inst.name}">disabled</span>{/if}
             </td>
             <td style="white-space:nowrap" class="m-inline">
               {#if c && hasErrorInfo(c)}
@@ -366,6 +593,24 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             {/if}
           </td>
         {/if}
+        <td style="position:relative;text-align:right;white-space:nowrap">
+          <button
+            class="expander"
+            style="font-size:15px;padding:0 4px"
+            title="actions"
+            onclick={(e) => {
+              e.stopPropagation();
+              menuFor = menuFor === key ? null : key;
+            }}
+          >
+            ⋮
+          </button>
+          {#if menuFor === key}
+            <div class="row-menu" role="menu">
+              <button onclick={() => openEdit([{ rule, ruleComment, item }])}>Edit…</button>
+            </div>
+          {/if}
+        </td>
       </tr>
       {#if expanded[key]}
         <tr class="subrow">
@@ -381,6 +626,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                       {:else}
                         {c.status ?? c.schedStatus ?? '—'}
                       {/if}
+                      {#if !c.enabled}<span class="badge neutral">disabled</span>{/if}
                     </td>
                     <td class="small muted" style="width:90px">{bytes(c.filesize)}</td>
                     <td style="width:90px">
@@ -414,3 +660,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {/each}
   </tbody>
 </table>
+
+{#if editRows}
+  <BatchEditModal
+    title={editRows.length === 1 ? 'Edit recording' : `Edit ${editRows.length} recordings`}
+    subtitle="Ticked fields apply to all copies. Instance checkboxes enable/disable per instance (unchecked = disabled)."
+    fields={RECORDING_FIELDS}
+    instanceSelector={editInstanceSelector}
+    onsave={applyEdit}
+    oncancel={() => (editRows = null)}
+    ondelete={deleteEdit}
+    deleteLabel="Delete recording(s)…"
+  />
+{/if}

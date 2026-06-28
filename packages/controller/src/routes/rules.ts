@@ -119,6 +119,38 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
     return sync().pushRule(req.params.id);
   });
 
+  app.post<{
+    Body: {
+      action?: 'enable' | 'disable' | 'edit' | 'push';
+      ids?: string[];
+      patch?: unknown;
+    };
+  }>('/api/rules/batch', async (req) => {
+    const { action, ids, patch } = req.body ?? {};
+    if (!Array.isArray(ids) || ids.length === 0) throw httpError(400, 'ids[] is required');
+    switch (action) {
+      case 'enable':
+        return sync().batchSetEnabled(ids, true);
+      case 'disable':
+        return sync().batchSetEnabled(ids, false);
+      case 'push':
+        return sync().batchPush(ids);
+      case 'edit': {
+        const p = (patch ?? {}) as unknown;
+        if (!Value.Check(PartialPayload, p)) {
+          const first = [...Value.Errors(PartialPayload, p)][0];
+          throw httpError(400, `invalid patch: ${first?.path ?? ''} ${first?.message ?? ''}`);
+        }
+        if (Object.keys(p as Record<string, unknown>).length === 0) {
+          throw httpError(400, 'patch must contain at least one field');
+        }
+        return sync().batchEdit(ids, p as Partial<MasterRulePayload>);
+      }
+      default:
+        throw httpError(400, `unknown action "${String(action)}"`);
+    }
+  });
+
   app.post('/api/sync/push', async () => sync().pushAll());
 
   app.get('/api/sync/drift', async () => sync().computeDrift());

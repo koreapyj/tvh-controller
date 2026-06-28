@@ -52,6 +52,13 @@ export interface RuleInput {
   overlay?: Partial<MasterRulePayload> | null;
 }
 
+/** per-rule outcome of a batch operation (enable/disable/edit/push) */
+export interface RuleBatchResult {
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
 interface BindingRow {
   master_rule_id: string;
   instance_id: string;
@@ -353,6 +360,71 @@ export class SyncEngine {
       })
       .where('id', '=', id)
       .execute();
+  }
+
+  // ---------- batch operations ----------
+
+  /**
+   * Apply a field change to one rule, writing to the payload (plain rule) or the
+   * overlay (linked clone) so plain/clone semantics match a single edit exactly.
+   * Master only — like single edit, the change is left pending until pushed.
+   */
+  private async applyRuleChangeInner(id: string, change: Partial<MasterRulePayload>): Promise<void> {
+    const existing = await this.getRule(id);
+    if (!existing) throw new Error(`rule ${id} not found`);
+    if (existing.deletedAt) throw new Error(`rule "${existing.name}" is deleted — restore it first`);
+    const input: RuleInput = existing.parentId
+      ? {
+          name: existing.name,
+          instances: existing.instances,
+          parentId: existing.parentId,
+          overlay: { ...(existing.overlay ?? {}), ...change },
+        }
+      : {
+          name: existing.name,
+          instances: existing.instances,
+          payload: { ...existing.payload, ...change } as MasterRulePayload,
+        };
+    await this.updateRuleInner(id, input);
+  }
+
+  private async runBatch(
+    ids: string[],
+    fn: (id: string) => Promise<void>,
+  ): Promise<RuleBatchResult[]> {
+    const out: RuleBatchResult[] = [];
+    for (const id of ids) {
+      try {
+        await fn(id);
+        out.push({ id, ok: true });
+      } catch (err) {
+        out.push({ id, ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return out;
+  }
+
+  /** enable/disable many rules (master only — left pending until pushed) */
+  batchSetEnabled(ids: string[], enabled: boolean): Promise<RuleBatchResult[]> {
+    return this.serialize(() =>
+      this.runBatch(ids, (id) => this.applyRuleChangeInner(id, { enabled })),
+    );
+  }
+
+  /** merge a field patch into many rules (master only — left pending until pushed) */
+  batchEdit(ids: string[], patch: Partial<MasterRulePayload>): Promise<RuleBatchResult[]> {
+    const clean = { ...patch };
+    delete (clean as Record<string, unknown>).name; // names stay per-rule unique
+    return this.serialize(() => this.runBatch(ids, (id) => this.applyRuleChangeInner(id, clean)));
+  }
+
+  /** push many rules to their targeted instances */
+  batchPush(ids: string[]): Promise<RuleBatchResult[]> {
+    return this.serialize(() =>
+      this.runBatch(ids, async (id) => {
+        await this.pushRuleInner(id);
+      }),
+    );
   }
 
   /** clone a rule: plain copy of its effective payload, or a linked clone with an empty overlay */

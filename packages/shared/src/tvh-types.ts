@@ -53,6 +53,10 @@ export interface TvhDvrEntry {
   data_errors?: number;
   errorcode?: number;
   pri?: number;
+  /** DVR log retention (days); 0 = config default */
+  retention?: number;
+  /** recording file retention (days); 0 = config default */
+  removal?: number;
   config_name?: string;
   owner?: string;
   creator?: string;

@@ -29,7 +29,10 @@ import type {
   InstanceSummary,
   MasterRulePayload,
   ReconcileAction,
+  RecordingBatchResult,
+  RecordingEditOp,
   RecordingGroup,
+  RecordingTarget,
   RuleWithStatus,
   EpgChannel,
   TvhEpgEvent,
@@ -76,6 +79,10 @@ export const api = {
     http<RecordingGroup[]>('GET', `/api/instances/${id}/recordings?state=${state}`),
   unifiedRecordings: (state: 'upcoming' | 'finished' | 'failed') =>
     http<UnifiedGroup[]>('GET', `/api/recordings?state=${state}`),
+  editRecordings: (ops: RecordingEditOp[]) =>
+    http<RecordingBatchResult[]>('POST', '/api/recordings/edit', { ops }),
+  deleteRecordings: (targets: RecordingTarget[]) =>
+    http<RecordingBatchResult[]>('POST', '/api/recordings/delete', { targets }),
   conflicts: (id: string) => http<ConflictWindow[]>('GET', `/api/instances/${id}/conflicts`),
 
   epg: (params?: { channels?: string[]; q?: string; offset?: number; limit?: number }) => {
@@ -104,6 +111,16 @@ export const api = {
   purgeRule: (id: string) => http<{ ok: boolean }>('DELETE', `/api/rules/${id}/purge`),
   deleteRule: (id: string) => http<{ ok: boolean }>('DELETE', `/api/rules/${id}`),
   pushRule: (id: string) => http<unknown[]>('POST', `/api/rules/${id}/push`),
+  batchRules: (
+    action: 'enable' | 'disable' | 'edit' | 'push',
+    ids: string[],
+    patch?: Partial<MasterRulePayload>,
+  ) =>
+    http<Array<{ id: string; ok: boolean; error?: string }>>('POST', '/api/rules/batch', {
+      action,
+      ids,
+      ...(patch ? { patch } : {}),
+    }),
   pushAll: () => http<unknown[]>('POST', '/api/sync/push'),
   drift: () => http<DriftItem[]>('GET', '/api/sync/drift'),
   reconcile: (driftId: string, action: ReconcileAction) =>
