@@ -25,6 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import RuleEditor from './RuleEditor.svelte';
   import RuleDetails from '../components/RuleDetails.svelte';
   import BatchEditModal from '../components/BatchEditModal.svelte';
+  import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
   import { RULE_FIELDS } from '../components/batchFields.js';
 
   let rules: RuleWithStatus[] = $state([]);
@@ -133,12 +134,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   // ---------- filtering (exact match, set by clicking a cell or the selects) ----------
 
-  let filterChannel: string | null = $state(null);
+  let filterChannels: string[] = $state([]);
   let filterComment: string | null = $state(null);
   let filterZeroMatch = $state(false);
 
   const channelFilterOptions = $derived(
-    [...new Set(rules.map((r) => r.effectivePayload.channel).filter(Boolean))].sort(),
+    [...new Set(rules.map((r) => r.effectivePayload.channel).filter(Boolean))]
+      .sort()
+      .map((c) => ({ value: c, label: c })),
   );
   const commentFilterOptions = $derived(
     [...new Set(rules.map((r) => r.effectivePayload.comment).filter(Boolean))].sort(),
@@ -147,7 +150,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   const filtered = $derived(
     rules.filter(
       (r) =>
-        (filterChannel === null || r.effectivePayload.channel === filterChannel) &&
+        (filterChannels.length === 0 || filterChannels.includes(r.effectivePayload.channel)) &&
         (filterComment === null || r.effectivePayload.comment === filterComment) &&
         (!filterZeroMatch || (r.enabled && r.upcomingMatches === 0)),
     ),
@@ -416,11 +419,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <button class="primary" onclick={() => openEditor(null)}>New rule</button>
   <button disabled={busy} onclick={() => run(() => api.pushAll())}>Push all pending</button>
   <span style="display:flex;gap:6px;align-items:center">
-    <label for="rf-channel" style="margin:0">Channel</label>
-    <select id="rf-channel" style="width:auto" bind:value={filterChannel}>
-      <option value={null}>(any)</option>
-      {#each channelFilterOptions as c}<option value={c}>{c}</option>{/each}
-    </select>
+    <span style="margin:0">Channel</span>
+    <MultiSelectDropdown
+      options={channelFilterOptions}
+      selected={filterChannels}
+      onchange={(next) => (filterChannels = next)}
+      allLabel="All channels"
+      unit="channels"
+      searchPlaceholder="Search channel…"
+    />
     <label for="rf-comment" style="margin:0">Comment</label>
     <select id="rf-comment" style="width:auto" bind:value={filterComment}>
       <option value={null}>(any)</option>
@@ -433,8 +440,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     >
       0 match
     </button>
-    {#if filterChannel !== null || filterComment !== null || filterZeroMatch}
-      <button onclick={() => { filterChannel = null; filterComment = null; filterZeroMatch = false; }}>Clear</button>
+    {#if filterChannels.length || filterComment !== null || filterZeroMatch}
+      <button onclick={() => { filterChannels = []; filterComment = null; filterZeroMatch = false; }}>Clear</button>
       <span class="muted small">{filtered.length} / {rules.length}</span>
     {/if}
   </span>
@@ -530,7 +537,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </td>
         <td class="small m-inline">
           {#if p.channel}
-            <button class="linklike" title="filter by this channel" onclick={() => (filterChannel = p.channel)}>
+            <button class="linklike" title="filter by this channel" onclick={() => (filterChannels = [p.channel])}>
               {p.channel}
             </button>
           {:else}any{/if}

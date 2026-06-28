@@ -204,28 +204,49 @@ export function registerEpgRoutes(app: FastifyInstance, ctx: AppContext): void {
     );
   });
 
+  // apply the same channel + title filters the EPG page uses, so /api/epg and
+  // /api/epg/index agree on the list a jump is computed against
+  function filteredList(channelsRaw?: string, q?: string): UnifiedEpgEvent[] {
+    // `channels` is a JSON array of chanKey() strings (name + number)
+    let keys: Set<string> | null = null;
+    if (channelsRaw) {
+      try {
+        const parsed = JSON.parse(channelsRaw) as unknown;
+        if (Array.isArray(parsed) && parsed.length) keys = new Set(parsed.map(String));
+      } catch {
+        /* ignore malformed filter */
+      }
+    }
+    const ql = q?.toLowerCase();
+    let list = mergedAll();
+    if (keys) list = list.filter((e) => keys!.has(chanKey(e.channelName, e.channelNumber)));
+    if (ql) list = list.filter((e) => `${e.title} ${e.subtitle ?? ''}`.toLowerCase().includes(ql));
+    return list;
+  }
+
   app.get<{ Querystring: { channels?: string; q?: string; offset?: string; limit?: string } }>(
     '/api/epg',
     async (req) => {
-      // `channels` is a JSON array of chanKey() strings (name + number)
-      let keys: Set<string> | null = null;
-      if (req.query.channels) {
-        try {
-          const parsed = JSON.parse(req.query.channels) as unknown;
-          if (Array.isArray(parsed) && parsed.length) keys = new Set(parsed.map(String));
-        } catch {
-          /* ignore malformed filter */
-        }
-      }
-      const q = req.query.q?.toLowerCase();
       const offset = Math.max(0, Number(req.query.offset) || 0);
       const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
-
-      let list = mergedAll();
-      if (keys) list = list.filter((e) => keys!.has(chanKey(e.channelName, e.channelNumber)));
-      if (q) list = list.filter((e) => `${e.title} ${e.subtitle ?? ''}`.toLowerCase().includes(q));
+      const list = filteredList(req.query.channels, req.query.q);
       // paginated for the frontend's infinite scroll
       return { items: list.slice(offset, offset + limit), total: list.length };
+    },
+  );
+
+  // Row index of the first programme starting at/after `at` (unix seconds), for
+  // the EPG "jump to time" control. The list is server-paginated, so the client
+  // can't compute this itself. Upcoming events are start-sorted, so this lands
+  // on the boundary; if nothing starts that late, returns total (end of list).
+  app.get<{ Querystring: { channels?: string; q?: string; at?: string } }>(
+    '/api/epg/index',
+    async (req) => {
+      const list = filteredList(req.query.channels, req.query.q);
+      const at = Number(req.query.at);
+      if (!Number.isFinite(at)) return { index: 0, total: list.length };
+      const idx = list.findIndex((e) => e.start >= at);
+      return { index: idx === -1 ? list.length : idx, total: list.length };
     },
   );
 

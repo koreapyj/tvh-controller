@@ -22,6 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { route } from '../lib/router.js';
   import { instances, recordingsTick } from '../lib/stores.js';
   import BatchEditModal from '../components/BatchEditModal.svelte';
+  import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
   import { RECORDING_FIELDS } from '../components/batchFields.js';
 
   let tab: 'upcoming' | 'finished' | 'failed' = $state('upcoming');
@@ -63,24 +64,40 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // ---------- filters (exact match; deep-linkable via query string) ----------
 
   let filterRule: string | null = $state(null);
-  let filterChannel: string | null = $state(null);
-  let filterDate: string | null = $state(null);
+  let filterComment: string | null = $state(null);
+  let filterChannels: string[] = $state([]);
+  let filterDateFrom = $state('');
+  let filterDateTo = $state('');
+
+  function parseChannels(raw: string | null): string[] {
+    if (!raw) return [];
+    try {
+      const v = JSON.parse(raw) as unknown;
+      return Array.isArray(v) ? v.map((x) => String(x)) : [];
+    } catch {
+      return [];
+    }
+  }
 
   // (re)apply filters from the query string on every NAVIGATION — including
   // re-clicking the sidebar link (go('/recordings') with no query resets them)
   $effect(() => {
     const q = new URLSearchParams($route.search);
     filterRule = q.get('rule');
-    filterChannel = q.get('channel');
-    filterDate = q.get('date');
+    filterComment = q.get('comment');
+    filterChannels = parseChannels(q.get('channels'));
+    filterDateFrom = q.get('from') ?? '';
+    filterDateTo = q.get('to') ?? '';
   });
 
   // keep the URL shareable without triggering navigation
   $effect(() => {
     const q = new URLSearchParams();
     if (filterRule !== null) q.set('rule', filterRule);
-    if (filterChannel !== null) q.set('channel', filterChannel);
-    if (filterDate !== null) q.set('date', filterDate);
+    if (filterComment !== null) q.set('comment', filterComment);
+    if (filterChannels.length) q.set('channels', JSON.stringify(filterChannels));
+    if (filterDateFrom) q.set('from', filterDateFrom);
+    if (filterDateTo) q.set('to', filterDateTo);
     const qs = q.toString();
     window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : ''));
   });
@@ -98,25 +115,39 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     ),
   );
   const ruleFilterOptions = $derived([...new Set(allRows.map((r) => r.rule))].sort());
-  const channelFilterOptions = $derived(
-    [...new Set(allRows.map((r) => r.item.channelname).filter(Boolean))].sort(),
+  const commentFilterOptions = $derived(
+    [...new Set(allRows.map((r) => r.ruleComment).filter(Boolean))].sort(),
   );
-  const dateFilterOptions = $derived(
-    [...new Set(allRows.map((r) => dateOf(r.item.start)))].sort().reverse(),
+  const channelOptions = $derived(
+    [...new Set(allRows.map((r) => r.item.channelname).filter(Boolean))]
+      .sort()
+      .map((c) => ({ value: c, label: c })),
+  );
+
+  const hasFilters = $derived(
+    filterRule !== null ||
+      filterComment !== null ||
+      filterChannels.length > 0 ||
+      filterDateFrom !== '' ||
+      filterDateTo !== '',
   );
 
   function clearFilters(): void {
     filterRule = null;
-    filterChannel = null;
-    filterDate = null;
+    filterComment = null;
+    filterChannels = [];
+    filterDateFrom = '';
+    filterDateTo = '';
   }
 
   const rows: Row[] = $derived.by(() => {
     const flat = allRows.filter(
       (r) =>
         (filterRule === null || r.rule === filterRule) &&
-        (filterChannel === null || r.item.channelname === filterChannel) &&
-        (filterDate === null || dateOf(r.item.start) === filterDate),
+        (filterComment === null || r.ruleComment === filterComment) &&
+        (filterChannels.length === 0 || filterChannels.includes(r.item.channelname)) &&
+        (!filterDateFrom || dateOf(r.item.start) >= filterDateFrom) &&
+        (!filterDateTo || dateOf(r.item.start) <= filterDateTo),
     );
     const cmp = (a: Row, b: Row): number => {
       switch (sortKey) {
@@ -256,12 +287,48 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // ---------- edit / delete modal ----------
 
   let editRows: Row[] | null = $state(null);
+  let editSingle = $state(false);
 
-  function openEdit(target: Row[]): void {
-    if (!target.length) return;
-    menuFor = null;
-    editRows = target;
+  /** recordings batch-field key -> UnifiedCopy property (for single-edit pre-fill) */
+  const KEY_TO_UC: Record<string, keyof UnifiedCopy> = {
+    comment: 'comment',
+    pri: 'pri',
+    start_extra: 'startExtra',
+    stop_extra: 'stopExtra',
+    removal: 'removal',
+  };
+  // single edit drops the Enabled field — the instance selector is the enable control
+  const singleFields = RECORDING_FIELDS.filter((f) => f.key !== 'enabled');
+
+  function openEditBatch(): void {
+    if (!selectedRows.length) return;
+    editSingle = false;
+    editRows = selectedRows;
   }
+  function openEditSingle(row: Row): void {
+    menuFor = null;
+    editSingle = true;
+    editRows = [row];
+  }
+
+  /** single-edit: pre-fill fields the copies agree on; flag the rest as differing */
+  const editPrefill = $derived.by(() => {
+    const values: Record<string, string> = {};
+    const differing: string[] = [];
+    if (!editSingle || !editRows || editRows.length !== 1) return { values, differing };
+    const copies = editRows[0].item.copies;
+    for (const f of singleFields) {
+      const ucKey = KEY_TO_UC[f.key];
+      if (!ucKey) continue;
+      const defined = copies.map((c) => c[ucKey]).filter((v) => v !== undefined && v !== null);
+      if (defined.length === copies.length && new Set(defined.map(String)).size === 1) {
+        values[f.key] = String(defined[0]);
+      } else {
+        differing.push(f.key);
+      }
+    }
+    return { values, differing };
+  });
 
   const editInstances = $derived.by(() => {
     if (!editRows) return [] as Array<{ id: string; name: string; initial: boolean | 'mixed' }>;
@@ -420,17 +487,25 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <option value={null}>(any)</option>
     {#each ruleFilterOptions as r}<option value={r}>{r}</option>{/each}
   </select>
-  <label for="rf-channel" style="margin:0">Channel</label>
-  <select id="rf-channel" style="width:auto" bind:value={filterChannel}>
+  <label for="rf-comment" style="margin:0">Comment</label>
+  <select id="rf-comment" style="width:auto;max-width:220px" bind:value={filterComment}>
     <option value={null}>(any)</option>
-    {#each channelFilterOptions as c}<option value={c}>{c}</option>{/each}
+    {#each commentFilterOptions as c}<option value={c}>{c}</option>{/each}
   </select>
-  <label for="rf-date" style="margin:0">Date</label>
-  <select id="rf-date" style="width:auto" bind:value={filterDate}>
-    <option value={null}>(any)</option>
-    {#each dateFilterOptions as d}<option value={d}>{d}</option>{/each}
-  </select>
-  {#if filterRule !== null || filterChannel !== null || filterDate !== null}
+  <span style="margin:0">Channel</span>
+  <MultiSelectDropdown
+    options={channelOptions}
+    selected={filterChannels}
+    onchange={(next) => (filterChannels = next)}
+    allLabel="All channels"
+    unit="channels"
+    searchPlaceholder="Search channel…"
+  />
+  <label for="rf-from" style="margin:0">Date</label>
+  <input id="rf-from" type="date" style="width:auto" bind:value={filterDateFrom} aria-label="from date" />
+  <span class="muted small">–</span>
+  <input id="rf-to" type="date" style="width:auto" bind:value={filterDateTo} aria-label="to date" />
+  {#if hasFilters}
     <button onclick={clearFilters}>Clear</button>
     <span class="muted small">{rows.length} / {allRows.length}</span>
   {/if}
@@ -439,7 +514,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {#if selectedRows.length}
   <div class="toolbar">
     <span class="muted small">{selectedRows.length} selected</span>
-    <button disabled={busy} onclick={() => openEdit(selectedRows)}>Edit…</button>
+    <button disabled={busy} onclick={openEditBatch}>Edit…</button>
     {#if tab === 'finished'}
       <button disabled={busy} onclick={uploadSelected}>Upload selected</button>
     {/if}
@@ -505,13 +580,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </td>
         <td class="small m-inline">
           {#if item.channelname}
-            <button class="linklike" title="filter by this channel" onclick={() => (filterChannel = item.channelname)}>
+            <button class="linklike" title="filter by this channel" onclick={() => (filterChannels = [item.channelname])}>
               {item.channelname}
             </button>
           {/if}
         </td>
         <td class="small m-inline">
-          <button class="linklike muted" title="filter by this date" onclick={() => (filterDate = dateOf(item.start))}>
+          <button class="linklike muted" title="filter to this date" onclick={() => { filterDateFrom = dateOf(item.start); filterDateTo = dateOf(item.start); }}>
             {ts(item.start)}
           </button>
         </td>
@@ -607,7 +682,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           </button>
           {#if menuFor === key}
             <div class="row-menu" role="menu">
-              <button onclick={() => openEdit([{ rule, ruleComment, item }])}>Edit…</button>
+              <button onclick={() => openEditSingle({ rule, ruleComment, item })}>Edit…</button>
             </div>
           {/if}
         </td>
@@ -662,14 +737,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </table>
 
 {#if editRows}
-  <BatchEditModal
-    title={editRows.length === 1 ? 'Edit recording' : `Edit ${editRows.length} recordings`}
-    subtitle="Ticked fields apply to all copies. Instance checkboxes enable/disable per instance (unchecked = disabled)."
-    fields={RECORDING_FIELDS}
-    instanceSelector={editInstanceSelector}
-    onsave={applyEdit}
-    oncancel={() => (editRows = null)}
-    ondelete={deleteEdit}
-    deleteLabel="Delete recording(s)…"
-  />
+  {#if editSingle}
+    <BatchEditModal
+      title="Edit recording"
+      subtitle="Changes apply to all copies of this recording. Instance checkboxes enable/disable per instance (unchecked = disabled)."
+      mode="single"
+      fields={singleFields}
+      initialValues={editPrefill.values}
+      differingKeys={editPrefill.differing}
+      instanceSelector={editInstanceSelector}
+      onsave={applyEdit}
+      oncancel={() => (editRows = null)}
+      ondelete={deleteEdit}
+      deleteLabel="Delete recording…"
+    />
+  {:else}
+    <BatchEditModal
+      title={`Edit ${editRows.length} recordings`}
+      subtitle="Ticked fields apply to all copies. Instance checkboxes enable/disable per instance (unchecked = disabled)."
+      fields={RECORDING_FIELDS}
+      instanceSelector={editInstanceSelector}
+      onsave={applyEdit}
+      oncancel={() => (editRows = null)}
+      ondelete={deleteEdit}
+      deleteLabel="Delete recording(s)…"
+    />
+  {/if}
 {/if}

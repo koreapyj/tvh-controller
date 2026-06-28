@@ -32,6 +32,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     title,
     subtitle = '',
     fields,
+    mode = 'batch',
+    initialValues = {},
+    differingKeys = [],
     instanceSelector = null,
     saveLabel = 'Save',
     onsave,
@@ -42,6 +45,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     title: string;
     subtitle?: string;
     fields: FieldSpec[];
+    /** 'batch' = a checkbox per field (only ticked applied); 'single' = pre-filled direct edit (only changed applied) */
+    mode?: 'batch' | 'single';
+    /** single mode: pre-filled string value per field key ('' = no agreed value) */
+    initialValues?: Record<string, string>;
+    /** single mode: field keys whose copies disagree — shown as "(multiple values)" */
+    differingKeys?: string[];
     instanceSelector?: InstanceSelector | null;
     saveLabel?: string;
     onsave: (out: { fields: Record<string, unknown>; instanceEnabled: Record<string, boolean> }) => void;
@@ -52,6 +61,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   let apply: Record<string, boolean> = $state({});
   let vals: Record<string, string> = $state({});
+  const initialVals: Record<string, string> = {};
   let instChecked: Record<string, boolean> = $state({});
   let instTouched: Record<string, boolean> = $state({});
   let formError = $state('');
@@ -60,7 +70,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   {
     for (const f of fields) {
       apply[f.key] = false;
-      vals[f.key] = f.type === 'bool' ? 'yes' : '';
+      const init = mode === 'single' ? (initialValues[f.key] ?? '') : f.type === 'bool' ? 'yes' : '';
+      vals[f.key] = init;
+      initialVals[f.key] = init;
     }
     if (instanceSelector) {
       for (const inst of instanceSelector.instances) {
@@ -81,19 +93,27 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 
   const hasChanges = $derived(
-    Object.values(apply).some(Boolean) || Object.values(instTouched).some(Boolean),
+    (mode === 'single'
+      ? fields.some((f) => vals[f.key] !== initialVals[f.key])
+      : Object.values(apply).some(Boolean)) || Object.values(instTouched).some(Boolean),
   );
 
   function save(): void {
     formError = '';
     const out: Record<string, unknown> = {};
     for (const f of fields) {
-      if (!apply[f.key]) continue;
+      const include = mode === 'single' ? vals[f.key] !== initialVals[f.key] : apply[f.key];
+      if (!include) continue;
       if (f.type === 'bool') {
         out[f.key] = vals[f.key] === 'yes';
       } else if (f.type === 'int') {
+        if (vals[f.key] === '') {
+          if (mode === 'single') continue; // cleared = leave unchanged
+          formError = `"${f.label}" must be a number`;
+          return;
+        }
         const n = Number(vals[f.key]);
-        if (vals[f.key] === '' || Number.isNaN(n)) {
+        if (Number.isNaN(n)) {
           formError = `"${f.label}" must be a number`;
           return;
         }
@@ -109,7 +129,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       }
     }
     if (!Object.keys(out).length && !Object.keys(instanceEnabled).length) {
-      formError = 'nothing to apply — tick a field or change an instance';
+      formError = 'nothing to apply — change a field or an instance';
       return;
     }
     onsave({ fields: out, instanceEnabled });
@@ -142,13 +162,24 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {/if}
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <div class="muted small">Tick a field to apply it; unticked fields are left unchanged.</div>
+      <div class="muted small">
+        {mode === 'batch'
+          ? 'Tick a field to apply it; unticked fields are left unchanged.'
+          : 'Only fields you change are saved; the rest are left unchanged.'}
+      </div>
       {#each fields as f (f.key)}
         <div style="display:flex;gap:10px;align-items:center">
-          <input type="checkbox" bind:checked={apply[f.key]} title="apply this field" />
+          {#if mode === 'batch'}
+            <input type="checkbox" bind:checked={apply[f.key]} title="apply this field" />
+          {/if}
           <label for="bf-{f.key}" style="margin:0;width:150px;flex:none">{f.label}</label>
           {#if f.type === 'bool'}
-            <select id="bf-{f.key}" style="width:auto" disabled={!apply[f.key]} bind:value={vals[f.key]}>
+            <select
+              id="bf-{f.key}"
+              style="width:auto"
+              disabled={mode === 'batch' && !apply[f.key]}
+              bind:value={vals[f.key]}
+            >
               <option value="yes">yes</option>
               <option value="no">no</option>
             </select>
@@ -157,8 +188,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               id="bf-{f.key}"
               style="flex:1"
               inputmode={f.type === 'int' ? 'numeric' : undefined}
-              placeholder={f.placeholder ?? ''}
-              disabled={!apply[f.key]}
+              placeholder={mode === 'single' && differingKeys.includes(f.key)
+                ? '(multiple values)'
+                : (f.placeholder ?? '')}
+              disabled={mode === 'batch' && !apply[f.key]}
               bind:value={vals[f.key]}
             />
           {/if}

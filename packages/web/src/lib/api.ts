@@ -95,6 +95,13 @@ export const api = {
     return http<{ items: UnifiedEpgEvent[]; total: number }>('GET', `/api/epg${qs ? `?${qs}` : ''}`);
   },
   epgChannels: () => http<EpgChannel[]>('GET', '/api/epg/channels'),
+  epgIndex: (params: { channels?: string[]; q?: string; at: number }) => {
+    const sp = new URLSearchParams();
+    if (params.channels?.length) sp.set('channels', JSON.stringify(params.channels));
+    if (params.q) sp.set('q', params.q);
+    sp.set('at', String(params.at));
+    return http<{ index: number; total: number }>('GET', `/api/epg/index?${sp.toString()}`);
+  },
   epgEvent: (instanceId: string, eventId: number) =>
     http<TvhEpgEvent>('GET', `/api/epg/event/${instanceId}/${eventId}`),
   recordEvent: (instanceId: string, eventId: number) =>

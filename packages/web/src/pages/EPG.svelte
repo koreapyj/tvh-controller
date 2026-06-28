@@ -22,6 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { duration, ts } from '../lib/format.js';
   import { epgTick, instances } from '../lib/stores.js';
   import RuleEditor from './RuleEditor.svelte';
+  import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
 
   /** channel identity used for filtering — must match the server's chanKey() */
   const chanKey = (c: EpgChannel) => `${c.name} ${c.number ?? ''}`;
@@ -41,10 +42,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   let channels: EpgChannel[] = $state([]);
   let channelFilter: string[] = $state([]); // selected chanKey() strings
-  let channelSearch = $state('');
-  let chanSearchInput: HTMLInputElement | undefined = $state();
   let titleFilter = $state('');
   let titleTimer: ReturnType<typeof setTimeout> | undefined;
+  let jumpAt = $state(''); // datetime-local value for "jump to time"
 
   let viewport: HTMLElement | undefined = $state();
   let viewportH = $state(0);
@@ -67,23 +67,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     Array.from({ length: Math.max(0, lastIndex - firstIndex) }, (_, k) => firstIndex + k),
   );
 
-  const filteredChannels = $derived.by(() => {
-    const s = channelSearch.trim().toLowerCase();
-    if (!s) return channels;
-    return channels.filter(
-      (ch) => ch.name.toLowerCase().includes(s) || String(ch.number ?? '').includes(s),
-    );
-  });
+  const channelOptions = $derived(
+    channels.map((ch) => ({
+      value: chanKey(ch),
+      label: `${ch.number ? `${ch.number} · ` : ''}${ch.name}`,
+      search: `${ch.name} ${ch.number ?? ''}`,
+    })),
+  );
 
   function params(offset: number) {
     return { channels: channelFilter, q: titleFilter || undefined, offset, limit: PAGE };
-  }
-
-  function toggleChannel(key: string): void {
-    channelFilter = channelFilter.includes(key)
-      ? channelFilter.filter((c) => c !== key)
-      : [...channelFilter, key];
-    reset();
   }
 
   async function fetchPage(p: number): Promise<void> {
@@ -150,8 +143,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     titleTimer = setTimeout(reset, 300);
   }
 
+  /** format a Date as a datetime-local input value (local time, minute precision) */
+  function toLocalInput(d: Date): string {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  /** scroll so the first programme starting at/after the picked time is at the top */
+  async function jumpToTime(): Promise<void> {
+    if (!jumpAt) return;
+    const at = Math.floor(new Date(jumpAt).getTime() / 1000);
+    if (!Number.isFinite(at)) return;
+    try {
+      const res = await api.epgIndex({ channels: channelFilter, q: titleFilter || undefined, at });
+      if (!res.total) return;
+      const idx = Math.min(Math.max(0, res.index), res.total - 1);
+      viewport?.scrollTo(0, idx * ROW_H);
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
+  }
+
   onMount(() => {
     reset();
+    jumpAt = toLocalInput(new Date());
     void api.epgChannels().then((c) => (channels = c)).catch(() => {});
     let first = true;
     const unsub = epgTick.subscribe(() => {
@@ -262,37 +277,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {#if notice}<div class="card" style="margin-bottom:12px">{notice}</div>{/if}
 
 <div class="toolbar">
-  <details
-    class="chan-filter"
-    ontoggle={(e) => (e.currentTarget as HTMLDetailsElement).open && chanSearchInput?.focus()}
-  >
-    <summary>{channelFilter.length ? `${channelFilter.length} channels` : 'All channels'}</summary>
-    <div class="chan-list">
-      <div class="chan-search">
-        <input
-          bind:this={chanSearchInput}
-          placeholder="Search number or name…"
-          bind:value={channelSearch}
-          aria-label="Search channels"
-        />
-        {#if channelFilter.length}
-          <button class="linklike" onclick={() => { channelFilter = []; reset(); }}>Clear ({channelFilter.length})</button>
-        {/if}
-      </div>
-      {#each filteredChannels as ch (chanKey(ch))}
-        <label>
-          <input
-            type="checkbox"
-            checked={channelFilter.includes(chanKey(ch))}
-            onchange={() => toggleChannel(chanKey(ch))}
-          />
-          {ch.number ? `${ch.number} · ` : ''}{ch.name}
-        </label>
-      {/each}
-      {#if !filteredChannels.length}<div class="muted small" style="padding:4px">No channels.</div>{/if}
-    </div>
-  </details>
+  <MultiSelectDropdown
+    options={channelOptions}
+    selected={channelFilter}
+    onchange={(next) => { channelFilter = next; reset(); }}
+    allLabel="All channels"
+    unit="channels"
+    searchPlaceholder="Search number or name…"
+  />
   <input placeholder="Filter title…" bind:value={titleFilter} oninput={onTitleInput} />
+  <span class="muted small">Jump to</span>
+  <input type="datetime-local" style="width:auto" bind:value={jumpAt} aria-label="Jump to date and time" />
+  <button onclick={jumpToTime}>Jump</button>
   <span class="spacer"></span>
   <span class="muted small">{total} programmes</span>
 </div>
@@ -477,61 +473,5 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     flex: 1 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-
-  /* channel multi-select dropdown */
-  .chan-filter {
-    position: relative;
-  }
-  .chan-filter > summary {
-    list-style: none;
-    cursor: pointer;
-    padding: 6px 10px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--panel);
-    white-space: nowrap;
-  }
-  .chan-filter > summary::-webkit-details-marker {
-    display: none;
-  }
-  .chan-list {
-    position: absolute;
-    z-index: 20;
-    margin-top: 4px;
-    min-width: 220px;
-    max-height: 320px;
-    overflow-y: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    padding: 8px;
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }
-  .chan-search {
-    position: sticky;
-    top: -8px;
-    background: var(--panel);
-    padding: 4px 0 6px;
-    margin: -8px 0 2px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .chan-search input {
-    flex: 1;
-  }
-  .chan-list label {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 2px 4px;
-    white-space: nowrap;
-    cursor: pointer;
-  }
-  .chan-list label:hover {
-    background: var(--panel2);
   }
 </style>
