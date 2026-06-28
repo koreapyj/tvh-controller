@@ -16,11 +16,12 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import type { EpgChannel, MasterRulePayload, TvhEpgEvent, UnifiedEpgEvent } from '@tvhc/shared';
   import { api, type RuleInput } from '../lib/api.js';
   import { duration, ts } from '../lib/format.js';
   import { epgTick, instances } from '../lib/stores.js';
+  import { route } from '../lib/router.js';
   import RuleEditor from './RuleEditor.svelte';
   import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
 
@@ -143,6 +144,37 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     titleTimer = setTimeout(reset, 300);
   }
 
+  function parseList(raw: string | null): string[] {
+    if (!raw) return [];
+    try {
+      const v = JSON.parse(raw) as unknown;
+      return Array.isArray(v) ? v.map((x) => String(x)) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  // restore filters from the URL on (re)navigation, then load with them applied.
+  // reset() is untracked: it synchronously reads channelFilter/titleFilter (via
+  // params() in fetchPage) and viewport, which this effect also writes — tracking
+  // them would make the effect invalidate itself. The only dependency we want is
+  // the route's search string.
+  $effect(() => {
+    const q = new URLSearchParams($route.search);
+    channelFilter = parseList(q.get('channels'));
+    titleFilter = q.get('q') ?? '';
+    untrack(() => reset());
+  });
+
+  // mirror the active filters into the URL so they survive reload / are shareable
+  $effect(() => {
+    const q = new URLSearchParams();
+    if (channelFilter.length) q.set('channels', JSON.stringify(channelFilter));
+    if (titleFilter) q.set('q', titleFilter);
+    const qs = q.toString();
+    window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : ''));
+  });
+
   /** format a Date as a datetime-local input value (local time, minute precision) */
   function toLocalInput(d: Date): string {
     const pad = (n: number) => String(n).padStart(2, '0');
@@ -165,7 +197,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 
   onMount(() => {
-    reset();
+    // initial load is driven by the URL-restore effect above
     jumpAt = toLocalInput(new Date());
     void api.epgChannels().then((c) => (channels = c)).catch(() => {});
     let first = true;

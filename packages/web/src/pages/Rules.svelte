@@ -20,7 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { api, type RuleInput } from '../lib/api.js';
   import { dateTime } from '../lib/format.js';
   import { channelOptions, instances } from '../lib/stores.js';
-  import { go } from '../lib/router.js';
+  import { go, route } from '../lib/router.js';
   import { conversionFor, offsetLabel, toEitTime } from '../lib/eit.js';
   import RuleEditor from './RuleEditor.svelte';
   import RuleDetails from '../components/RuleDetails.svelte';
@@ -137,6 +137,34 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let filterChannels: string[] = $state([]);
   let filterComment: string | null = $state(null);
   let filterZeroMatch = $state(false);
+
+  function parseList(raw: string | null): string[] {
+    if (!raw) return [];
+    try {
+      const v = JSON.parse(raw) as unknown;
+      return Array.isArray(v) ? v.map((x) => String(x)) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  // restore filters from the URL on (re)navigation
+  $effect(() => {
+    const q = new URLSearchParams($route.search);
+    filterChannels = parseList(q.get('channels'));
+    filterComment = q.get('comment');
+    filterZeroMatch = q.get('zero') === '1';
+  });
+
+  // mirror the active filters into the URL so they survive reload / are shareable
+  $effect(() => {
+    const q = new URLSearchParams();
+    if (filterChannels.length) q.set('channels', JSON.stringify(filterChannels));
+    if (filterComment !== null) q.set('comment', filterComment);
+    if (filterZeroMatch) q.set('zero', '1');
+    const qs = q.toString();
+    window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : ''));
+  });
 
   const channelFilterOptions = $derived(
     [...new Set(rules.map((r) => r.effectivePayload.channel).filter(Boolean))]
