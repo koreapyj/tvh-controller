@@ -95,7 +95,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     },
     { label: 'Channel', value: payload.channel || 'Any channel', isDefault: !payload.channel },
     { label: 'Channel tag', value: payload.tag || '—', isDefault: !payload.tag },
-    { label: 'Weekdays', value: weekdays(payload.weekdays), isDefault: !payload.weekdays.length },
+    {
+      label: 'Weekdays',
+      value: weekdays(payload.weekdays),
+      isDefault: !payload.weekdays.length || payload.weekdays.length === 7,
+    },
     {
       label: 'Start window',
       value:

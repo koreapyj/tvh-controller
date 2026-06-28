@@ -29,6 +29,20 @@ export interface NameMaps {
   dvrConfigsByUuid: Map<string, string>;
 }
 
+const ALL_WEEKDAYS = [1, 2, 3, 4, 5, 6, 7];
+
+/**
+ * Canonical weekday set. "Every day" has ONE form here: all seven days. The
+ * editor's convention is "no selection = every day", but tvheadend reads a
+ * literally-empty weekday set as "No days" (the rule never records) — so an
+ * empty selection must become all seven days before it reaches tvheadend, and
+ * read-back must agree. Partial selections are sorted and de-duplicated.
+ */
+function canonWeekdays(days: number[] | undefined): number[] {
+  const u = [...new Set(days ?? [])].filter((d) => d >= 1 && d <= 7).sort((a, b) => a - b);
+  return u.length === 0 ? [...ALL_WEEKDAYS] : u;
+}
+
 /**
  * Instance autorec rule -> canonical MasterRulePayload.
  * - drops uuid / serieslink / owner / creator (instance-local or read-only)
@@ -55,7 +69,7 @@ export function normalizeRule(rule: TvhAutorecRule, maps: NameMaps): MasterRuleP
     start_window: rule.start_window ?? '',
     start_extra: rule.start_extra ?? 0,
     stop_extra: rule.stop_extra ?? 0,
-    weekdays: [...(rule.weekdays ?? [])].sort((a, b) => a - b),
+    weekdays: canonWeekdays(rule.weekdays),
     minduration: rule.minduration ?? 0,
     maxduration: rule.maxduration ?? 0,
     minyear: rule.minyear ?? 0,
@@ -89,6 +103,6 @@ export function normalizePayload(payload: MasterRulePayload): MasterRulePayload 
   return {
     ...(Value.Default(MasterRulePayload, {}) as MasterRulePayload),
     ...payload,
-    weekdays: [...payload.weekdays].sort((a, b) => a - b),
+    weekdays: canonWeekdays(payload.weekdays),
   };
 }

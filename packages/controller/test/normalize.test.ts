@@ -54,6 +54,19 @@ describe('normalizeRule', () => {
     expect(normalizeRule(tvhRule, maps).weekdays).toEqual([1, 3, 5]);
   });
 
+  it('treats an empty/absent weekday set as every day (tvheadend reads empty as "No days")', () => {
+    // no weekdays field at all
+    expect(normalizeRule({ uuid: 'x', name: 'A' }, maps).weekdays).toEqual([1, 2, 3, 4, 5, 6, 7]);
+    // explicitly empty
+    expect(normalizeRule({ uuid: 'x', name: 'A', weekdays: [] }, maps).weekdays).toEqual([
+      1, 2, 3, 4, 5, 6, 7,
+    ]);
+    // all seven stays every day (canonical, idempotent)
+    expect(
+      normalizeRule({ uuid: 'x', name: 'A', weekdays: [7, 6, 5, 4, 3, 2, 1] }, maps).weekdays,
+    ).toEqual([1, 2, 3, 4, 5, 6, 7]);
+  });
+
   it('drops uuid/serieslink/owner/creator', () => {
     const p = normalizeRule(tvhRule, maps) as Record<string, unknown>;
     expect(p.uuid).toBeUndefined();

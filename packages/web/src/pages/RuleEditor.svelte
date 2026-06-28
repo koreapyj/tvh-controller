@@ -73,7 +73,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   /** '' = inherit/default, 'yes' / 'no' = explicit */
   let bf: Record<BoolField, '' | 'yes' | 'no'> = $state({ enabled: '', fulltext: '' });
   let wdOverride = $state(false);
-  let wd: number[] = $state([]);
+  // default to every day (all selected); the user narrows down from there
+  let wd: number[] = $state([1, 2, 3, 4, 5, 6, 7]);
   let allInstances = $state(true);
   let selectedInstances: string[] = $state([]);
   let formError = $state('');
@@ -98,7 +99,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       }
       if (source.weekdays !== undefined && source.weekdays !== null) {
         wdOverride = true;
-        wd = [...source.weekdays];
+        // empty = every day in our model, shown as all selected
+        wd = source.weekdays.length ? [...source.weekdays] : [1, 2, 3, 4, 5, 6, 7];
       }
     }
     if (!overlayMode && !wdOverride) wdOverride = true; // plain mode always edits weekdays
@@ -292,7 +294,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 {label}
               </button>
             {/each}
-            <span class="muted small">none = every day</span>
           {:else}
             <span class="muted small">inherited: {ph('weekdays', 'every day')}</span>
           {/if}

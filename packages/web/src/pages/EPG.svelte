@@ -264,7 +264,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return {
       enabled: true, name: '', title, fulltext: false, mergetext: false,
       channel, tag: '', btype: 0, content_type: 0, star_rating: 0,
-      start: '', start_window: '', start_extra: 0, stop_extra: 0, weekdays: [],
+      start: '', start_window: '', start_extra: 0, stop_extra: 0, weekdays: [1, 2, 3, 4, 5, 6, 7],
       minduration: 0, maxduration: 0, minyear: 0, maxyear: 0, minseason: 0,
       maxseason: 0, pri: 6, record: 0, retention: 0, removal: 0, maxcount: 0,
       maxsched: 0, config_name: '', directory: '', comment: '',
