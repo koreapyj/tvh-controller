@@ -145,14 +145,15 @@ button.expander {
   color: var(--muted); font-size: 11px;
 }
 button.expander:hover { color: var(--text); }
-button.linklike {
+.linklike {
   background: none; border: none; padding: 0; cursor: pointer;
-  color: var(--accent); font-size: inherit; text-align: left;
+  color: var(--accent); font-size: inherit; font-family: inherit; text-align: left;
+  text-decoration: none;
 }
-button.linklike:hover { text-decoration: underline; border: none; }
-button.linklike.muted { color: var(--muted); }
-button.linklike.muted:hover { color: var(--accent); }
-button.badge-button { border: none; cursor: pointer; font-family: inherit; }
+.linklike:hover { text-decoration: underline; border: none; }
+.linklike.muted { color: var(--muted); }
+.linklike.muted:hover { color: var(--accent); }
+.badge-button { border: none; cursor: pointer; font-family: inherit; text-decoration: none; }
 .row-menu {
   position: absolute; right: 4px; top: 100%; z-index: 5;
   background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;

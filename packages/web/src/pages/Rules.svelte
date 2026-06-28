@@ -20,7 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { api, type RuleInput } from '../lib/api.js';
   import { dateTime } from '../lib/format.js';
   import { channelOptions, instances } from '../lib/stores.js';
-  import { go, route } from '../lib/router.js';
+  import { route } from '../lib/router.js';
   import { conversionFor, offsetLabel, toEitTime } from '../lib/eit.js';
   import RuleEditor from './RuleEditor.svelte';
   import RuleDetails from '../components/RuleDetails.svelte';
@@ -148,6 +148,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }
   }
 
+  /** the /rules URL for the current filters, with the given overrides applied */
+  function rulesUrl(
+    over: { channels?: string[]; comment?: string | null; zero?: boolean } = {},
+  ): string {
+    const channels = over.channels !== undefined ? over.channels : filterChannels;
+    const comment = over.comment !== undefined ? over.comment : filterComment;
+    const zero = over.zero !== undefined ? over.zero : filterZeroMatch;
+    const q = new URLSearchParams();
+    if (channels.length) q.set('channels', JSON.stringify(channels));
+    if (comment !== null) q.set('comment', comment);
+    if (zero) q.set('zero', '1');
+    const qs = q.toString();
+    return `/rules${qs ? `?${qs}` : ''}`;
+  }
+
   // restore filters from the URL on (re)navigation
   $effect(() => {
     const q = new URLSearchParams($route.search);
@@ -158,12 +173,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   // mirror the active filters into the URL so they survive reload / are shareable
   $effect(() => {
-    const q = new URLSearchParams();
-    if (filterChannels.length) q.set('channels', JSON.stringify(filterChannels));
-    if (filterComment !== null) q.set('comment', filterComment);
-    if (filterZeroMatch) q.set('zero', '1');
-    const qs = q.toString();
-    window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : ''));
+    window.history.replaceState({}, '', rulesUrl());
   });
 
   const channelFilterOptions = $derived(
@@ -556,31 +566,31 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </td>
         <td>
           {#if rule.parentId}<span class="muted">↳ </span>{/if}
-          <button
+          <a
             class="linklike"
             style="color:var(--text)"
             title="show this rule's recordings"
-            onclick={() => go(`/recordings?rule=${encodeURIComponent(rule.name)}`)}
+            href="/recordings?rule={encodeURIComponent(rule.name)}"
           >
             {rule.name}
-          </button>
+          </a>
           {#if rule.parentId}<span class="badge info" title="linked clone of {rule.parentName}">linked</span>{/if}
           {#if !rule.enabled}<span class="badge neutral">disabled</span>{/if}
           {#if rule.enabled && rule.upcomingMatches === 0}
-            <button
+            <a
               class="badge warn badge-button"
               title="no upcoming recording matches this rule on any targeted instance (within the EPG window) — check the title pattern, channel, and time window; for a seasonal show this may just mean the season ended. Click to filter."
-              onclick={() => (filterZeroMatch = true)}
+              href={rulesUrl({ zero: true })}
             >
               0 match
-            </button>
+            </a>
           {/if}
         </td>
         <td class="small m-inline">
           {#if p.channel}
-            <button class="linklike" title="filter by this channel" onclick={() => (filterChannels = [p.channel])}>
+            <a class="linklike" title="filter by this channel" href={rulesUrl({ channels: [p.channel] })}>
               {p.channel}
-            </button>
+            </a>
           {:else}any{/if}
           {#if rule.parentId && rule.overlay && 'channel' in rule.overlay}<span class="badge warn" title="overrides parent">override</span>{/if}
         </td>
@@ -592,9 +602,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <td class="small m-inline">{weekdays(p.weekdays)}</td>
         <td class="small m-inline">
           {#if p.comment}
-            <button class="linklike" title="filter by this comment" onclick={() => (filterComment = p.comment)}>
+            <a class="linklike" title="filter by this comment" href={rulesUrl({ comment: p.comment })}>
               {p.comment}
-            </button>
+            </a>
           {:else}<span class="muted m-hide">—</span>{/if}
         </td>
         <td class="small m-inline">

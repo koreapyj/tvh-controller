@@ -79,6 +79,31 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }
   }
 
+  /** the /recordings URL for the current filters, with the given overrides applied */
+  function recordingsUrl(
+    over: {
+      rule?: string | null;
+      comment?: string | null;
+      channels?: string[];
+      from?: string;
+      to?: string;
+    } = {},
+  ): string {
+    const rule = over.rule !== undefined ? over.rule : filterRule;
+    const comment = over.comment !== undefined ? over.comment : filterComment;
+    const channels = over.channels !== undefined ? over.channels : filterChannels;
+    const from = over.from !== undefined ? over.from : filterDateFrom;
+    const to = over.to !== undefined ? over.to : filterDateTo;
+    const q = new URLSearchParams();
+    if (rule !== null) q.set('rule', rule);
+    if (comment !== null) q.set('comment', comment);
+    if (channels.length) q.set('channels', JSON.stringify(channels));
+    if (from) q.set('from', from);
+    if (to) q.set('to', to);
+    const qs = q.toString();
+    return `/recordings${qs ? `?${qs}` : ''}`;
+  }
+
   // (re)apply filters from the query string on every NAVIGATION — including
   // re-clicking the sidebar link (go('/recordings') with no query resets them)
   $effect(() => {
@@ -92,14 +117,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   // keep the URL shareable without triggering navigation
   $effect(() => {
-    const q = new URLSearchParams();
-    if (filterRule !== null) q.set('rule', filterRule);
-    if (filterComment !== null) q.set('comment', filterComment);
-    if (filterChannels.length) q.set('channels', JSON.stringify(filterChannels));
-    if (filterDateFrom) q.set('from', filterDateFrom);
-    if (filterDateTo) q.set('to', filterDateTo);
-    const qs = q.toString();
-    window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : ''));
+    window.history.replaceState({}, '', recordingsUrl());
   });
 
   /** local date (YYYY-MM-DD) of a recording's programme start */
@@ -575,20 +593,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {#if diffs.length}<span class="badge warn" title="copies differ on: {diffs.join(', ')}">differs</span>{/if}
         </td>
         <td class="small">
-          <button class="linklike muted" title="filter by this rule" onclick={() => (filterRule = rule)}>{rule}</button>
+          <a class="linklike muted" title="filter by this rule" href={recordingsUrl({ rule })}>{rule}</a>
           {#if ruleComment}<span class="muted small"> ({ruleComment})</span>{/if}
         </td>
         <td class="small m-inline">
           {#if item.channelname}
-            <button class="linklike" title="filter by this channel" onclick={() => (filterChannels = [item.channelname])}>
+            <a class="linklike" title="filter by this channel" href={recordingsUrl({ channels: [item.channelname] })}>
               {item.channelname}
-            </button>
+            </a>
           {/if}
         </td>
         <td class="small m-inline">
-          <button class="linklike muted" title="filter to this date" onclick={() => { filterDateFrom = dateOf(item.start); filterDateTo = dateOf(item.start); }}>
+          <a class="linklike muted" title="filter to this date" href={recordingsUrl({ from: dateOf(item.start), to: dateOf(item.start) })}>
             {ts(item.start)}
-          </button>
+          </a>
         </td>
         <td class="small muted m-inline">{duration(item.start, item.stop)}</td>
         {#if tab === 'failed'}
