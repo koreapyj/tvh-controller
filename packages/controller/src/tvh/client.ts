@@ -202,16 +202,27 @@ export class TvhClient {
   }
 
   /**
-   * EPG broadcasts, sorted by start ascending (tvheadend only keeps current +
-   * future events, so this is effectively the upcoming guide). Callers trim to
-   * a window; `extra` can carry `channel`, `title`, `mode`, etc.
+   * Every matching EPG broadcast, sorted by start ascending. tvheadend's grid is
+   * paginated (the `limit` arg defaults to just 50), so we page through until a
+   * short page signals the end. The only bound is tvheadend's finite EIT horizon
+   * — no artificial cap. `extra` can carry `filter`, `channel`, `title`, etc.
    */
-  epgEventsGrid(limit = 2000, extra: Params = {}): Promise<TvhEpgEvent[]> {
-    return this.grid<TvhEpgEvent>('/api/epg/events/grid', limit, {
-      sort: 'start',
-      dir: 'ASC',
-      ...extra,
-    });
+  async epgEventsAll(extra: Params = {}): Promise<TvhEpgEvent[]> {
+    const PAGE = 20000;
+    const out: TvhEpgEvent[] = [];
+    for (;;) {
+      const res = await this.call<{ entries?: TvhEpgEvent[] }>('/api/epg/events/grid', {
+        start: out.length,
+        limit: PAGE,
+        sort: 'start',
+        dir: 'ASC',
+        ...extra,
+      });
+      const entries = res.entries ?? [];
+      out.push(...entries);
+      if (entries.length < PAGE) break; // a short (or empty) page is the last one
+    }
+    return out;
   }
 
   /** full details for one broadcast (description/credits/etc.) */

@@ -65,9 +65,6 @@ function epgChanged(prev: TvhEpgEvent[], next: TvhEpgEvent[]): boolean {
   });
 }
 
-/** EPG cache window: current + next ~7 days (the usual EIT horizon), capped */
-const EPG_WINDOW_SECONDS = 7 * 24 * 3600;
-const EPG_LIMIT = 20000;
 
 export class InstancePoller {
   readonly client: TvhClient;
@@ -317,17 +314,16 @@ export class InstancePoller {
     }
   }
 
-  /** refresh the bounded EPG window; comet `epg` push drives this between polls */
+  /** refresh the EPG cache; comet `epg` push drives this between polls */
   async pollEpg(): Promise<void> {
     const snap = this.cache.get(this.instance.id);
     const now = Math.floor(Date.now() / 1000);
-    const horizon = now + EPG_WINDOW_SECONDS;
-    // server-side filter to currently-airing + future events so the row budget
-    // isn't spent on broadcasts that already ended (EPG holds ~weeks of events)
-    const all = await this.client.epgEventsGrid(EPG_LIMIT, {
+    // server-side filter to currently-airing + future events so we don't fetch
+    // broadcasts that already ended; no forward date window and no count cap —
+    // page through everything tvheadend holds
+    const epg = await this.client.epgEventsAll({
       filter: [{ field: 'stop', type: 'numeric', comparison: 'gt', value: now }],
     });
-    const epg = all.filter((e) => e.start <= horizon);
     const changed = epgChanged(snap.epg, epg);
     snap.epg = epg;
     if (changed) this.bus.publish({ type: 'epg', data: { instanceId: this.instance.id } });
