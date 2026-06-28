@@ -404,11 +404,23 @@ export class SyncEngine {
     return out;
   }
 
-  /** enable/disable many rules (master only — left pending until pushed) */
-  batchSetEnabled(ids: string[], enabled: boolean): Promise<RuleBatchResult[]> {
-    return this.serialize(() =>
-      this.runBatch(ids, (id) => this.applyRuleChangeInner(id, { enabled })),
-    );
+  /**
+   * Soft-delete many rules (removes them from their instances, cancelling the
+   * scheduled recordings there, but keeps them restorable in the Deleted tab).
+   * Clones are deleted before parents — deleteRuleInner refuses a parent that
+   * still has active linked clones.
+   */
+  batchDelete(ids: string[]): Promise<RuleBatchResult[]> {
+    return this.serialize(async () => {
+      const meta = await Promise.all(
+        ids.map(async (id) => ({ id, isClone: !!(await this.getRule(id))?.parentId })),
+      );
+      const order = meta
+        .slice()
+        .sort((a, b) => Number(b.isClone) - Number(a.isClone))
+        .map((m) => m.id);
+      return this.runBatch(order, (id) => this.deleteRuleInner(id));
+    });
   }
 
   /** merge a field patch into many rules (master only — left pending until pushed) */

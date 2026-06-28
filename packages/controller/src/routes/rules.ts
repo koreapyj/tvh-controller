@@ -121,7 +121,7 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
 
   app.post<{
     Body: {
-      action?: 'enable' | 'disable' | 'edit' | 'push';
+      action?: 'edit' | 'delete' | 'push';
       ids?: string[];
       patch?: unknown;
     };
@@ -129,10 +129,8 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
     const { action, ids, patch } = req.body ?? {};
     if (!Array.isArray(ids) || ids.length === 0) throw httpError(400, 'ids[] is required');
     switch (action) {
-      case 'enable':
-        return sync().batchSetEnabled(ids, true);
-      case 'disable':
-        return sync().batchSetEnabled(ids, false);
+      case 'delete':
+        return sync().batchDelete(ids);
       case 'push':
         return sync().batchPush(ids);
       case 'edit': {

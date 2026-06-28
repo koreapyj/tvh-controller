@@ -396,7 +396,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 
   async function runRuleBatch(
-    action: 'enable' | 'disable' | 'edit' | 'push',
+    action: 'edit' | 'delete' | 'push',
     ids: string[],
     patch?: Partial<MasterRulePayload>,
   ): Promise<void> {
@@ -421,6 +421,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     const ids = selectedIds;
     batchEditing = false;
     void runRuleBatch('edit', ids, out.fields as Partial<MasterRulePayload>);
+  }
+
+  async function batchDelete(): Promise<void> {
+    const ids = selectedIds;
+    if (!ids.length) return;
+    if (
+      !confirm(
+        `Delete ${ids.length} rule${ids.length === 1 ? '' : 's'} from their targeted instances?\n\n` +
+          'Tvheadend will CANCEL the scheduled recordings each rule created.\n' +
+          'They move to the Deleted tab and can be restored later.',
+      )
+    )
+      return;
+    await runRuleBatch('delete', ids);
   }
 </script>
 
@@ -497,9 +511,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {#if selectedIds.length}
   <div class="toolbar">
     <span class="muted small">{selectedIds.length} selected</span>
-    <button disabled={busy} onclick={() => runRuleBatch('enable', selectedIds)}>Enable</button>
-    <button disabled={busy} onclick={() => runRuleBatch('disable', selectedIds)}>Disable</button>
     <button disabled={busy} onclick={() => (batchEditing = true)}>Edit…</button>
+    <button class="danger" disabled={busy} onclick={batchDelete}>Delete</button>
     <button disabled={busy} onclick={() => runRuleBatch('push', selectedIds)}>Push selected</button>
     <button onclick={() => (selected = {})}>Clear selection</button>
   </div>
