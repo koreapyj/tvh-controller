@@ -18,7 +18,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
-import type { RecordingBatchResult, TvhDvrEntry } from '@tvhc/shared';
+import type { RecordingBatchResult, TvhDvrEntry, TvhEpgEvent } from '@tvhc/shared';
 import { registerRecordingsRoutes } from '../src/routes/recordings.js';
 import type { AppContext } from '../src/routes/context.js';
 
@@ -176,5 +176,70 @@ describe('POST /api/recordings/delete', () => {
     expect(body[0].ok).toBe(false);
     expect(body[0].error).toMatch(/still present/);
     await app.close();
+  });
+});
+
+describe('POST /api/recordings/add-candidates', () => {
+  function ev(eventId: number, channelName: string, start: number, stop: number): TvhEpgEvent {
+    return {
+      eventId,
+      channelName,
+      channelUuid: 'c',
+      channelNumber: null,
+      start,
+      stop,
+      title: 'prog',
+    } as unknown as TvhEpgEvent;
+  }
+
+  function ctxWith(snaps: Array<{ id: string; reachable: boolean; epg: TvhEpgEvent[] }>): AppContext {
+    const all = snaps.map((s) => ({ summary: { id: s.id, reachable: s.reachable }, epg: s.epg }));
+    return { cache: { all: () => all } } as unknown as AppContext;
+  }
+
+  async function ask(ctx: AppContext, body: unknown): Promise<{ status: number; json: unknown }> {
+    const app = Fastify();
+    registerRecordingsRoutes(app, ctx);
+    await app.ready();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/recordings/add-candidates',
+      headers: { 'content-type': 'application/json' },
+      payload: JSON.stringify(body),
+    });
+    await app.close();
+    return { status: res.statusCode, json: res.statusCode === 200 ? res.json() : null };
+  }
+
+  it('returns the matching event on reachable instances, excluding those already recording', async () => {
+    const ctx = ctxWith([
+      { id: 'a', reachable: true, epg: [ev(11, 'NHK', 1000, 2000)] },
+      { id: 'b', reachable: true, epg: [ev(22, 'NHK', 1005, 2005)] },
+      { id: 'c', reachable: true, epg: [ev(33, 'Other', 1000, 2000)] },
+    ]);
+    const { status, json } = await ask(ctx, { channelname: 'NHK', start: 1000, stop: 2000, exclude: ['a'] });
+    expect(status).toBe(200);
+    expect(json).toEqual([{ instanceId: 'b', eventId: 22 }]);
+  });
+
+  it('skips unreachable instances', async () => {
+    const ctx = ctxWith([{ id: 'b', reachable: false, epg: [ev(22, 'NHK', 1000, 2000)] }]);
+    const { json } = await ask(ctx, { channelname: 'NHK', start: 1000, stop: 2000 });
+    expect(json).toEqual([]);
+  });
+
+  it('picks the dominant (largest-overlap) event, not one merely grazed by padding', async () => {
+    // padded recording [950,2050]: the broadcast [1000,2000] overlaps fully, the
+    // neighbour [2000,3000] only touches the trailing padding
+    const ctx = ctxWith([
+      { id: 'b', reachable: true, epg: [ev(22, 'NHK', 1000, 2000), ev(23, 'NHK', 2000, 3000)] },
+    ]);
+    const { json } = await ask(ctx, { channelname: 'NHK', start: 950, stop: 2050 });
+    expect(json).toEqual([{ instanceId: 'b', eventId: 22 }]);
+  });
+
+  it('400s without the required fields', async () => {
+    const { status } = await ask(ctxWith([]), { channelname: 'NHK' });
+    expect(status).toBe(400);
   });
 });

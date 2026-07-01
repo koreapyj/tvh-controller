@@ -186,4 +186,35 @@ export function registerRecordingsRoutes(app: FastifyInstance, ctx: AppContext):
     }
     return results;
   });
+
+  // Instances (with no copy yet) where a broadcast could be recorded redundantly:
+  // a reachable instance whose EPG carries the same channel + time slot. Returns
+  // the matching event id so the caller can schedule it. Used by the Recordings
+  // edit dialog to let you add an instance to an existing (upcoming) recording.
+  app.post<{
+    Body: { channelname?: string; start?: number; stop?: number; exclude?: string[] };
+  }>('/api/recordings/add-candidates', async (req) => {
+    const { channelname, start, stop, exclude } = req.body ?? {};
+    if (!channelname || typeof start !== 'number' || typeof stop !== 'number') {
+      throw httpError(400, 'channelname, start and stop are required');
+    }
+    const skip = new Set(exclude ?? []);
+    const out: Array<{ instanceId: string; eventId: number }> = [];
+    for (const snap of ctx.cache.all()) {
+      if (skip.has(snap.summary.id) || !snap.summary.reachable) continue;
+      // the broadcast on this channel with the largest temporal overlap (the
+      // recording window may be padded, so pick the dominant event, not any that
+      // barely grazes the padding)
+      let best: { eventId: number; overlap: number } | null = null;
+      for (const e of snap.epg) {
+        if (e.channelName !== channelname) continue;
+        const overlap = Math.min(stop, e.stop) - Math.max(start, e.start);
+        if (overlap > 0 && (!best || overlap > best.overlap)) {
+          best = { eventId: e.eventId, overlap };
+        }
+      }
+      if (best) out.push({ instanceId: snap.summary.id, eventId: best.eventId });
+    }
+    return out;
+  });
 }

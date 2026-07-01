@@ -22,10 +22,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // written. An optional instance selector (recordings only) doubles as the
   // per-instance enable/disable control.
 
-  interface InstanceSelector {
-    instances: { id: string; name: string }[];
+  interface InstanceOption {
+    id: string;
+    name: string;
     /** current per-instance enabled state; 'mixed' across a batch */
-    initial: Record<string, boolean | 'mixed'>;
+    initial: boolean | 'mixed';
+    /** shown but not toggleable (e.g. can't be added here); `reason` explains why */
+    disabled?: boolean;
+    reason?: string;
+  }
+  interface InstanceSelector {
+    instances: InstanceOption[];
+    /** hint shown above the checkboxes */
+    hint?: string;
   }
 
   let {
@@ -64,6 +73,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   const initialVals: Record<string, string> = {};
   let instChecked: Record<string, boolean> = $state({});
   let instTouched: Record<string, boolean> = $state({});
+  const instInitial: Record<string, boolean | 'mixed'> = {};
   let formError = $state('');
 
   // one-time init
@@ -76,15 +86,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }
     if (instanceSelector) {
       for (const inst of instanceSelector.instances) {
-        const cur = instanceSelector.initial[inst.id];
-        instChecked[inst.id] = cur === true;
+        instChecked[inst.id] = inst.initial === true;
+        instInitial[inst.id] = inst.initial;
         instTouched[inst.id] = false;
       }
     }
   }
 
   function isMixed(id: string): boolean {
-    return instanceSelector?.initial[id] === 'mixed' && !instTouched[id];
+    return instInitial[id] === 'mixed' && !instTouched[id];
   }
 
   function toggleInstance(id: string, checked: boolean): void {
@@ -144,17 +154,27 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
     {#if instanceSelector}
       <div style="margin-bottom:14px">
-        <div style="margin-bottom:4px">Instances <span class="muted small">(unchecked = disabled on that instance)</span></div>
+        <div style="margin-bottom:4px">
+          Instances
+          <span class="muted small">
+            {instanceSelector.hint ?? '(unchecked = disabled on that instance)'}
+          </span>
+        </div>
         <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:6px">
           {#each instanceSelector.instances as inst (inst.id)}
-            <label style="display:flex;gap:6px;align-items:center;margin:0">
+            <label
+              class:muted={inst.disabled}
+              title={inst.reason ?? ''}
+              style="display:flex;gap:6px;align-items:center;margin:0"
+            >
               <input
                 type="checkbox"
                 checked={instChecked[inst.id]}
                 indeterminate={isMixed(inst.id)}
+                disabled={inst.disabled}
                 onchange={(e) => toggleInstance(inst.id, e.currentTarget.checked)}
               />
-              {inst.name}
+              {inst.name}{#if inst.disabled && inst.reason}<span class="muted small"> — {inst.reason}</span>{/if}
             </label>
           {/each}
         </div>

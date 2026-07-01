@@ -318,15 +318,40 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // single edit drops the Enabled field — the instance selector is the enable control
   const singleFields = RECORDING_FIELDS.filter((f) => f.key !== 'enabled');
 
+  // upcoming, single-edit only: instances where this broadcast could be added (redundant)
+  let addTargets: Array<{ instanceId: string; eventId: number }> = $state([]);
+  let addLoading = $state(false);
+
+  function instName(id: string): string {
+    return $instances.find((i) => i.id === id)?.name ?? id;
+  }
+
   function openEditBatch(): void {
     if (!selectedRows.length) return;
     editSingle = false;
+    addTargets = [];
     editRows = selectedRows;
   }
-  function openEditSingle(row: Row): void {
+  async function openEditSingle(row: Row): Promise<void> {
     menuFor = null;
     editSingle = true;
+    addTargets = [];
     editRows = [row];
+    if (tab !== 'upcoming') return; // a finished broadcast can't be re-recorded elsewhere
+    addLoading = true;
+    try {
+      const exclude = row.item.copies.map((c) => c.instanceId);
+      addTargets = await api.recordingAddCandidates(
+        row.item.channelname,
+        row.item.start,
+        row.item.stop,
+        exclude,
+      );
+    } catch {
+      addTargets = [];
+    } finally {
+      addLoading = false;
+    }
   }
 
   /** single-edit: pre-fill fields the copies agree on; flag the rest as differing */
@@ -338,9 +363,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     for (const f of singleFields) {
       const ucKey = KEY_TO_UC[f.key];
       if (!ucKey) continue;
-      const defined = copies.map((c) => c[ucKey]).filter((v) => v !== undefined && v !== null);
-      if (defined.length === copies.length && new Set(defined.map(String)).size === 1) {
-        values[f.key] = String(defined[0]);
+      // compare only across instances that hold this recording; an unset field
+      // reads as empty, so a single copy is never "(multiple values)"
+      const strs = copies.map((c) => {
+        const v = c[ucKey];
+        return v === undefined || v === null ? '' : String(v);
+      });
+      if (copies.length && new Set(strs).size === 1) {
+        values[f.key] = strs[0];
       } else {
         differing.push(f.key);
       }
@@ -371,10 +401,58 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       });
   });
 
-  const editInstanceSelector = $derived({
-    instances: editInstances.map(({ id, name }) => ({ id, name })),
-    initial: Object.fromEntries(editInstances.map((e) => [e.id, e.initial])),
+  const editSelectorBatch = $derived({
+    instances: editInstances.map((e) => ({ id: e.id, name: e.name, initial: e.initial })),
   });
+
+  /** single-edit: classify EVERY instance — existing copy (toggle), addable (schedule), or blocked */
+  const editInstanceItems = $derived.by(() => {
+    type Item = {
+      id: string;
+      name: string;
+      initial: boolean | 'mixed';
+      disabled?: boolean;
+      reason?: string;
+      addEventId?: number;
+    };
+    if (!editSingle || !editRows || editRows.length !== 1) return [] as Item[];
+    const item = editRows[0].item;
+    const copyById = new Map(item.copies.map((c) => [c.instanceId, c]));
+    const addById = new Map(addTargets.map((t) => [t.instanceId, t.eventId]));
+    return $instances.map((inst): Item => {
+      const copy = copyById.get(inst.id);
+      if (copy) return { id: inst.id, name: inst.name, initial: copy.enabled };
+      if (tab !== 'upcoming')
+        return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'already recorded' };
+      if (addLoading)
+        return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'checking…' };
+      if (!inst.reachable)
+        return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'unreachable' };
+      const eventId = addById.get(inst.id);
+      if (eventId !== undefined) return { id: inst.id, name: inst.name, initial: false, addEventId: eventId };
+      return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'no matching programme here' };
+    });
+  });
+
+  const editSelectorSingle = $derived({
+    hint: '(check to record on / uncheck to disable)',
+    instances: editInstanceItems.map((i) => ({
+      id: i.id,
+      name: i.name,
+      initial: i.initial,
+      disabled: i.disabled,
+      reason: i.reason,
+    })),
+  });
+
+  /** instance id -> event id for instances the single-edit can add (schedule) */
+  const editAddTargetsMap = $derived(
+    Object.fromEntries(
+      editInstanceItems
+        .filter((i) => i.addEventId !== undefined)
+        .map((i) => [i.id, i.addEventId as number]),
+    ) as Record<string, number>,
+  );
 
   async function runRecordingBatch(
     fn: () => Promise<Array<{ instanceId: string; uuid: string; ok: boolean; error?: string }>>,
@@ -402,16 +480,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   function applyEdit(out: { fields: Record<string, unknown>; instanceEnabled: Record<string, boolean> }): void {
     const target = editRows ?? [];
+    const addMap = editAddTargetsMap;
     editRows = null;
     const uniform = { ...out.fields };
     const enabledOverride = 'enabled' in uniform ? (uniform.enabled as boolean) : undefined;
     delete uniform.enabled;
 
+    // checking an instance with no copy schedules a redundant recording there;
+    // everything else is enable/disable of an existing copy
+    const adds: Array<{ instanceId: string; eventId: number }> = [];
+    const enabledByInstance: Record<string, boolean> = {};
+    for (const [instId, checked] of Object.entries(out.instanceEnabled)) {
+      const eventId = addMap[instId];
+      if (eventId !== undefined) {
+        if (checked) adds.push({ instanceId: instId, eventId });
+      } else {
+        enabledByInstance[instId] = checked;
+      }
+    }
+
     const opsByInstance = new Map<string, { uuids: string[]; fields: Record<string, unknown> }>();
     for (const row of target) {
       for (const c of row.item.copies) {
         const enabledForInst =
-          enabledOverride !== undefined ? enabledOverride : out.instanceEnabled[c.instanceId];
+          enabledOverride !== undefined ? enabledOverride : enabledByInstance[c.instanceId];
         const fields: Record<string, unknown> = { ...uniform };
         if (enabledForInst !== undefined) fields.enabled = enabledForInst;
         if (Object.keys(fields).length === 0) continue;
@@ -426,11 +518,54 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       uuids: v.uuids,
       fields: v.fields,
     }));
-    if (!ops.length) {
+
+    if (!ops.length && !adds.length) {
       notice = 'No changes to apply.';
       return;
     }
-    void runRecordingBatch(() => api.editRecordings(ops), 'Updated');
+    void applyEditAndAdd(ops, adds);
+  }
+
+  async function applyEditAndAdd(
+    ops: Array<{ instanceId: string; uuids: string[]; fields: Record<string, unknown> }>,
+    adds: Array<{ instanceId: string; eventId: number }>,
+  ): Promise<void> {
+    busy = true;
+    notice = '';
+    try {
+      const parts: string[] = [];
+      if (ops.length) {
+        const res = await api.editRecordings(ops);
+        const fails = res.filter((r) => !r.ok);
+        parts.push(
+          fails.length
+            ? `${res.length - fails.length} updated, ${fails.length} failed — ${fails
+                .slice(0, 2)
+                .map((f) => `${f.instanceId}: ${f.error ?? 'failed'}`)
+                .join('; ')}`
+            : `updated ${res.length} cop${res.length === 1 ? 'y' : 'ies'}`,
+        );
+      }
+      let added = 0;
+      const addFails: string[] = [];
+      for (const a of adds) {
+        try {
+          await api.recordEvent(a.instanceId, a.eventId);
+          added++;
+        } catch (e) {
+          addFails.push(`${instName(a.instanceId)}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (added) parts.push(`added on ${added} instance${added === 1 ? '' : 's'}`);
+      if (addFails.length) parts.push(`add failed — ${addFails.join('; ')}`);
+      notice = parts.join('; ') || 'No changes.';
+      selected = {};
+      await refresh();
+    } catch (err) {
+      notice = err instanceof Error ? err.message : String(err);
+    } finally {
+      busy = false;
+    }
   }
 
   function deleteEdit(): void {
@@ -755,30 +890,32 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </table>
 
 {#if editRows}
-  {#if editSingle}
-    <BatchEditModal
-      title="Edit recording"
-      subtitle="Changes apply to all copies of this recording. Instance checkboxes enable/disable per instance (unchecked = disabled)."
-      mode="single"
-      fields={singleFields}
-      initialValues={editPrefill.values}
-      differingKeys={editPrefill.differing}
-      instanceSelector={editInstanceSelector}
-      onsave={applyEdit}
-      oncancel={() => (editRows = null)}
-      ondelete={deleteEdit}
-      deleteLabel="Delete recording…"
-    />
-  {:else}
-    <BatchEditModal
-      title={`Edit ${editRows.length} recordings`}
-      subtitle="Ticked fields apply to all copies. Instance checkboxes enable/disable per instance (unchecked = disabled)."
-      fields={RECORDING_FIELDS}
-      instanceSelector={editInstanceSelector}
-      onsave={applyEdit}
-      oncancel={() => (editRows = null)}
-      ondelete={deleteEdit}
-      deleteLabel="Delete recording(s)…"
-    />
-  {/if}
+  {#key editRows}
+    {#if editSingle}
+      <BatchEditModal
+        title="Edit recording"
+        subtitle="Changes apply to all copies. Check an unchecked instance to record it there too; uncheck a copy to disable it."
+        mode="single"
+        fields={singleFields}
+        initialValues={editPrefill.values}
+        differingKeys={editPrefill.differing}
+        instanceSelector={editSelectorSingle}
+        onsave={applyEdit}
+        oncancel={() => (editRows = null)}
+        ondelete={deleteEdit}
+        deleteLabel="Delete recording…"
+      />
+    {:else}
+      <BatchEditModal
+        title={`Edit ${editRows.length} recordings`}
+        subtitle="Ticked fields apply to all copies. Instance checkboxes enable/disable per instance (unchecked = disabled)."
+        fields={RECORDING_FIELDS}
+        instanceSelector={editSelectorBatch}
+        onsave={applyEdit}
+        oncancel={() => (editRows = null)}
+        ondelete={deleteEdit}
+        deleteLabel="Delete recording(s)…"
+      />
+    {/if}
+  {/key}
 {/if}

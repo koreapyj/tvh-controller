@@ -83,6 +83,13 @@ export const api = {
     http<RecordingBatchResult[]>('POST', '/api/recordings/edit', { ops }),
   deleteRecordings: (targets: RecordingTarget[]) =>
     http<RecordingBatchResult[]>('POST', '/api/recordings/delete', { targets }),
+  recordingAddCandidates: (channelname: string, start: number, stop: number, exclude: string[]) =>
+    http<Array<{ instanceId: string; eventId: number }>>('POST', '/api/recordings/add-candidates', {
+      channelname,
+      start,
+      stop,
+      exclude,
+    }),
   conflicts: (id: string) => http<ConflictWindow[]>('GET', `/api/instances/${id}/conflicts`),
 
   epg: (params?: { channels?: string[]; q?: string; offset?: number; limit?: number }) => {
