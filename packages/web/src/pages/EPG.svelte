@@ -25,6 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { route } from '../lib/router.js';
   import RuleEditor from './RuleEditor.svelte';
   import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
+  import { notify } from '../lib/notifications.js';
 
   /** channel identity used for filtering — must match the server's chanKey() */
   const chanKey = (c: EpgChannel) => `${c.name} ${c.number ?? ''}`;
@@ -39,8 +40,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let rows: (UnifiedEpgEvent | null)[] = $state([]);
   let loaded = new Set<number>(); // loaded page indices
   let token = 0; // invalidates in-flight fetches on reset
-  let error = $state('');
-  let notice = $state('');
 
   let channels: EpgChannel[] = $state([]);
   let channelFilter: string[] = $state([]); // selected chanKey() strings
@@ -95,10 +94,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       const next = rows.slice();
       res.items.forEach((it, i) => (next[p * PAGE + i] = it));
       rows = next;
-      error = '';
+      notify.dismiss('epg-load');
     } catch (err) {
       loaded.delete(p); // allow a retry on the next scroll tick
-      if (my === token) error = err instanceof Error ? err.message : String(err);
+      if (my === token) notify.error(err instanceof Error ? err.message : String(err), { key: 'epg-load' });
     }
   }
 
@@ -183,7 +182,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       const idx = Math.min(Math.max(0, res.index), res.total - 1);
       viewport?.scrollTo(0, idx * ROW_H);
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -221,7 +220,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   async function openDetails(e: UnifiedEpgEvent): Promise<void> {
     viewing = e;
     details = e.details;
-    notice = '';
     const c = e.copies[0];
     if (c) {
       const full = await api.epgEvent(c.instanceId, c.eventId).catch(() => null);
@@ -259,7 +257,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         failed.push(`${$instName(id)}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    notice = [done.length ? `Scheduled on ${done.join(', ')}.` : '', ...failed].filter(Boolean).join(' ');
+    if (failed.length) {
+      notify.error(failed.join(' '));
+    } else if (done.length) {
+      notify.success(`Scheduled on ${done.join(', ')}.`);
+    }
     recordingFor = null;
     busy = false;
     refreshInPlace();
@@ -274,9 +276,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   async function saveAutorec(out: Omit<RuleInput, 'parentId'>): Promise<void> {
     try {
       await api.createRule(out);
-      notice = `Autorec rule "${out.name}" created. Push it from the Autorec Rules page.`;
+      notify.success(`Autorec rule "${out.name}" created. Push it from the Autorec Rules page.`);
     } catch (err) {
-      notice = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       autorecInit = null;
     }
@@ -303,8 +305,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 />
 
 <h1>EPG</h1>
-{#if error}<div class="error-banner">{error}</div>{/if}
-{#if notice}<div class="card" style="margin-bottom:12px">{notice}</div>{/if}
 
 <div class="toolbar">
   <MultiSelectDropdown

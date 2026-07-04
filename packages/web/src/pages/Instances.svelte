@@ -19,10 +19,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import type { InstanceOverview } from '@tvhc/shared';
   import { api } from '../lib/api.js';
   import { latestWins } from '../lib/fetchGuard.js';
+  import { notify } from '../lib/notifications.js';
   import { conflictsByInstance, instances, recordingsTick, statusByInstance } from '../lib/stores.js';
 
   let overviews: Record<string, InstanceOverview> = $state({});
-  let error = $state('');
 
   const guard = latestWins();
   async function refresh(): Promise<void> {
@@ -39,9 +39,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       },
       (next) => {
         overviews = next;
-        error = '';
+        notify.dismiss('instances-load');
       },
-      (msg) => (error = msg),
+      (msg) => notify.error(msg, { key: 'instances-load' }),
     );
   }
 
@@ -53,7 +53,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </script>
 
 <h1>Instances</h1>
-{#if error}<div class="error-banner">{error}</div>{/if}
 
 <div class="cards">
   {#each $instances as inst (inst.id)}

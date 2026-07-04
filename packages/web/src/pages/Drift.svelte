@@ -20,19 +20,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { api } from '../lib/api.js';
   import { dateTime } from '../lib/format.js';
   import { driftItems, instName } from '../lib/stores.js';
+  import { notify } from '../lib/notifications.js';
   import RuleDetails from '../components/RuleDetails.svelte';
 
   let items: DriftItem[] = $state([]);
   let ignored: IgnoredOrphan[] = $state([]);
-  let error = $state('');
   let busy = $state(false);
 
   async function refresh(): Promise<void> {
     try {
       [items, ignored] = await Promise.all([api.drift(), api.ignoredOrphans()]);
-      error = '';
+      notify.dismiss('drift-load');
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err), { key: 'drift-load' });
     }
   }
 
@@ -43,9 +43,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     integrityRunning = true;
     try {
       integrity = await api.integrityCheck();
-      error = '';
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       integrityRunning = false;
     }
@@ -67,7 +66,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       await api.unignoreOrphan(o.instanceId, o.tvhUuid);
       await refresh();
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       busy = false;
     }
@@ -84,9 +83,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     try {
       await api.reconcile(item.id, action);
       await refresh();
-      error = '';
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       busy = false;
     }
@@ -104,7 +102,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   The controller is the master for autorec rules; instances should be read-only. Items below were
   changed, deleted, or created directly on an instance.
 </p>
-{#if error}<div class="error-banner">{error}</div>{/if}
 
 <div class="toolbar">
   <button disabled={integrityRunning} onclick={runIntegrityCheck}>

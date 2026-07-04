@@ -23,15 +23,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { parseListParam } from '../lib/query.js';
   import { route } from '../lib/router.js';
   import { instName, instances, recordingsTick } from '../lib/stores.js';
+  import { notify } from '../lib/notifications.js';
   import BatchEditModal from '../components/BatchEditModal.svelte';
   import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
   import { RECORDING_FIELDS } from '../components/batchFields.js';
 
   let tab: 'upcoming' | 'finished' | 'failed' = $state('upcoming');
   let groups: UnifiedGroup[] = $state([]);
-  let error = $state('');
   let busy = $state(false);
-  let notice = $state('');
 
   type SortKey = 'rule' | 'title' | 'channel' | 'time' | 'duration' | 'instance';
   let sortKey: SortKey = $state('time');
@@ -187,9 +186,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       () => api.unifiedRecordings(forTab),
       (g) => {
         groups = g;
-        error = '';
+        notify.dismiss('recordings-load');
       },
-      (msg) => (error = msg),
+      (msg) => notify.error(msg, { key: 'recordings-load' }),
     );
   }
 
@@ -244,16 +243,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   async function upload(instanceId: string, uuid: string): Promise<void> {
     busy = true;
-    notice = '';
     try {
       const results = await api.startUploads(instanceId, [uuid]);
       const r = results[0];
-      if (r?.error) notice = `Upload not started: ${r.error}`;
-      else if (r?.duplicateOf) notice = 'Already uploaded (or uploading) from another instance.';
-      else notice = 'Upload queued.';
+      if (r?.error) notify.error(`Upload not started: ${r.error}`);
+      else if (r?.duplicateOf) notify.info('Already uploaded (or uploading) from another instance.');
+      else notify.success('Upload queued.');
       await refresh();
     } catch (err) {
-      notice = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       busy = false;
     }
@@ -458,20 +456,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     okVerb: string,
   ): Promise<void> {
     busy = true;
-    notice = '';
     try {
       const res = await fn();
       const fails = res.filter((r) => !r.ok);
       if (fails.length === 0) {
-        notice = `${okVerb} ${res.length} cop${res.length === 1 ? 'y' : 'ies'}.`;
+        notify.success(`${okVerb} ${res.length} cop${res.length === 1 ? 'y' : 'ies'}.`);
       } else {
         const sample = fails.slice(0, 3).map((f) => `${f.instanceId}: ${f.error ?? 'failed'}`).join('; ');
-        notice = `${res.length - fails.length} ok, ${fails.length} failed — ${sample}${fails.length > 3 ? '…' : ''}`;
+        notify.error(
+          `${res.length - fails.length} ok, ${fails.length} failed — ${sample}${fails.length > 3 ? '…' : ''}`,
+        );
       }
       selected = {};
       await refresh();
     } catch (err) {
-      notice = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       busy = false;
     }
@@ -519,7 +518,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }));
 
     if (!ops.length && !adds.length) {
-      notice = 'No changes to apply.';
+      notify.info('No changes to apply.');
       return;
     }
     void applyEditAndAdd(ops, adds);
@@ -530,12 +529,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     adds: Array<{ instanceId: string; eventId: number }>,
   ): Promise<void> {
     busy = true;
-    notice = '';
     try {
       const parts: string[] = [];
+      let hasFailure = false;
       if (ops.length) {
         const res = await api.editRecordings(ops);
         const fails = res.filter((r) => !r.ok);
+        if (fails.length) hasFailure = true;
         parts.push(
           fails.length
             ? `${res.length - fails.length} updated, ${fails.length} failed — ${fails
@@ -556,12 +556,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         }
       }
       if (added) parts.push(`added on ${added} instance${added === 1 ? '' : 's'}`);
-      if (addFails.length) parts.push(`add failed — ${addFails.join('; ')}`);
-      notice = parts.join('; ') || 'No changes.';
+      if (addFails.length) {
+        hasFailure = true;
+        parts.push(`add failed — ${addFails.join('; ')}`);
+      }
+      const message = parts.join('; ') || 'No changes.';
+      if (hasFailure) notify.error(message);
+      else notify.success(message);
       selected = {};
       await refresh();
     } catch (err) {
-      notice = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       busy = false;
     }
@@ -597,7 +602,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       byInstance.set(c.instanceId, list);
     }
     busy = true;
-    notice = '';
     try {
       let queued = 0;
       let dup = 0;
@@ -610,11 +614,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           else queued++;
         }
       }
-      notice = `Upload: ${queued} queued, ${dup} already uploaded, ${err} failed.`;
+      const message = `Upload: ${queued} queued, ${dup} already uploaded, ${err} failed.`;
+      if (err > 0) notify.error(message);
+      else notify.success(message);
       selected = {};
       await refresh();
     } catch (e) {
-      notice = e instanceof Error ? e.message : String(e);
+      notify.error(e instanceof Error ? e.message : String(e));
     } finally {
       busy = false;
     }
@@ -624,8 +630,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <svelte:window onclick={() => (menuFor = null)} />
 
 <h1>Recordings</h1>
-{#if error}<div class="error-banner">{error}</div>{/if}
-{#if notice}<div class="card" style="margin-bottom:12px">{notice}</div>{/if}
 
 <div class="tabs">
   {#each ['upcoming', 'finished', 'failed'] as t}

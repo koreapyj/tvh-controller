@@ -23,6 +23,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { channelOptions, instances } from '../lib/stores.js';
   import { route } from '../lib/router.js';
   import { conversionFor, offsetLabel, toEitTime } from '../lib/eit.js';
+  import { notify } from '../lib/notifications.js';
   import RuleEditor from './RuleEditor.svelte';
   import RuleDetails from '../components/RuleDetails.svelte';
   import BatchEditModal from '../components/BatchEditModal.svelte';
@@ -30,7 +31,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { RULE_FIELDS } from '../components/batchFields.js';
 
   let rules: RuleWithStatus[] = $state([]);
-  let error = $state('');
   let busy = $state(false);
   let viewing: RuleWithStatus | null = $state(null);
   let importInstance = $state('');
@@ -96,7 +96,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     try {
       deletedRules = await api.deletedRules();
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -123,9 +123,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   async function refresh(): Promise<void> {
     try {
       rules = await api.rules();
-      error = '';
+      notify.dismiss('rules-load');
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err), { key: 'rules-load' });
     }
   }
 
@@ -283,9 +283,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     try {
       await fn();
       await refresh();
-      error = '';
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       busy = false;
     }
@@ -400,13 +399,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     try {
       const res = await api.batchRules(action, ids, patch);
       const fails = res.filter((r) => !r.ok);
-      error = fails.length
-        ? `${fails.length} of ${res.length} failed: ${fails.slice(0, 3).map((f) => f.error ?? 'failed').join('; ')}`
-        : '';
+      if (fails.length) {
+        notify.error(
+          `${fails.length} of ${res.length} failed: ${fails.slice(0, 3).map((f) => f.error ?? 'failed').join('; ')}`,
+        );
+      }
       selected = {};
       await refresh();
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       busy = false;
     }
@@ -446,7 +447,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 />
 
 <h1>Autorec Rules</h1>
-{#if error}<div class="error-banner">{error}</div>{/if}
 {#if anyConv}
   <p class="muted small">
     Start times are shown in broadcast (EIT) time UTC{offsetLabel(anyConv.eitOffsetMinutes)} (from

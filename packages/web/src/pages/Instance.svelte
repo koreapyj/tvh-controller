@@ -20,12 +20,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { api } from '../lib/api.js';
   import { latestWins } from '../lib/fetchGuard.js';
   import { ts } from '../lib/format.js';
+  import { notify } from '../lib/notifications.js';
   import { instances, recordingsTick, statusByInstance } from '../lib/stores.js';
 
   let { instanceId }: { instanceId: string } = $props();
 
   let overview: InstanceOverview | null = $state(null);
-  let error = $state('');
 
   const inst = $derived($instances.find((i) => i.id === instanceId));
 
@@ -35,9 +35,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       () => api.overview(id),
       (o) => {
         overview = o;
-        error = '';
+        notify.dismiss('instance-load');
       },
-      (msg) => (error = msg),
+      (msg) => notify.error(msg, { key: 'instance-load' }),
     );
   }
 
@@ -62,7 +62,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </script>
 
 <h1>{inst?.name ?? instanceId}</h1>
-{#if error}<div class="error-banner">{error}</div>{/if}
 
 {#if overview}
   {@const live = $statusByInstance[instanceId]}

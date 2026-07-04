@@ -20,18 +20,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import type { UploadJob } from '@tvhc/shared';
   import { api } from '../lib/api.js';
   import { bytes, pct, ts } from '../lib/format.js';
+  import { notify } from '../lib/notifications.js';
   import { instName, uploadEvent } from '../lib/stores.js';
 
   let jobs: UploadJob[] = $state([]);
-  let error = $state('');
   let busy = $state(false);
 
   async function refresh(): Promise<void> {
     try {
       jobs = await api.uploads();
-      error = '';
+      notify.dismiss('uploads-load');
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err), { key: 'uploads-load' });
     }
   }
 
@@ -68,7 +68,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       await fn();
       await refresh();
     } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
+      notify.error(err instanceof Error ? err.message : String(err));
     } finally {
       busy = false;
     }
@@ -81,7 +81,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   (rclone checksums each transfer in flight). The shared ledger prevents the same broadcast
   from being uploaded twice.
 </p>
-{#if error}<div class="error-banner">{error}</div>{/if}
 
 <table class="m-cards">
   <thead>

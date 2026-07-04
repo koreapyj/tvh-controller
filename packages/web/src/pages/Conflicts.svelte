@@ -20,10 +20,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { api } from '../lib/api.js';
   import { latestWins } from '../lib/fetchGuard.js';
   import { ts } from '../lib/format.js';
+  import { notify } from '../lib/notifications.js';
   import { conflictsByInstance, instances } from '../lib/stores.js';
 
   let fetched: Record<string, ConflictWindow[]> = $state({});
-  let error = $state('');
 
   const guard = latestWins();
   $effect(() => {
@@ -37,9 +37,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       },
       (next) => {
         fetched = next;
-        error = '';
+        notify.dismiss('conflicts-load');
       },
-      (msg) => (error = msg),
+      (msg) => notify.error(msg, { key: 'conflicts-load' }),
     );
   });
 
@@ -56,7 +56,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   Predicted from upcoming recordings: channels are mapped to muxes and matched against available
   tuners per network. Recordings on the same mux share a tuner.
 </p>
-{#if error}<div class="error-banner">{error}</div>{/if}
 
 {#each merged as { inst, windows } (inst.id)}
   <div class="card" style="margin-bottom:12px">
