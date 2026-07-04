@@ -1,6 +1,7 @@
 # Build: docker build -f deploy/controller.Dockerfile -t tvh-controller .
-# CI tests on the same Node major (.github/workflows/ci.yml). pnpm is
-# installed explicitly: corepack is no longer bundled with Node >= 25.
+# CI tests on the same Node major (.github/workflows/ci.yml) — currently
+# node:26-alpine. pnpm is installed explicitly: corepack is no longer
+# bundled with Node >= 25.
 FROM node:26-alpine AS build
 RUN npm install -g pnpm@9.15.1
 WORKDIR /app

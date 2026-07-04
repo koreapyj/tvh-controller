@@ -18,7 +18,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import type { UploadStatus } from '@tvhc/shared';
-import { requireDb, type AppContext } from './context.js';
+import { httpError, requireDb, type AppContext } from './context.js';
 
 export function registerUploadRoutes(app: FastifyInstance, ctx: AppContext): void {
   const ledger = (): NonNullable<AppContext['ledger']> => requireDb(ctx.ledger, 'uploads');
@@ -32,18 +32,10 @@ export function registerUploadRoutes(app: FastifyInstance, ctx: AppContext): voi
   app.post<{ Body: { instanceId: string; dvrUuids: string[] } }>('/api/uploads', async (req) => {
     const { instanceId, dvrUuids } = req.body ?? ({} as { instanceId?: string; dvrUuids?: string[] });
     if (!instanceId || !ctx.cache.has(instanceId) || !Array.isArray(dvrUuids) || !dvrUuids.length) {
-      const err = new Error('instanceId and dvrUuids[] are required') as Error & {
-        statusCode: number;
-      };
-      err.statusCode = 400;
-      throw err;
+      throw httpError(400, 'instanceId and dvrUuids[] are required');
     }
     if (!dispatcher().hasClient(instanceId)) {
-      const err = new Error(`instance "${instanceId}" has no rclone rcd configured`) as Error & {
-        statusCode: number;
-      };
-      err.statusCode = 400;
-      throw err;
+      throw httpError(400, `instance "${instanceId}" has no rclone rcd configured`);
     }
     const snap = ctx.cache.get(instanceId);
     const storageRoots = (snap.topology?.dvrConfigs ?? [])

@@ -137,6 +137,19 @@ runs with `--rc-no-auth`. When credentials are configured, the client uses
 Basic with a transparent Digest fallback for tvheadend. The controller
 itself has **no auth** and must only be reachable over a trusted network.
 
+**Deployment requirement**: the controller's HTTP API (port 8080) and every
+`rclone rcd` endpoint it talks to (port 5572, typically started with
+`--rc-no-auth` — see [`deploy/host/rclone-rcd.service`](deploy/host/rclone-rcd.service))
+carry no authentication and no per-request authorization. Both rely entirely
+on network-level isolation for safety. Only run this stack on a private
+network or behind a VPN that only trusted operators and hosts can reach;
+never expose either port to the public internet or to an untrusted LAN/VLAN,
+and never put the controller behind a public reverse proxy without adding
+your own auth layer in front of it. In Kubernetes, restrict ingress to the
+controller Service with a `NetworkPolicy` (example in
+[`deploy/k8s/controller.yaml`](deploy/k8s/controller.yaml)) rather than
+relying on cluster network isolation alone.
+
 ## Deployment
 
 1. **Hosts** (each tvheadend machine): install `rclone` (any version with

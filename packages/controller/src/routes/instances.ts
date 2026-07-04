@@ -25,13 +25,11 @@ import {
   type RecordingItem,
   type TvhDvrEntry,
 } from '@tvhc/shared';
-import type { AppContext } from './context.js';
+import { httpError, type AppContext } from './context.js';
 
 function requireInstance(ctx: AppContext, id: string): void {
   if (!ctx.cache.has(id)) {
-    const err = new Error(`unknown instance "${id}"`) as Error & { statusCode: number };
-    err.statusCode = 404;
-    throw err;
+    throw httpError(404, `unknown instance "${id}"`);
   }
 }
 

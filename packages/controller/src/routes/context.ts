@@ -24,6 +24,7 @@ import type { SyncEngine } from '../sync/engine.js';
 import type { InstancePoller } from '../tvh/poller.js';
 import type { UploadDispatcher } from '../uploads/dispatcher.js';
 import type { UploadLedger } from '../uploads/ledger.js';
+import { httpError } from '../util/httpError.js';
 
 export interface AppContext {
   config: AppConfig;
@@ -37,11 +38,10 @@ export interface AppContext {
   dispatcher: UploadDispatcher | null;
 }
 
-export function httpError(statusCode: number, message: string): Error {
-  const err = new Error(message) as Error & { statusCode: number };
-  err.statusCode = statusCode;
-  return err;
-}
+// Re-exported so existing route handlers can keep importing httpError from
+// './context.js'; the implementation lives in util/httpError.ts (a neutral
+// location) so non-routes layers like sync/engine.ts can use it too.
+export { httpError };
 
 export function requireDb<T>(value: T | null, feature: string): T {
   if (value === null) {

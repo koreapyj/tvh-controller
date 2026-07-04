@@ -18,6 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import type { InstanceOverview } from '@tvhc/shared';
   import { api } from '../lib/api.js';
+  import { latestWins } from '../lib/fetchGuard.js';
   import { ts } from '../lib/format.js';
   import { instances, recordingsTick, statusByInstance } from '../lib/stores.js';
 
@@ -28,19 +29,29 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   const inst = $derived($instances.find((i) => i.id === instanceId));
 
-  async function refresh(): Promise<void> {
-    try {
-      overview = await api.overview(instanceId);
-      error = '';
-    } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
-    }
+  const guard = latestWins();
+  async function refresh(id: string): Promise<void> {
+    await guard(
+      () => api.overview(id),
+      (o) => {
+        overview = o;
+        error = '';
+      },
+      (msg) => (error = msg),
+    );
   }
 
+  // navigating /instance/A -> /instance/B reuses this component; never show
+  // A's overview under B's header while B loads
   $effect(() => {
-    void instanceId;
-    if ($recordingsTick.n === 0 || $recordingsTick.instanceId === instanceId) {
-      void refresh();
+    overview = null;
+    void refresh(instanceId);
+  });
+
+  // live refresh when a recordings grid changed on THIS instance
+  $effect(() => {
+    if ($recordingsTick.n > 0 && $recordingsTick.instanceId === instanceId) {
+      void refresh(instanceId);
     }
   });
 

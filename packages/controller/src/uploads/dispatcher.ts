@@ -204,7 +204,12 @@ export class UploadDispatcher {
     // clearing the job id, or the retry would race it on the remote path
     const client = this.clients.get(job.instanceId);
     if (client && job.rcloneJobId !== null) {
-      await client.stopJob(job.rcloneJobId).catch(() => {});
+      // best-effort: the job is usually already gone, but a stop that fails
+      // on a live job means the old transfer may still race this retry on
+      // the temp path — worth a log line, never worth blocking the retry
+      await client.stopJob(job.rcloneJobId).catch((err) => {
+        console.error(`upload ${uploadId}: could not stop rclone job ${job.rcloneJobId}:`, err);
+      });
     }
     // start at verify: when the old transfer actually completed (e.g. the
     // failure was a verify-step bug or restart), this resolves to done
@@ -327,8 +332,10 @@ export class UploadDispatcher {
       return;
     }
     // copy to a per-upload temp object and rename it onto the final path only
-    // after verification — an overwrite never blanks the live copy, and the
-    // final name never holds two same-name objects (Part 5)
+    // after verification, so the final name never holds two same-name objects
+    // (Part 5). The commit itself is delete-then-move (rc has no atomic
+    // overwrite): a crash between the two leaves the final path briefly
+    // absent until resume() re-drives the job and re-commits the temp.
     const tempPath = tempRemotePath(job);
 
     while (!this.stopped) {
@@ -483,14 +490,16 @@ export class UploadDispatcher {
         }
         verifyRetryDelay = VERIFY_RETRY_MIN_MS;
         if (localSize !== null && tempSize === localSize) {
-          // commit: atomically replace the final object with the verified temp
+          // commit: delete the old final object, then rename the verified
+          // temp onto it. NOT atomic — the final path is absent between the
+          // two calls, and a crash there is healed by resume() re-driving
+          // the job (the temp survives and re-commits).
           try {
             await client.deleteFile(job.remotePath).catch(() => {});
             await client.moveFile(tempPath, job.remotePath);
           } catch (err) {
             // the old object may already be gone; a transient swap failure
-            // just retries — the live final object is only removed in the
-            // same step that renames the verified temp in
+            // just retries with the temp still intact
             if (isTransientRcError(err)) {
               await this.noteTransient(uploadId, `rcd unreachable while committing the upload: ${rcErrorText(err)}`);
               await sleep(verifyRetryDelay);

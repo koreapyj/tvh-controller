@@ -21,7 +21,6 @@ import type {
   ConflictWindow,
   RuleInstances,
   DriftItem,
-  DvrState,
   IgnoredOrphan,
   IntegrityIssue,
   InstanceOverview,
@@ -31,7 +30,6 @@ import type {
   ReconcileAction,
   RecordingBatchResult,
   RecordingEditOp,
-  RecordingGroup,
   RecordingTarget,
   RuleWithStatus,
   EpgChannel,
@@ -75,8 +73,6 @@ export const api = {
   instances: () => http<InstanceSummary[]>('GET', '/api/instances'),
   channels: () => http<ChannelOption[]>('GET', '/api/channels'),
   overview: (id: string) => http<InstanceOverview>('GET', `/api/instances/${id}/overview`),
-  recordings: (id: string, state: DvrState) =>
-    http<RecordingGroup[]>('GET', `/api/instances/${id}/recordings?state=${state}`),
   unifiedRecordings: (state: 'upcoming' | 'finished' | 'failed') =>
     http<UnifiedGroup[]>('GET', `/api/recordings?state=${state}`),
   editRecordings: (ops: RecordingEditOp[]) =>

@@ -18,25 +18,29 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import type { ConflictWindow } from '@tvhc/shared';
   import { api } from '../lib/api.js';
+  import { latestWins } from '../lib/fetchGuard.js';
   import { ts } from '../lib/format.js';
   import { conflictsByInstance, instances } from '../lib/stores.js';
 
   let fetched: Record<string, ConflictWindow[]> = $state({});
   let error = $state('');
 
+  const guard = latestWins();
   $effect(() => {
-    void (async () => {
-      try {
-        const list = $instances;
+    const list = $instances;
+    void guard(
+      async () => {
         const results = await Promise.all(list.map((i) => api.conflicts(i.id).catch(() => [])));
         const next: Record<string, ConflictWindow[]> = {};
         list.forEach((inst, idx) => (next[inst.id] = results[idx] ?? []));
+        return next;
+      },
+      (next) => {
         fetched = next;
         error = '';
-      } catch (err) {
-        error = err instanceof Error ? err.message : String(err);
-      }
-    })();
+      },
+      (msg) => (error = msg),
+    );
   });
 
   const merged = $derived(

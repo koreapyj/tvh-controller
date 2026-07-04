@@ -18,25 +18,31 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import type { InstanceOverview } from '@tvhc/shared';
   import { api } from '../lib/api.js';
+  import { latestWins } from '../lib/fetchGuard.js';
   import { conflictsByInstance, instances, recordingsTick, statusByInstance } from '../lib/stores.js';
 
   let overviews: Record<string, InstanceOverview> = $state({});
   let error = $state('');
 
+  const guard = latestWins();
   async function refresh(): Promise<void> {
-    try {
-      const list = $instances.length ? $instances : await api.instances();
-      const results = await Promise.all(list.map((i) => api.overview(i.id).catch(() => null)));
-      const next: Record<string, InstanceOverview> = {};
-      list.forEach((inst, idx) => {
-        const o = results[idx];
-        if (o) next[inst.id] = o;
-      });
-      overviews = next;
-      error = '';
-    } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
-    }
+    await guard(
+      async () => {
+        const list = $instances.length ? $instances : await api.instances();
+        const results = await Promise.all(list.map((i) => api.overview(i.id).catch(() => null)));
+        const next: Record<string, InstanceOverview> = {};
+        list.forEach((inst, idx) => {
+          const o = results[idx];
+          if (o) next[inst.id] = o;
+        });
+        return next;
+      },
+      (next) => {
+        overviews = next;
+        error = '';
+      },
+      (msg) => (error = msg),
+    );
   }
 
   $effect(() => {

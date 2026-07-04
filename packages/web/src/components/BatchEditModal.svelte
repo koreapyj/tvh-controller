@@ -135,7 +135,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     const instanceEnabled: Record<string, boolean> = {};
     if (instanceSelector) {
       for (const inst of instanceSelector.instances) {
-        if (instTouched[inst.id]) instanceEnabled[inst.id] = instChecked[inst.id];
+        if (instTouched[inst.id]) instanceEnabled[inst.id] = instChecked[inst.id] ?? false;
       }
     }
     if (!Object.keys(out).length && !Object.keys(instanceEnabled).length) {
@@ -146,8 +146,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 </script>
 
+<svelte:window onkeydown={(e) => e.key === 'Escape' && oncancel()} />
+
 <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && oncancel()}>
-  <div class="modal" style="width:560px">
+  <div class="modal" style="width:560px" role="dialog" aria-modal="true" aria-label={title}>
     <h2 style="margin-top:0">{title}</h2>
     {#if subtitle}<p class="muted small" style="margin-top:0">{subtitle}</p>{/if}
     {#if formError}<div class="error-banner">{formError}</div>{/if}

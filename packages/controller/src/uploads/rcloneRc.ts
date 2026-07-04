@@ -41,6 +41,8 @@ export class RcloneRcClient {
   constructor(
     private readonly cfg: InstanceRcloneConfig,
     private readonly fetchImpl: typeof fetch = fetch,
+    /** per-request cap; rc calls are control-plane only (copies run async) */
+    private readonly timeoutMs = 60_000,
   ) {
     this.auth = cfg.user
       ? `Basic ${Buffer.from(`${cfg.user}:${cfg.pass ?? ''}`).toString('base64')}`
@@ -48,14 +50,23 @@ export class RcloneRcClient {
   }
 
   private async call<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
-    const res = await this.fetchImpl(`${this.cfg.rcUrl}${path}`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(this.auth ? { authorization: this.auth } : {}),
-      },
-      body: JSON.stringify(body),
-    });
+    let res: Response;
+    try {
+      res = await this.fetchImpl(`${this.cfg.rcUrl}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(this.auth ? { authorization: this.auth } : {}),
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch (err) {
+      if (err instanceof Error && err.name === 'TimeoutError') {
+        throw new Error(`rclone rc ${path} timed out after ${this.timeoutMs}ms`);
+      }
+      throw err;
+    }
     const text = await res.text();
     if (!res.ok) throw new RcloneRcError(res.status, path, text);
     return (text === '' ? {} : JSON.parse(text)) as T;
@@ -170,9 +181,10 @@ export class RcloneRcClient {
 
   /**
    * Rename a remote object within the same remote (metadata-only on Drive).
-   * Used to atomically commit an upload: the file is copied to a temp name,
-   * verified, then moved onto its final name so the final path only ever
-   * holds one object and an overwrite never blanks the live copy.
+   * Used to commit an upload: the file is copied to a temp name, verified,
+   * then moved onto its final name. Note the commit is delete-then-move (rc
+   * has no atomic overwrite), so a crash between the two leaves the final
+   * path briefly absent until the next resume re-drives the job.
    */
   async moveFile(from: string, to: string): Promise<void> {
     const src = RcloneRcClient.splitRemote(from);

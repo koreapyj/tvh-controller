@@ -55,3 +55,11 @@ export function pct(part: number, total: number | null | undefined): number {
   if (!total || total <= 0) return 0;
   return Math.min(100, Math.round((part / total) * 100));
 }
+
+/** tvheadend weekday numbering: 1 = Monday … 7 = Sunday */
+export const WEEKDAY_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+export function weekdays(days: number[]): string {
+  if (!days.length || days.length === 7) return 'Every day';
+  return days.map((d) => WEEKDAY_LABELS[d - 1] ?? String(d)).join(', ');
+}

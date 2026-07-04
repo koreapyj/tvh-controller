@@ -68,7 +68,8 @@ function epgChanged(prev: TvhEpgEvent[], next: TvhEpgEvent[]): boolean {
 
 export class InstancePoller {
   readonly client: TvhClient;
-  private timers: NodeJS.Timeout[] = [];
+  /** one live handle per loop/trigger, overwritten on reschedule (never grows) */
+  private timers = new Map<string, NodeJS.Timeout>();
   private stopped = false;
   private lastStatusKey = '';
   private comet: CometClient | null = null;
@@ -110,10 +111,10 @@ export class InstancePoller {
 
   start(): void {
     const jitter = Math.random() * 2000;
-    this.schedule(() => this.pollDvrAndStatus(), this.intervals.dvr, jitter);
-    this.schedule(() => this.pollAutorecs(), this.intervals.autorec, jitter + 500);
-    this.schedule(() => this.pollTopology(), this.intervals.topology, jitter + 1000);
-    this.schedule(() => this.pollEpg(), this.intervals.epg, jitter + 1500);
+    this.schedule('dvr', () => this.pollDvrAndStatus(), this.intervals.dvr, jitter);
+    this.schedule('autorec', () => this.pollAutorecs(), this.intervals.autorec, jitter + 500);
+    this.schedule('topology', () => this.pollTopology(), this.intervals.topology, jitter + 1000);
+    this.schedule('epg', () => this.pollEpg(), this.intervals.epg, jitter + 1500);
 
     // comet push (same channel the tvheadend web UI uses) drives sub-second
     // input/subscription updates and triggers DVR/autorec/EPG refreshes;
@@ -131,8 +132,8 @@ export class InstancePoller {
 
   stop(): void {
     this.stopped = true;
-    for (const t of this.timers) clearTimeout(t);
-    this.timers = [];
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
     this.comet?.stop();
     if (this.statusPublishTimer) clearTimeout(this.statusPublishTimer);
   }
@@ -199,7 +200,8 @@ export class InstancePoller {
   private triggerDvrPoll(): void {
     if (this.dvrPollPending || this.stopped) return;
     this.dvrPollPending = true;
-    this.timers.push(
+    this.timers.set(
+      'dvr-trigger',
       setTimeout(() => {
         this.dvrPollPending = false;
         void this.pollDvrAndStatus().catch(() => {});
@@ -210,7 +212,8 @@ export class InstancePoller {
   private triggerAutorecPoll(): void {
     if (this.autorecPollPending || this.stopped) return;
     this.autorecPollPending = true;
-    this.timers.push(
+    this.timers.set(
+      'autorec-trigger',
       setTimeout(() => {
         this.autorecPollPending = false;
         void this.pollAutorecs().catch(() => {});
@@ -222,7 +225,8 @@ export class InstancePoller {
   private triggerEpgPoll(): void {
     if (this.epgPollPending || this.stopped) return;
     this.epgPollPending = true;
-    this.timers.push(
+    this.timers.set(
+      'epg-trigger',
       setTimeout(() => {
         this.epgPollPending = false;
         void this.pollEpg().catch(() => {});
@@ -230,7 +234,12 @@ export class InstancePoller {
     );
   }
 
-  private schedule(fn: () => Promise<void>, interval: number, initialDelay: number): void {
+  private schedule(
+    key: string,
+    fn: () => Promise<void>,
+    interval: number,
+    initialDelay: number,
+  ): void {
     const run = async () => {
       if (this.stopped) return;
       try {
@@ -240,10 +249,10 @@ export class InstancePoller {
         this.markReachable(err instanceof Error ? err.message : String(err));
       }
       if (!this.stopped) {
-        this.timers.push(setTimeout(run, interval));
+        this.timers.set(key, setTimeout(run, interval));
       }
     };
-    this.timers.push(setTimeout(run, initialDelay));
+    this.timers.set(key, setTimeout(run, initialDelay));
   }
 
   private markReachable(error: string | null): void {

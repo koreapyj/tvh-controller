@@ -18,9 +18,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import type { UnifiedCopy, UnifiedGroup, UnifiedItem } from '@tvhc/shared';
   import { api } from '../lib/api.js';
+  import { latestWins } from '../lib/fetchGuard.js';
   import { bytes, duration, ts } from '../lib/format.js';
+  import { parseListParam } from '../lib/query.js';
   import { route } from '../lib/router.js';
-  import { instances, recordingsTick } from '../lib/stores.js';
+  import { instName, instances, recordingsTick } from '../lib/stores.js';
   import BatchEditModal from '../components/BatchEditModal.svelte';
   import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
   import { RECORDING_FIELDS } from '../components/batchFields.js';
@@ -69,16 +71,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let filterDateFrom = $state('');
   let filterDateTo = $state('');
 
-  function parseChannels(raw: string | null): string[] {
-    if (!raw) return [];
-    try {
-      const v = JSON.parse(raw) as unknown;
-      return Array.isArray(v) ? v.map((x) => String(x)) : [];
-    } catch {
-      return [];
-    }
-  }
-
   /** the /recordings URL for the current filters, with the given overrides applied */
   function recordingsUrl(
     over: {
@@ -110,7 +102,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     const q = new URLSearchParams($route.search);
     filterRule = q.get('rule');
     filterComment = q.get('comment');
-    filterChannels = parseChannels(q.get('channels'));
+    filterChannels = parseListParam(q.get('channels'));
     filterDateFrom = q.get('from') ?? '';
     filterDateTo = q.get('to') ?? '';
   });
@@ -186,13 +178,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return flat.sort((a, b) => cmp(a, b) * sortDir || a.item.start - b.item.start);
   });
 
+  const guard = latestWins();
   async function refresh(): Promise<void> {
-    try {
-      groups = await api.unifiedRecordings(tab);
-      error = '';
-    } catch (err) {
-      error = err instanceof Error ? err.message : String(err);
-    }
+    // latest-wins: a slow response for a previously selected tab must never
+    // overwrite the currently selected tab's rows
+    const forTab = tab;
+    await guard(
+      () => api.unifiedRecordings(forTab),
+      (g) => {
+        groups = g;
+        error = '';
+      },
+      (msg) => (error = msg),
+    );
   }
 
   $effect(() => {
@@ -313,6 +311,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     pri: 'pri',
     start_extra: 'startExtra',
     stop_extra: 'stopExtra',
+    retention: 'retention',
     removal: 'removal',
   };
   // single edit drops the Enabled field — the instance selector is the enable control
@@ -321,10 +320,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // upcoming, single-edit only: instances where this broadcast could be added (redundant)
   let addTargets: Array<{ instanceId: string; eventId: number }> = $state([]);
   let addLoading = $state(false);
-
-  function instName(id: string): string {
-    return $instances.find((i) => i.id === id)?.name ?? id;
-  }
 
   function openEditBatch(): void {
     if (!selectedRows.length) return;
@@ -359,7 +354,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     const values: Record<string, string> = {};
     const differing: string[] = [];
     if (!editSingle || !editRows || editRows.length !== 1) return { values, differing };
-    const copies = editRows[0].item.copies;
+    const editRow = editRows[0];
+    if (!editRow) return { values, differing };
+    const copies = editRow.item.copies;
     for (const f of singleFields) {
       const ucKey = KEY_TO_UC[f.key];
       if (!ucKey) continue;
@@ -370,7 +367,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         return v === undefined || v === null ? '' : String(v);
       });
       if (copies.length && new Set(strs).size === 1) {
-        values[f.key] = strs[0];
+        values[f.key] = strs[0] ?? '';
       } else {
         differing.push(f.key);
       }
@@ -416,7 +413,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       addEventId?: number;
     };
     if (!editSingle || !editRows || editRows.length !== 1) return [] as Item[];
-    const item = editRows[0].item;
+    const editRow = editRows[0];
+    if (!editRow) return [] as Item[];
+    const item = editRow.item;
     const copyById = new Map(item.copies.map((c) => [c.instanceId, c]));
     const addById = new Map(addTargets.map((t) => [t.instanceId, t.eventId]));
     return $instances.map((inst): Item => {
@@ -553,7 +552,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           await api.recordEvent(a.instanceId, a.eventId);
           added++;
         } catch (e) {
-          addFails.push(`${instName(a.instanceId)}: ${e instanceof Error ? e.message : String(e)}`);
+          addFails.push(`${$instName(a.instanceId)}: ${e instanceof Error ? e.message : String(e)}`);
         }
       }
       if (added) parts.push(`added on ${added} instance${added === 1 ? '' : 's'}`);

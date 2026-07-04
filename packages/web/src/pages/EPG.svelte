@@ -20,7 +20,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import type { EpgChannel, MasterRulePayload, TvhEpgEvent, UnifiedEpgEvent } from '@tvhc/shared';
   import { api, type RuleInput } from '../lib/api.js';
   import { duration, ts } from '../lib/format.js';
-  import { epgTick, instances } from '../lib/stores.js';
+  import { parseListParam } from '../lib/query.js';
+  import { epgTick, instName } from '../lib/stores.js';
   import { route } from '../lib/router.js';
   import RuleEditor from './RuleEditor.svelte';
   import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
@@ -144,16 +145,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     titleTimer = setTimeout(reset, 300);
   }
 
-  function parseList(raw: string | null): string[] {
-    if (!raw) return [];
-    try {
-      const v = JSON.parse(raw) as unknown;
-      return Array.isArray(v) ? v.map((x) => String(x)) : [];
-    } catch {
-      return [];
-    }
-  }
-
   // restore filters from the URL on (re)navigation, then load with them applied.
   // reset() is untracked: it synchronously reads channelFilter/titleFilter (via
   // params() in fetchPage) and viewport, which this effect also writes — tracking
@@ -161,7 +152,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // the route's search string.
   $effect(() => {
     const q = new URLSearchParams($route.search);
-    channelFilter = parseList(q.get('channels'));
+    channelFilter = parseListParam(q.get('channels'));
     titleFilter = q.get('q') ?? '';
     untrack(() => reset());
   });
@@ -209,7 +200,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       refreshInPlace();
       void api.epgChannels().then((c) => (channels = c)).catch(() => {});
     });
-    return unsub;
+    return () => {
+      unsub();
+      clearTimeout(titleTimer); // a pending title debounce must not fire into a dead component
+    };
   });
 
   function endTime(stop: number): string {
@@ -218,10 +212,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       minute: '2-digit',
       hourCycle: 'h23',
     });
-  }
-
-  function instName(id: string): string {
-    return $instances.find((i) => i.id === id)?.name ?? id;
   }
 
   function isScheduled(e: UnifiedEpgEvent): boolean {
@@ -264,9 +254,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       if (eventId === undefined) continue;
       try {
         await api.recordEvent(id, eventId);
-        done.push(instName(id));
+        done.push($instName(id));
       } catch (err) {
-        failed.push(`${instName(id)}: ${err instanceof Error ? err.message : String(err)}`);
+        failed.push(`${$instName(id)}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     notice = [done.length ? `Scheduled on ${done.join(', ')}.` : '', ...failed].filter(Boolean).join(' ');
@@ -303,6 +293,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     };
   }
 </script>
+
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key !== 'Escape') return;
+    if (recordingFor) recordingFor = null;
+    else if (viewing) viewing = null;
+  }}
+/>
 
 <h1>EPG</h1>
 {#if error}<div class="error-banner">{error}</div>{/if}
@@ -362,7 +360,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     role="presentation"
     onclick={(e) => e.target === e.currentTarget && (viewing = null)}
   >
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label={details.title ?? viewing.title}>
       <h2>{details.title ?? viewing.title}</h2>
       {#if details.subtitle}<div class="muted">{details.subtitle}</div>{/if}
 
@@ -388,7 +386,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <td>
               {#each viewing.copies as c (c.instanceId)}
                 <span class="badge neutral" title={c.dvrState ?? ''}>
-                  {instName(c.instanceId)}{#if c.dvrState} · {c.dvrState}{/if}
+                  {$instName(c.instanceId)}{#if c.dvrState} · {c.dvrState}{/if}
                 </span>
               {/each}
             </td>
@@ -419,7 +417,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     role="presentation"
     onclick={(e) => e.target === e.currentTarget && (recordingFor = null)}
   >
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label={`Record ${recordingFor.title}`}>
       <h2>Record "{recordingFor.title}"</h2>
       <div class="muted small">{recordingFor.channelName} · {ts(recordingFor.start)}–{endTime(recordingFor.stop)}</div>
       <p class="muted small">Select instances — check more than one for a redundant recording.</p>
@@ -431,7 +429,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               checked={recordInstances.includes(c.instanceId)}
               onchange={() => toggleRecordInstance(c.instanceId)}
             />
-            {instName(c.instanceId)}
+            {$instName(c.instanceId)}
             {#if c.instanceId === recordingFor.recommendedInstanceId}
               <span class="badge ok" title="Reachable instance with a free tuner during this broadcast (uses the same conflict check as the Conflicts page)">recommended</span>
             {/if}
@@ -450,18 +448,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {/if}
 
 {#if autorecInit}
-  <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (autorecInit = null)}>
-    <div class="modal">
-      <h2>New autorec rule</h2>
-      <RuleEditor
-        initialName={autorecInit.name}
-        initialInstances="all"
-        initialPayload={autorecPayload(autorecInit.name, autorecInit.channel)}
-        onsave={saveAutorec}
-        oncancel={() => (autorecInit = null)}
-      />
-    </div>
-  </div>
+  <RuleEditor
+    initialName={autorecInit.name}
+    initialInstances="all"
+    initialPayload={autorecPayload(autorecInit.name, autorecInit.channel)}
+    onsave={saveAutorec}
+    oncancel={() => (autorecInit = null)}
+  />
 {/if}
 
 <style>

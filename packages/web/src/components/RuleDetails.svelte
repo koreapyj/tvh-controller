@@ -18,13 +18,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import type { MasterRulePayload } from '@tvhc/shared';
   import { conversionFor, toEitTime } from '../lib/eit.js';
+  import { weekdays } from '../lib/format.js';
   import { channelOptions, instances } from '../lib/stores.js';
 
   let { payload, compact = false }: { payload: MasterRulePayload; compact?: boolean } = $props();
 
   const conv = $derived(conversionFor(payload.channel, $channelOptions, $instances));
-
-  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
   // labels from tvheadend dvr.h enums
   const RECORD_MODES: Record<number, string> = {
@@ -60,11 +59,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     5: 'Not set',
     6: 'Default',
   };
-
-  function weekdays(days: number[]): string {
-    if (!days.length || days.length === 7) return 'Every day';
-    return days.map((d) => DAYS[d - 1] ?? String(d)).join(', ');
-  }
 
   function seconds(v: number): string {
     if (!v) return '—';

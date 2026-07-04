@@ -158,9 +158,7 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
     async (req) => {
       const { driftId, action } = req.body ?? ({} as { driftId?: string; action?: ReconcileAction });
       if (!driftId || !action) {
-        const err = new Error('driftId and action are required') as Error & { statusCode: number };
-        err.statusCode = 400;
-        throw err;
+        throw httpError(400, 'driftId and action are required');
       }
       await sync().reconcile(driftId, action);
       return { ok: true };
@@ -175,11 +173,7 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
   app.post<{ Body: { instanceId: string; tvhUuid: string } }>('/api/sync/unignore', async (req) => {
     const { instanceId, tvhUuid } = req.body ?? ({} as { instanceId?: string; tvhUuid?: string });
     if (!instanceId || !tvhUuid) {
-      const err = new Error('instanceId and tvhUuid are required') as Error & {
-        statusCode: number;
-      };
-      err.statusCode = 400;
-      throw err;
+      throw httpError(400, 'instanceId and tvhUuid are required');
     }
     await sync().unignoreOrphan(instanceId, tvhUuid);
     return { ok: true };
@@ -188,9 +182,7 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
   app.post<{ Querystring: { instance?: string } }>('/api/sync/import', async (req) => {
     const instance = req.query.instance;
     if (!instance || !ctx.cache.has(instance)) {
-      const err = new Error('valid ?instance= is required') as Error & { statusCode: number };
-      err.statusCode = 400;
-      throw err;
+      throw httpError(400, 'valid ?instance= is required');
     }
     return sync().importFromInstance(instance);
   });

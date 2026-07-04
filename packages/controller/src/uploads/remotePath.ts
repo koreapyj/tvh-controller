@@ -55,7 +55,14 @@ export function buildRemotePath(
       if (!root) continue;
       const prefix = root.endsWith('/') ? root : `${root}/`;
       if (entry.filename.startsWith(prefix)) {
-        return `${remote}/${entry.filename.slice(prefix.length)}`;
+        const relative = entry.filename.slice(prefix.length);
+        // the filename is instance-reported data: a `..` segment (config
+        // error or rogue instance) must not escape the remote root — fall
+        // through to the sanitized fallback layout instead
+        const segments = relative.split('/');
+        if (!segments.some((s) => s === '..' || s === '.' || s === '')) {
+          return `${remote}/${relative}`;
+        }
       }
     }
   }

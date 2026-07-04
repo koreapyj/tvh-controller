@@ -1,0 +1,19 @@
+.git
+.github
+.claude
+
+node_modules
+**/node_modules
+dist
+**/dist
+coverage
+**/coverage
+*.tsbuildinfo
+**/*.tsbuildinfo
+
+# Real, secret-bearing config must never enter the build context.
+config.yaml
+config.mock.yaml
+
+LICENSE.md
+README.md

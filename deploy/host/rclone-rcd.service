@@ -6,9 +6,17 @@
 #      and paths
 #   4. systemctl daemon-reload && systemctl enable --now rclone-rcd
 #
-# The controller reaches this port over the zone VPN; --rc-no-auth relies on
-# that network isolation. --transfers 1 keeps host I/O and Drive quota impact
-# low.
+# SECURITY: --rc-no-auth means this daemon accepts ANY rc request from ANY
+# host that can reach --rc-addr, with no credentials and no authorization
+# checks (it can trigger arbitrary file copies/moves/deletes via the rc
+# API). This is only safe because --rc-addr is bound to an interface that is
+# reachable exclusively over the zone VPN, and the controller is the only
+# client expected to reach it — the daemon itself provides NO defense in
+# depth. Do not bind --rc-addr to a publicly routable interface, do not
+# expose port 5572 through any firewall/NAT, and do not remove --rc-no-auth
+# without also adding `user`/`pass` to the corresponding instance's rclone
+# config in tvh-controller's config.yaml. --transfers 1 keeps host I/O and
+# Drive quota impact low.
 [Unit]
 Description=rclone remote control daemon (tvh-controller uploads)
 After=network-online.target

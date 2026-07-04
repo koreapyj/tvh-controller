@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { writable } from 'svelte/store';
+import { derived, writable } from 'svelte/store';
 import type {
   ChannelOption,
   ConflictWindow,
@@ -28,6 +28,11 @@ import type {
 } from '@tvhc/shared';
 
 export const instances = writable<InstanceSummary[]>([]);
+/** reactive instance-name lookup: `$instName(id)` falls back to the raw id */
+export const instName = derived(
+  instances,
+  (list) => (id: string) => list.find((i) => i.id === id)?.name ?? id,
+);
 /** channels merged across instances, incl. per-channel EIT offsets from tvheadend */
 export const channelOptions = writable<ChannelOption[]>([]);
 export const conflictsByInstance = writable<Record<string, ConflictWindow[]>>({});

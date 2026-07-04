@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import type { ChannelOption, MasterRulePayload, RuleInstances } from '@tvhc/shared';
   import type { RuleInput } from '../lib/api.js';
   import { conversionFor, toEitTime } from '../lib/eit.js';
+  import { WEEKDAY_LABELS } from '../lib/format.js';
   import { channelOptions, instances } from '../lib/stores.js';
 
   let {
@@ -106,8 +107,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     if (!overlayMode && !wdOverride) wdOverride = true; // plain mode always edits weekdays
   }
 
-  const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-
   function ph(field: keyof MasterRulePayload, fallback = ''): string {
     if (base) {
       const v = base[field];
@@ -189,8 +188,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   );
 </script>
 
+<svelte:window onkeydown={(e) => e.key === 'Escape' && oncancel()} />
+
 <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && oncancel()}>
-  <div class="modal">
+  <div
+    class="modal"
+    role="dialog"
+    aria-modal="true"
+    aria-label={initialName ? `Edit ${initialName}` : 'New autorec rule'}
+  >
     <h2 style="margin-top:0">
       {initialName ? `Edit: ${initialName}` : overlayMode ? 'New linked clone' : 'New autorec rule'}
       {#if overlayMode}<span class="badge info">linked: {parentName}</span>{/if}
@@ -289,7 +295,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </label>
           {/if}
           {#if wdOverride}
-            {#each WEEKDAYS as label, i}
+            {#each WEEKDAY_LABELS as label, i}
               <button type="button" class:primary={wd.includes(i + 1)} onclick={() => toggleDay(i + 1)}>
                 {label}
               </button>

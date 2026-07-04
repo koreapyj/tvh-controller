@@ -64,6 +64,8 @@ export class TvhClient {
     username?: string,
     password?: string,
     private readonly fetchImpl: typeof fetch = fetch,
+    /** per-request cap so a wedged instance can't stall its poller forever */
+    private readonly timeoutMs = 15_000,
   ) {
     this.username = username ?? '';
     this.password = password ?? '';
@@ -85,15 +87,24 @@ export class TvhClient {
     const url = `${this.baseUrl}${path}`;
     const uri = new URL(url).pathname;
     const body = this.encode(params);
-    const doFetch = (auth: string | null) =>
-      this.fetchImpl(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/x-www-form-urlencoded',
-          ...(auth ? { authorization: auth } : {}),
-        },
-        body,
-      });
+    const doFetch = async (auth: string | null) => {
+      try {
+        return await this.fetchImpl(url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/x-www-form-urlencoded',
+            ...(auth ? { authorization: auth } : {}),
+          },
+          body,
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+      } catch (err) {
+        if (err instanceof Error && err.name === 'TimeoutError') {
+          throw new Error(`tvheadend ${path} timed out after ${this.timeoutMs}ms`);
+        }
+        throw err;
+      }
+    };
 
     let res = await doFetch(this.digest ? this.digest.authorize('POST', uri) : this.basic);
 
@@ -106,6 +117,10 @@ export class TvhClient {
         res = await doFetch(this.digest.authorize('POST', uri));
       }
     }
+
+    // a 401 that survived the digest retry means the session is bad (e.g. a
+    // stale nonce not flagged `stale`) — drop it so the next call renegotiates
+    if (res.status === 401) this.digest = null;
 
     if (!res.ok) {
       throw new TvhApiError(res.status, path, await res.text().catch(() => ''));

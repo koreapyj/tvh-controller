@@ -26,7 +26,7 @@ import {
   type TvhEpgEvent,
   type UnifiedEpgEvent,
 } from '@tvhc/shared';
-import type { AppContext } from './context.js';
+import { httpError, type AppContext } from './context.js';
 
 export interface EpgMergeInput {
   instanceId: string;
@@ -146,9 +146,7 @@ export function mergeEpg(
 
 function requireInstance(ctx: AppContext, id: string): void {
   if (!ctx.cache.has(id)) {
-    const err = new Error(`unknown instance "${id}"`) as Error & { statusCode: number };
-    err.statusCode = 404;
-    throw err;
+    throw httpError(404, `unknown instance "${id}"`);
   }
 }
 
@@ -257,9 +255,7 @@ export function registerEpgRoutes(app: FastifyInstance, ctx: AppContext): void {
       const poller = ctx.pollers.get(req.params.instanceId);
       const event = await poller?.client.epgEventLoad(Number(req.params.eventId));
       if (!event) {
-        const err = new Error('event not found') as Error & { statusCode: number };
-        err.statusCode = 404;
-        throw err;
+        throw httpError(404, 'event not found');
       }
       return event;
     },
@@ -270,9 +266,7 @@ export function registerEpgRoutes(app: FastifyInstance, ctx: AppContext): void {
     requireInstance(ctx, instanceId);
     const poller = ctx.pollers.get(instanceId);
     if (!poller) {
-      const err = new Error(`unknown instance "${instanceId}"`) as Error & { statusCode: number };
-      err.statusCode = 404;
-      throw err;
+      throw httpError(404, `unknown instance "${instanceId}"`);
     }
     const cfgUuid = defaultDvrConfigUuid(ctx.cache.get(instanceId).topology?.dvrConfigs ?? []);
     const uuid = await poller.client.dvrEntryCreateByEvent(Number(eventId), cfgUuid);

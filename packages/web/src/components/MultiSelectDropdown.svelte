@@ -43,6 +43,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   let search = $state('');
   let searchInput: HTMLInputElement | undefined = $state();
+  let root: HTMLDetailsElement | undefined = $state();
 
   const filtered = $derived.by(() => {
     const s = search.trim().toLowerCase();
@@ -57,8 +58,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 </script>
 
+<svelte:window
+  onclick={(e) => {
+    // native <details> only closes via its <summary>; match the row-menu
+    // behavior and dismiss on any outside click or Escape
+    if (root?.open && !root.contains(e.target as Node)) root.open = false;
+  }}
+  onkeydown={(e) => {
+    if (e.key === 'Escape' && root?.open) root.open = false;
+  }}
+/>
+
 <details
   class="ms-filter"
+  bind:this={root}
   ontoggle={(e) => (e.currentTarget as HTMLDetailsElement).open && searchInput?.focus()}
 >
   <summary>{selected.length ? `${selected.length} ${unit}` : allLabel}</summary>

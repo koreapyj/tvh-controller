@@ -119,14 +119,24 @@ async function main(): Promise<void> {
   if (dispatcher) await dispatcher.resume();
   autoUploader?.start();
 
+  let closing = false;
   const close = async (): Promise<void> => {
-    autoUploader?.stop();
-    for (const [, poller] of pollers) poller.stop();
-    // give in-flight upload loops a bounded chance to checkpoint before the
-    // database goes away; resume() recovers anything still unfinished
-    await dispatcher?.stop();
-    await app.close();
-    await db?.destroy();
+    if (closing) return; // a second signal must not double-close app/db
+    closing = true;
+    // failsafe: a hung app.close()/db.destroy() must not block SIGTERM forever
+    setTimeout(() => process.exit(1), 10_000).unref();
+    try {
+      autoUploader?.stop();
+      for (const [, poller] of pollers) poller.stop();
+      // give in-flight upload loops a bounded chance to checkpoint before the
+      // database goes away; resume() recovers anything still unfinished
+      await dispatcher?.stop();
+      await app.close();
+      await db?.destroy();
+    } catch (err) {
+      console.error('error during shutdown:', err);
+      process.exit(1);
+    }
     process.exit(0);
   };
   process.on('SIGINT', () => void close());

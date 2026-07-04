@@ -31,6 +31,7 @@ export const RECORDING_FIELDS: FieldSpec[] = [
   { key: 'pri', label: 'Priority', type: 'int', placeholder: '6 = default, 0 = highest' },
   { key: 'start_extra', label: 'Start padding (min)', type: 'int', placeholder: '0' },
   { key: 'stop_extra', label: 'Stop padding (min)', type: 'int', placeholder: '0' },
+  { key: 'retention', label: 'Keep log (days)', type: 'int', placeholder: '0 = config default' },
   { key: 'removal', label: 'Keep file (days)', type: 'int', placeholder: '0 = config default' },
 ];
 

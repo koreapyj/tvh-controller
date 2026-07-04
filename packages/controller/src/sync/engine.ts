@@ -32,6 +32,7 @@ import type { Db } from '../db/db.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { InstancePoller } from '../tvh/poller.js';
+import { httpError } from '../util/httpError.js';
 import { diffPayloads } from './diff.js';
 import { normalizePayload, normalizeRule, payloadHash, type NameMaps } from './normalize.js';
 import { inScope, materializeScope, resolveEffective } from './resolve.js';
@@ -242,11 +243,10 @@ export class SyncEngine {
   private async createRuleInner(input: RuleInput): Promise<MasterRule> {
     const taken = await this.allNames();
     if (taken.has(input.name)) {
-      const err = new Error(
+      throw httpError(
+        409,
         `a rule named "${input.name}" already exists (possibly in the Deleted tab — restore or purge it)`,
-      ) as Error & { statusCode: number };
-      err.statusCode = 409;
-      throw err;
+      );
     }
     const id = randomUUID();
     let payloadJson: string;
@@ -477,11 +477,10 @@ export class SyncEngine {
       .where('deleted_at', 'is', null)
       .execute();
     if (children.length) {
-      const err = new Error(
+      throw httpError(
+        409,
         `rule has linked clones: ${children.map((c) => `"${c.name}"`).join(', ')} — delete or detach them first`,
-      ) as Error & { statusCode: number };
-      err.statusCode = 409;
-      throw err;
+      );
     }
     const bindings = await this.db
       .selectFrom('rule_bindings')
@@ -516,11 +515,7 @@ export class SyncEngine {
       if (rule.parentId) {
         const parent = await this.getRule(rule.parentId);
         if (!parent || parent.deletedAt) {
-          const err = new Error(
-            `cannot restore linked clone "${rule.name}" — restore its parent first`,
-          ) as Error & { statusCode: number };
-          err.statusCode = 409;
-          throw err;
+          throw httpError(409, `cannot restore linked clone "${rule.name}" — restore its parent first`);
         }
       }
       await this.db
@@ -544,11 +539,10 @@ export class SyncEngine {
         .where('parent_id', '=', id)
         .execute();
       if (children.length) {
-        const err = new Error(
+        throw httpError(
+          409,
           `rule still has linked clones (${children.map((c) => `"${c.name}"`).join(', ')}) — purge them first`,
-        ) as Error & { statusCode: number };
-        err.statusCode = 409;
-        throw err;
+        );
       }
       await this.db.deleteFrom('master_rules').where('id', '=', id).execute();
     });
@@ -1041,6 +1035,12 @@ export class SyncEngine {
 
   /** force a push even when master_hash matches (used by overwrite-from-master) */
   private async pushWithForce(ruleId: string, instanceId: string): Promise<void> {
+    const binding = await this.db
+      .selectFrom('rule_bindings')
+      .select(['master_hash'])
+      .where('master_rule_id', '=', ruleId)
+      .where('instance_id', '=', instanceId)
+      .executeTakeFirst();
     await this.db
       .updateTable('rule_bindings')
       .set({ master_hash: 'force-repush' })
@@ -1049,7 +1049,19 @@ export class SyncEngine {
       .execute();
     const results = await this.pushRuleInner(ruleId, [instanceId]);
     const failed = results.find((r) => r.action === 'error' || r.action === 'blocked');
-    if (failed) throw new Error(`push failed: ${failed.detail}`);
+    if (failed) {
+      // a failed push never reached the binding update — restore the real
+      // hash so the sentinel doesn't leave the rule permanently "pending"
+      if (binding) {
+        await this.db
+          .updateTable('rule_bindings')
+          .set({ master_hash: binding.master_hash })
+          .where('master_rule_id', '=', ruleId)
+          .where('instance_id', '=', instanceId)
+          .execute();
+      }
+      throw new Error(`push failed: ${failed.detail}`);
+    }
   }
 
   async listIgnoredOrphans(): Promise<

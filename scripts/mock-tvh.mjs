@@ -91,8 +91,19 @@ const autorecs = [
   },
 ];
 
+// mirrors the upcoming DVR entries plus one unscheduled broadcast, so the
+// EPG page has data and dedup across two mock zones can be exercised
+const epgEvents = [
+  { eventId: 101, channelUuid: 'ch1', channelName: 'KBS1', channelNumber: '1', title: 'Evening News', start: now + 2 * H, stop: now + 3 * H, dvrUuid: 'e1', dvrState: 'scheduled' },
+  { eventId: 102, channelUuid: 'ch2', channelName: 'MBC', channelNumber: '2', title: 'Friday Drama', start: now + 2 * H + 1800, stop: now + 3 * H + 1800, dvrUuid: 'e2', dvrState: 'scheduled' },
+  { eventId: 103, channelUuid: 'ch3', channelName: 'SBS', channelNumber: '3', title: 'Variety Show', start: now + 2 * H + 2400, stop: now + 3 * H },
+  { eventId: 104, channelUuid: 'ch1', channelName: 'KBS1', channelNumber: '1', title: 'Late Documentary', start: now + 4 * H, stop: now + 5 * H },
+];
+
 const routes = {
   '/api/serverinfo': { sw_version: '4.3-mock', api_version: 19, name: 'mock-tvh' },
+  '/api/epg/events/grid': { entries: epgEvents, totalCount: epgEvents.length },
+  '/api/epg/events/load': { entries: [epgEvents[0]] },
   '/api/dvr/entry/grid_upcoming': { entries: upcoming, total: upcoming.length },
   '/api/dvr/entry/grid_finished': { entries: finished, total: finished.length },
   '/api/dvr/entry/grid_failed': { entries: failed, total: failed.length },

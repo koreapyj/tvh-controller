@@ -20,7 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import type { UploadJob } from '@tvhc/shared';
   import { api } from '../lib/api.js';
   import { bytes, pct, ts } from '../lib/format.js';
-  import { instances, uploadEvent } from '../lib/stores.js';
+  import { instName, uploadEvent } from '../lib/stores.js';
 
   let jobs: UploadJob[] = $state([]);
   let error = $state('');
@@ -51,10 +51,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       else jobs = jobs.map((j, i) => (i === idx ? ev : j));
     });
   });
-
-  function instName(id: string): string {
-    return $instances.find((i) => i.id === id)?.name ?? id;
-  }
 
   function statusBadge(s: string): string {
     switch (s) {
@@ -117,7 +113,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <div class="muted small">{ts(j.start)}</div>
         </td>
         <td class="small m-inline">{j.channelname}</td>
-        <td class="small m-inline"><span class="m-only">from</span>{instName(j.instanceId)}</td>
+        <td class="small m-inline"><span class="m-only">from</span>{$instName(j.instanceId)}</td>
         <td class="m-inline">
           <span class="badge {statusBadge(j.status)}">{j.status}</span>
           {#if j.error}<div class="small" style="color:var(--bad)">{j.error}</div>{/if}

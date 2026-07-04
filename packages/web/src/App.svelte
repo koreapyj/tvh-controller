@@ -18,6 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from './lib/api.js';
+  import { errText } from './lib/fetchGuard.js';
   import { interceptLinkClicks, route } from './lib/router.js';
   import { channelOptions, instances, sseConnected } from './lib/stores.js';
   import EPG from './pages/EPG.svelte';
@@ -29,18 +30,32 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import Conflicts from './pages/Conflicts.svelte';
   import Uploads from './pages/Uploads.svelte';
 
-  onMount(async () => {
-    instances.set(await api.instances());
-    // channels need instance topology, which may lag right after a
-    // controller restart — retry until available
+  let bootError = $state('');
+
+  // channels need instance topology, which may lag right after a controller
+  // restart — retry until available, then surface a banner instead of
+  // silently leaving every channel filter empty
+  async function loadChannels(): Promise<void> {
+    bootError = '';
     for (let i = 0; i < 10; i++) {
       const channels = await api.channels().catch(() => []);
       if (channels.length) {
         channelOptions.set(channels);
-        break;
+        return;
       }
       await new Promise((r) => setTimeout(r, 5000));
     }
+    bootError = 'Channel list unavailable — instance topology has not loaded. Channel filters and EIT time conversion are degraded.';
+  }
+
+  onMount(async () => {
+    try {
+      instances.set(await api.instances());
+    } catch (err) {
+      bootError = `Controller unreachable: ${errText(err)}`;
+      return;
+    }
+    await loadChannels();
   });
 
   // mobile-only off-canvas drawer (the bar and backdrop are display:none on desktop)
@@ -83,6 +98,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   </nav>
 
   <main>
+    {#if bootError}
+      <div class="error-banner">
+        {bootError}
+        <button onclick={() => void loadChannels()}>Retry</button>
+      </div>
+    {/if}
     {#if $route.page === 'epg'}
       <EPG />
     {:else if $route.page === 'instances'}

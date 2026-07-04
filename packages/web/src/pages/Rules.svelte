@@ -18,7 +18,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import type { MasterRule, MasterRulePayload, RuleWithStatus, SyncState } from '@tvhc/shared';
   import { api, type RuleInput } from '../lib/api.js';
-  import { dateTime } from '../lib/format.js';
+  import { dateTime, weekdays } from '../lib/format.js';
+  import { parseListParam } from '../lib/query.js';
   import { channelOptions, instances } from '../lib/stores.js';
   import { route } from '../lib/router.js';
   import { conversionFor, offsetLabel, toEitTime } from '../lib/eit.js';
@@ -138,16 +139,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let filterComment: string | null = $state(null);
   let filterZeroMatch = $state(false);
 
-  function parseList(raw: string | null): string[] {
-    if (!raw) return [];
-    try {
-      const v = JSON.parse(raw) as unknown;
-      return Array.isArray(v) ? v.map((x) => String(x)) : [];
-    } catch {
-      return [];
-    }
-  }
-
   /** the /rules URL for the current filters, with the given overrides applied */
   function rulesUrl(
     over: { channels?: string[]; comment?: string | null; zero?: boolean } = {},
@@ -166,7 +157,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // restore filters from the URL on (re)navigation
   $effect(() => {
     const q = new URLSearchParams($route.search);
-    filterChannels = parseList(q.get('channels'));
+    filterChannels = parseListParam(q.get('channels'));
     filterComment = q.get('comment');
     filterZeroMatch = q.get('zero') === '1';
   });
@@ -258,12 +249,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }
     return out;
   });
-
-  const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-  function weekdays(days: number[]): string {
-    if (!days.length || days.length === 7) return 'Every day';
-    return days.map((d) => DAYS[d - 1] ?? String(d)).join(', ');
-  }
 
   const anyConv = $derived(conversionFor('', $channelOptions, $instances));
 
@@ -448,7 +433,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 </script>
 
-<svelte:window onclick={() => (menuFor = null)} />
+<svelte:window
+  onclick={() => (menuFor = null)}
+  onkeydown={(e) => {
+    if (e.key !== 'Escape') return;
+    if (cloning) cloning = null;
+    else if (viewing) {
+      viewing = null;
+      viewingDeleted = false;
+    }
+  }}
+/>
 
 <h1>Autorec Rules</h1>
 {#if error}<div class="error-banner">{error}</div>{/if}
@@ -711,7 +706,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 {#if cloning}
   <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (cloning = null)}>
-    <div class="modal" style="width:480px">
+    <div class="modal" style="width:480px" role="dialog" aria-modal="true" aria-label={`Clone ${cloning.source.name}`}>
       <h2 style="margin-top:0">Clone: {cloning.source.name}</h2>
       <div style="display:flex;flex-direction:column;gap:10px">
         <label style="display:flex;gap:8px;align-items:flex-start;margin:0">
@@ -745,7 +740,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     role="presentation"
     onclick={(e) => e.target === e.currentTarget && ((viewing = null), (viewingDeleted = false))}
   >
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label={viewing.name}>
       <h2 style="margin-top:0">
         {viewing.name}
         {#if viewingDeleted}<span class="badge bad">deleted</span>{/if}

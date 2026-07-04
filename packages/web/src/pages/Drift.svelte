@@ -19,7 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import type { DriftItem, IgnoredOrphan, IntegrityIssue, ReconcileAction } from '@tvhc/shared';
   import { api } from '../lib/api.js';
   import { dateTime } from '../lib/format.js';
-  import { driftItems, instances } from '../lib/stores.js';
+  import { driftItems, instName } from '../lib/stores.js';
   import RuleDetails from '../components/RuleDetails.svelte';
 
   let items: DriftItem[] = $state([]);
@@ -77,10 +77,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     if ($driftItems !== null) items = $driftItems;
     else void refresh();
   });
-
-  function instName(id: string): string {
-    return $instances.find((i) => i.id === id)?.name ?? id;
-  }
 
   async function act(item: DriftItem, action: ReconcileAction, confirmText?: string): Promise<void> {
     if (confirmText && !confirm(confirmText)) return;
@@ -169,7 +165,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         {#each ignored as o (o.instanceId + o.tvhUuid)}
           <tr>
             <td>{o.name || o.tvhUuid}</td>
-            <td class="small">{instName(o.instanceId)}</td>
+            <td class="small">{$instName(o.instanceId)}</td>
             <td class="small muted">{dateTime(o.ignoredAt)}</td>
             <td><button disabled={busy} onclick={() => unignore(o)}>Un-ignore</button></td>
           </tr>
@@ -189,7 +185,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       {:else}
         <span class="badge info">orphan rule</span> {item.instanceRuleName ?? item.tvhUuid}
       {/if}
-      <span class="muted small">on {instName(item.instanceId)}</span>
+      <span class="muted small">on {$instName(item.instanceId)}</span>
     </h3>
 
     {#if item.diffs?.length}
@@ -209,7 +205,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {/if}
 
     {#if item.kind === 'orphan' && item.instancePayload}
-      <h4 style="margin:10px 0 4px">Rule as configured on {instName(item.instanceId)}</h4>
+      <h4 style="margin:10px 0 4px">Rule as configured on {$instName(item.instanceId)}</h4>
       <RuleDetails payload={item.instancePayload} compact />
       {#if item.tvhUuid}<div class="muted small" style="margin-top:4px">tvh uuid: <code>{item.tvhUuid}</code></div>{/if}
     {:else if item.kind === 'deleted-on-instance' && item.masterPayload}
@@ -272,7 +268,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             act(
               item,
               'delete-from-instance',
-              `Delete "${item.instanceRuleName}" from ${instName(item.instanceId)}? Its scheduled recordings will be cancelled.`,
+              `Delete "${item.instanceRuleName}" from ${$instName(item.instanceId)}? Its scheduled recordings will be cancelled.`,
             )}
         >
           Delete from instance

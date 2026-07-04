@@ -4,3 +4,4 @@ dist/
 *.tsbuildinfo
 coverage/
 config.yaml
+package-lock.json
