@@ -17,12 +17,15 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { TvhAutorecRule } from '@tvhc/shared';
+import type { MasterRulePayload, TvhAutorecRule } from '@tvhc/shared';
 import { diffPayloads } from '../src/sync/diff.js';
 import { normalizePayload, normalizeRule, payloadHash, type NameMaps } from '../src/sync/normalize.js';
 
 const maps: NameMaps = {
-  channelsByUuid: new Map([['ch-uuid-1', 'KBS1']]),
+  channelsByUuid: new Map([
+    ['ch-uuid-1', { name: 'KBS1', number: null }],
+    ['ch-uuid-51', { name: 'KBS1', number: '51' }],
+  ]),
   tagsByUuid: new Map([['tag-uuid-1', 'Terrestrial']]),
   dvrConfigsByUuid: new Map([['cfg-uuid-1', 'default profile']]),
 };
@@ -67,6 +70,24 @@ describe('normalizeRule', () => {
     ).toEqual([1, 2, 3, 4, 5, 6, 7]);
   });
 
+  it('maps a channel uuid to its name + number', () => {
+    const p = normalizeRule({ ...tvhRule, channel: 'ch-uuid-51' }, maps);
+    expect(p.channel).toBe('KBS1');
+    expect(p.channel_number).toBe('51');
+  });
+
+  it('an empty channel never carries a number', () => {
+    const p = normalizeRule({ uuid: 'x', name: 'A', channel: '' }, maps);
+    expect(p.channel).toBe('');
+    expect(p.channel_number).toBeNull();
+  });
+
+  it('an unknown channel uuid falls back to the raw uuid with a null number', () => {
+    const p = normalizeRule({ uuid: 'x', name: 'A', channel: 'ch-unknown' }, maps);
+    expect(p.channel).toBe('ch-unknown');
+    expect(p.channel_number).toBeNull();
+  });
+
   it('drops uuid/serieslink/owner/creator', () => {
     const p = normalizeRule(tvhRule, maps) as Record<string, unknown>;
     expect(p.uuid).toBeUndefined();
@@ -103,6 +124,18 @@ describe('normalizeRule', () => {
   });
 });
 
+describe('normalizePayload', () => {
+  it('canonicalizes a legacy numeric channel_number (dev-era rows stored numbers before the schema was corrected to string)', () => {
+    const p = normalizePayload({ channel: 'X', channel_number: 9.1 as unknown as string } as MasterRulePayload);
+    expect(p.channel_number).toBe('9.1');
+  });
+
+  it('a null channel_number stays null', () => {
+    const p = normalizePayload({ channel: 'X', channel_number: null } as MasterRulePayload);
+    expect(p.channel_number).toBeNull();
+  });
+});
+
 describe('payloadHash', () => {
   it('is insensitive to key order', () => {
     const a = normalizeRule(tvhRule, maps);
@@ -131,5 +164,25 @@ describe('diffPayloads', () => {
     const a = normalizePayload(normalizeRule(tvhRule, maps));
     const b = { ...a, weekdays: [1, 3, 5] };
     expect(diffPayloads(a, b)).toEqual([]);
+  });
+
+  it('master channel_number null + matching name: a concrete instance number is not drift', () => {
+    const master = normalizePayload({ ...normalizeRule(tvhRule, maps), channel: 'X', channel_number: null });
+    const instance = { ...master, channel: 'X', channel_number: '51' };
+    expect(diffPayloads(master, instance)).toEqual([]);
+  });
+
+  it('master channel_number null but the instance NAME differs: both fields are reported', () => {
+    const master = normalizePayload({ ...normalizeRule(tvhRule, maps), channel: 'X', channel_number: null });
+    const instance = { ...master, channel: 'Y', channel_number: '51' };
+    const diffs = diffPayloads(master, instance);
+    expect(diffs.map((d) => d.field).sort()).toEqual(['channel', 'channel_number']);
+  });
+
+  it('master pinned to a different number than the instance: reported as drift', () => {
+    const master = normalizePayload({ ...normalizeRule(tvhRule, maps), channel: 'X', channel_number: '51' });
+    const instance = { ...master, channel: 'X', channel_number: '1' };
+    const diffs = diffPayloads(master, instance);
+    expect(diffs.map((d) => d.field)).toEqual(['channel_number']);
   });
 });

@@ -16,7 +16,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
-  import type { MasterRule, MasterRulePayload, RuleWithStatus, SyncState } from '@tvhc/shared';
+  import { chanLabel, chanNumberOrder, type MasterRule, type MasterRulePayload, type RuleWithStatus, type SyncState } from '@tvhc/shared';
   import { api, type RuleInput } from '../lib/api.js';
   import { dateTime, weekdays } from '../lib/format.js';
   import { parseListParam } from '../lib/query.js';
@@ -167,8 +167,23 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     window.history.replaceState({}, '', rulesUrl());
   });
 
+  /** distinct channel label for filtering/sorting/display — includes the pinned number so
+   *  same-name channels with different numbers become distinct entries (see chanLabel) */
+  const chLabel = (p: MasterRulePayload): string =>
+    p.channel ? chanLabel(p.channel, p.channel_number ?? null) : '';
+
+  /** the number an unpinned rule targets: the lowest-numbered channel with that
+   *  name (mirrors channelSetterValue's push-time resolution) */
+  const resolvedNumber = (name: string): string | null => {
+    const candidates = $channelOptions.filter((c) => c.name === name && c.number !== null);
+    if (!candidates.length) return null;
+    return candidates.reduce((a, b) =>
+      chanNumberOrder(b.number) < chanNumberOrder(a.number) ? b : a,
+    ).number;
+  };
+
   const channelFilterOptions = $derived(
-    [...new Set(rules.map((r) => r.effectivePayload.channel).filter(Boolean))]
+    [...new Set(rules.map((r) => chLabel(r.effectivePayload)).filter(Boolean))]
       .sort()
       .map((c) => ({ value: c, label: c })),
   );
@@ -179,7 +194,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   const filtered = $derived(
     rules.filter(
       (r) =>
-        (filterChannels.length === 0 || filterChannels.includes(r.effectivePayload.channel)) &&
+        (filterChannels.length === 0 || filterChannels.includes(chLabel(r.effectivePayload))) &&
         (filterComment === null || r.effectivePayload.comment === filterComment) &&
         (!filterZeroMatch || (r.enabled && r.upcomingMatches === 0)),
     ),
@@ -209,7 +224,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   function sortValue(r: RuleWithStatus, key: SortKey): string {
     switch (key) {
       case 'name': return r.name;
-      case 'channel': return r.effectivePayload.channel;
+      case 'channel': {
+        // the new "N　Name" label sorts lexicographically ("10　" before "2　"),
+        // so sort by a zero-padded numeric key instead (empty channel sorts
+        // first, matching the prior chLabel-based ordering of ''). Channel
+        // numbers can be decimal ("9.1"), so the key is scaled to an integer
+        // (3 fractional digits) before padding — plain padStart on the
+        // decimal string would sort "9.1" after "10" lexicographically.
+        const p = r.effectivePayload;
+        if (!p.channel) return '';
+        const order = chanNumberOrder(p.channel_number ?? resolvedNumber(p.channel));
+        const n = Number.isFinite(order) ? Math.round(order * 1000) : 1e12;
+        return String(n).padStart(15, '0') + p.channel;
+      }
       case 'start': return r.effectivePayload.start;
       case 'start_window': return r.effectivePayload.start_window;
       case 'weekdays': return weekdays(r.effectivePayload.weekdays);
@@ -250,11 +277,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return out;
   });
 
-  const anyConv = $derived(conversionFor('', $channelOptions, $instances));
+  const anyConv = $derived(conversionFor('', null, $channelOptions, $instances));
 
-  function eitTimeCell(hhmm: string, channel: string): { text: string; title: string } {
+  function eitTimeCell(
+    hhmm: string,
+    channel: string,
+    channelNumber: string | null,
+  ): { text: string; title: string } {
     if (!hhmm) return { text: 'Any', title: '' };
-    const conv = conversionFor(channel, $channelOptions, $instances);
+    const conv = conversionFor(channel, channelNumber, $channelOptions, $instances);
     if (!conv) return { text: hhmm, title: '' };
     const t = toEitTime(hhmm, conv);
     if (!t) return { text: hhmm, title: '' };
@@ -583,13 +614,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </td>
         <td class="small m-inline">
           {#if p.channel}
-            <a class="linklike" title="filter by this channel" href={rulesUrl({ channels: [p.channel] })}>
-              {p.channel}
+            {#if p.channel_number == null}
+              {@const n = resolvedNumber(p.channel)}
+              {#if n !== null}
+                <span class="muted" title="not pinned — targets the lowest-numbered channel with this name">{n}　</span>
+              {/if}
+            {/if}
+            <a class="linklike" title="filter by this channel" href={rulesUrl({ channels: [chLabel(p)] })}>
+              {chLabel(p)}
             </a>
           {:else}any{/if}
-          {#if rule.parentId && rule.overlay && 'channel' in rule.overlay}<span class="badge warn" title="overrides parent">override</span>{/if}
+          {#if rule.parentId && rule.overlay && ('channel' in rule.overlay || 'channel_number' in rule.overlay)}<span class="badge warn" title="overrides parent">override</span>{/if}
         </td>
-        {#each [eitTimeCell(p.start, p.channel), eitTimeCell(p.start_window, p.channel)] as cell, ci}
+        {#each [eitTimeCell(p.start, p.channel, p.channel_number ?? null), eitTimeCell(p.start_window, p.channel, p.channel_number ?? null)] as cell, ci}
           <td class="small m-inline" title={cell.title}>
             <span class="m-only">{ci === 0 ? 'after' : 'before'}</span>{cell.text}
           </td>

@@ -18,7 +18,10 @@
 
 import type { FastifyInstance } from 'fastify';
 import {
+  chanKey,
+  chanNumberOrder,
   compareRecordings,
+  type ChannelOption,
   type DvrState,
   type InstanceOverview,
   type RecordingGroup,
@@ -26,6 +29,54 @@ import {
   type TvhDvrEntry,
 } from '@tvhc/shared';
 import { httpError, type AppContext } from './context.js';
+import type { TopologySnapshot } from '../state/instanceCache.js';
+
+export interface ChannelMergeInput {
+  instanceId: string;
+  serverOffsetMinutes: number | null;
+  topology: Pick<TopologySnapshot, 'channels' | 'services' | 'muxes' | 'networks'> | null;
+}
+
+/** channels across all instances merged by name + number identity (rule editor autocomplete, EIT conversion) */
+export function mergeChannels(inputs: ChannelMergeInput[]): ChannelOption[] {
+  const byKey = new Map<string, ChannelOption>();
+  for (const inp of inputs) {
+    const topo = inp.topology;
+    if (!topo) continue;
+    const serviceMux = new Map(topo.services.map((s) => [s.uuid, s.multiplex_uuid ?? s.multiplex]));
+    const muxNetwork = new Map(topo.muxes.map((m) => [m.uuid, m.network_uuid ?? m.network]));
+    const networkLocaltime = new Map(topo.networks.map((n) => [n.uuid, n.localtime]));
+
+    // network "EIT time offset": 0 = UTC, 1 = server-local, else minutes
+    const eitOffsetOf = (ch: { services?: string[] }): number | null => {
+      for (const svc of ch.services ?? []) {
+        const mux = serviceMux.get(svc);
+        const net = mux ? muxNetwork.get(mux) : undefined;
+        const localtime = net ? networkLocaltime.get(net) : undefined;
+        if (localtime === undefined) continue;
+        if (localtime === 0) return 0;
+        if (localtime === 1) return inp.serverOffsetMinutes;
+        return localtime;
+      }
+      return null;
+    };
+
+    for (const ch of topo.channels) {
+      if (!ch.name) continue;
+      const key = chanKey(ch.name, ch.number);
+      let entry = byKey.get(key);
+      if (!entry) {
+        entry = { name: ch.name, number: ch.number ?? null, instances: [], eitOffsetMinutes: null };
+        byKey.set(key, entry);
+      }
+      if (entry.eitOffsetMinutes === null) entry.eitOffsetMinutes = eitOffsetOf(ch);
+      if (!entry.instances.includes(inp.instanceId)) entry.instances.push(inp.instanceId);
+    }
+  }
+  return [...byKey.values()].sort(
+    (a, b) => chanNumberOrder(a.number) - chanNumberOrder(b.number) || a.name.localeCompare(b.name),
+  );
+}
 
 function requireInstance(ctx: AppContext, id: string): void {
   if (!ctx.cache.has(id)) {
@@ -36,49 +87,15 @@ function requireInstance(ctx: AppContext, id: string): void {
 export function registerInstanceRoutes(app: FastifyInstance, ctx: AppContext): void {
   app.get('/api/instances', async () => ctx.cache.all().map((s) => s.summary));
 
-  /** channels across all instances merged by name (for rule editor autocomplete) */
-  app.get('/api/channels', async () => {
-    const byName = new Map<
-      string,
-      { name: string; number: number | null; instances: string[]; eitOffsetMinutes: number | null }
-    >();
-    for (const snap of ctx.cache.all()) {
-      const topo = snap.topology;
-      if (!topo) continue;
-      const serviceMux = new Map(topo.services.map((s) => [s.uuid, s.multiplex_uuid ?? s.multiplex]));
-      const muxNetwork = new Map(topo.muxes.map((m) => [m.uuid, m.network_uuid ?? m.network]));
-      const networkLocaltime = new Map(topo.networks.map((n) => [n.uuid, n.localtime]));
-
-      // network "EIT time offset": 0 = UTC, 1 = server-local, else minutes
-      const eitOffsetOf = (ch: { services?: string[] }): number | null => {
-        for (const svc of ch.services ?? []) {
-          const mux = serviceMux.get(svc);
-          const net = mux ? muxNetwork.get(mux) : undefined;
-          const localtime = net ? networkLocaltime.get(net) : undefined;
-          if (localtime === undefined) continue;
-          if (localtime === 0) return 0;
-          if (localtime === 1) return snap.summary.serverOffsetMinutes;
-          return localtime;
-        }
-        return null;
-      };
-
-      for (const ch of topo.channels) {
-        if (!ch.name) continue;
-        let entry = byName.get(ch.name);
-        if (!entry) {
-          entry = { name: ch.name, number: ch.number ?? null, instances: [], eitOffsetMinutes: null };
-          byName.set(ch.name, entry);
-        }
-        if (entry.number === null && ch.number !== undefined) entry.number = ch.number;
-        if (entry.eitOffsetMinutes === null) entry.eitOffsetMinutes = eitOffsetOf(ch);
-        if (!entry.instances.includes(snap.summary.id)) entry.instances.push(snap.summary.id);
-      }
-    }
-    return [...byName.values()].sort(
-      (a, b) => (a.number ?? 1e9) - (b.number ?? 1e9) || a.name.localeCompare(b.name),
-    );
-  });
+  app.get('/api/channels', async () =>
+    mergeChannels(
+      ctx.cache.all().map((s) => ({
+        instanceId: s.summary.id,
+        serverOffsetMinutes: s.summary.serverOffsetMinutes,
+        topology: s.topology,
+      })),
+    ),
+  );
 
   app.get<{ Params: { id: string } }>('/api/instances/:id/overview', async (req) => {
     requireInstance(ctx, req.params.id);

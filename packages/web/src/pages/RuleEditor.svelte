@@ -16,8 +16,9 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
-  import type { ChannelOption, MasterRulePayload, RuleInstances } from '@tvhc/shared';
+  import { chanKey, chanLabel, chanNumberOrder, type ChannelOption, type MasterRulePayload, type RuleInstances } from '@tvhc/shared';
   import type { RuleInput } from '../lib/api.js';
+  import { parseChannelInput, resolveChannelPick } from '../lib/channelPick.js';
   import { conversionFor, toEitTime } from '../lib/eit.js';
   import { WEEKDAY_LABELS } from '../lib/format.js';
   import { channelOptions, instances } from '../lib/stores.js';
@@ -49,7 +50,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   const DEFAULTS: MasterRulePayload = {
     enabled: true, name: '', title: '', fulltext: false, mergetext: false,
-    channel: '', tag: '', btype: 0, content_type: 0, star_rating: 0,
+    channel: '', channel_number: null, tag: '', btype: 0, content_type: 0, star_rating: 0,
     start: '', start_window: '', start_extra: 0, stop_extra: 0, weekdays: [],
     minduration: 0, maxduration: 0, minyear: 0, maxyear: 0, minseason: 0,
     maxseason: 0, pri: 6, record: 0, retention: 0, removal: 0, maxcount: 0,
@@ -103,6 +104,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         // empty = every day in our model, shown as all selected
         wd = source.weekdays.length ? [...source.weekdays] : [1, 2, 3, 4, 5, 6, 7];
       }
+      // seed the channel input with the full identity label when the source
+      // carries its own pinned number (absent on legacy overlays that
+      // predate channel numbers, or when the source targets "any number").
+      if (source.channel && source.channel_number != null) {
+        sf.channel = chanLabel(String(source.channel), source.channel_number);
+      }
     }
     if (!overlayMode && !wdOverride) wdOverride = true; // plain mode always edits weekdays
   }
@@ -129,7 +136,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   function buildOverlay(): Partial<MasterRulePayload> {
     const o: Partial<MasterRulePayload> = {};
-    for (const k of ['title', 'channel', 'tag', 'config_name', 'start', 'start_window', 'comment'] as StrField[]) {
+    for (const k of ['title', 'tag', 'config_name', 'start', 'start_window', 'comment'] as Exclude<StrField, 'channel'>[]) {
       if (sf[k] !== '') o[k] = sf[k];
     }
     for (const k of ['pri', 'minduration', 'maxduration', 'record', 'start_extra', 'stop_extra', 'maxcount'] as NumField[]) {
@@ -139,6 +146,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       if (bf[k] !== '') o[k] = bf[k] === 'yes';
     }
     if (wdOverride) o.weekdays = [...wd];
+    // channel + channel_number are always written together; save() already
+    // validated that a non-empty sf.channel resolves to a real channel
+    if (sf.channel !== '') {
+      const pick = resolveChannelPick(sf.channel, channels)!;
+      o.channel = pick.name;
+      o.channel_number = pick.number;
+    }
     return o;
   }
 
@@ -157,6 +171,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       formError = 'select at least one instance (or All)';
       return;
     }
+    if (sf.channel !== '' && !resolveChannelPick(sf.channel, channels)) {
+      formError = 'channel not found on any instance — pick one from the list';
+      return;
+    }
     for (const k of ['pri', 'minduration', 'maxduration', 'record', 'start_extra', 'stop_extra', 'maxcount'] as NumField[]) {
       if (sf[k] !== '' && Number.isNaN(Number(sf[k]))) {
         formError = `"${k}" must be a number`;
@@ -171,7 +189,40 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }
   }
 
-  const conv = $derived(conversionFor(sf.channel || ph('channel'), $channelOptions, $instances));
+  const channels: ChannelOption[] = $derived($channelOptions);
+
+  const picked = $derived(parseChannelInput(sf.channel, channels));
+  // effective identity: typed value, else the inherited parent pair (overlay mode)
+  const effPick = $derived(
+    sf.channel
+      ? picked
+      : overlayMode && base?.channel
+        ? { name: base.channel, number: base.channel_number ?? null }
+        : { name: '', number: null },
+  );
+  const matchedChannels = $derived(channels.filter((c) => c.name === effPick.name));
+  const pinnedChannel = $derived(
+    effPick.number !== null ? (matchedChannels.find((c) => c.number === effPick.number) ?? null) : null,
+  );
+  // an unpinned pick targets the lowest-numbered same-name channel (numberless
+  // last) — mirror channelSetterValue so the editor shows the real target
+  const effectiveChannel = $derived(
+    pinnedChannel ??
+      (matchedChannels.length
+        ? matchedChannels.reduce((a, b) =>
+            chanNumberOrder(b.number) < chanNumberOrder(a.number) ? b : a,
+          )
+        : null),
+  );
+  const matchedInstances = $derived(effectiveChannel?.instances ?? []);
+  const scopeIds = $derived(allInstances ? $instances.map((i) => i.id) : selectedInstances);
+  const missingOn = $derived(
+    matchedChannels.length ? scopeIds.filter((id) => !matchedInstances.includes(id)) : [],
+  );
+
+  const conv = $derived(
+    conversionFor(effPick.name, effPick.number ?? (effectiveChannel?.number ?? null), $channelOptions, $instances),
+  );
 
   function eitHint(hhmm: string): string {
     if (!conv || !hhmm) return '';
@@ -179,12 +230,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return t ? `= ${t.time} EIT` : '';
   }
 
-  const channels: ChannelOption[] = $derived($channelOptions);
-  const effChannel = $derived(sf.channel || (overlayMode ? ph('channel') : ''));
-  const matchedChannel = $derived(channels.find((c) => c.name === effChannel) ?? null);
-  const scopeIds = $derived(allInstances ? $instances.map((i) => i.id) : selectedInstances);
-  const missingOn = $derived(
-    matchedChannel ? scopeIds.filter((id) => !matchedChannel.instances.includes(id)) : [],
+  /** the inherited parent channel, shown with its pinned number when known */
+  const channelPlaceholder = $derived(
+    base?.channel ? chanLabel(base.channel, base.channel_number ?? null) : 'Any channel',
   );
 </script>
 
@@ -243,20 +291,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <input id="re-title" bind:value={sf.title} placeholder={ph('title', '(any)')} />
       </div>
       <div>
-        <label for="re-channel">Channel name {overlayMode ? '' : '(blank = any)'}</label>
-        <input id="re-channel" bind:value={sf.channel} list="channel-options" placeholder={ph('channel', 'Any channel')} />
+        <label for="re-channel">Channel {overlayMode ? '' : '(blank = any)'}</label>
+        <input id="re-channel" bind:value={sf.channel} list="channel-options" placeholder={channelPlaceholder} />
         <datalist id="channel-options">
-          {#each channels as c (c.name)}
-            <option value={c.name} label="{c.number !== null ? `${c.number} · ` : ''}{c.name}"></option>
+          {#each channels as c (chanKey(c.name, c.number))}
+            <option value={chanLabel(c.name, c.number)}></option>
           {/each}
         </datalist>
-        {#if matchedChannel}
+        {#if effectiveChannel}
           <div class="muted small">
-            {#if matchedChannel.number !== null}#{matchedChannel.number} · {/if}on {matchedChannel.instances.join(', ')}
+            {chanLabel(effectiveChannel.name, effectiveChannel.number)}{#if effPick.number === null && effectiveChannel.number !== null}&nbsp;(lowest — will be pinned on save){/if}
+            · on {matchedInstances.join(', ')}
             {#if missingOn.length}<span style="color:var(--warn)"> — missing on {missingOn.join(', ')}</span>{/if}
           </div>
-        {:else if effChannel}
-          <div class="small" style="color:var(--bad)">channel not found on any instance — push will be blocked</div>
+        {:else if effPick.name}
+          <div class="small" style="color:var(--bad)">channel not found on any instance — pick one from the list</div>
         {/if}
       </div>
       <div>

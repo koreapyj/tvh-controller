@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import type { MasterRule, MasterRulePayload, RuleInstances } from '@tvhc/shared';
+import { chanNumberOrder, type MasterRule, type MasterRulePayload, type RuleInstances, type TvhChannel } from '@tvhc/shared';
 import { normalizePayload } from './normalize.js';
 
 /** strip undefined/null values so they don't shadow inherited fields */
@@ -40,11 +40,18 @@ export function resolveEffective(
     if (!parent) {
       throw new Error(`linked clone "${rule.name}" references a missing parent rule`);
     }
-    return normalizePayload({
+    const overrides = definedProps<MasterRulePayload>(rule.overlay);
+    const merged: MasterRulePayload = {
       ...parent.payload,
-      ...definedProps<MasterRulePayload>(rule.overlay),
+      ...overrides,
       name: rule.name,
-    });
+    };
+    // channel identity is (name, number): an overlay that overrides the channel
+    // name must never inherit the parent's number; absent/null = any number
+    if (Object.prototype.hasOwnProperty.call(overrides, 'channel')) {
+      merged.channel_number = overrides.channel_number ?? null;
+    }
+    return normalizePayload(merged);
   }
   return normalizePayload({ ...rule.payload, name: rule.name });
 }
@@ -56,4 +63,28 @@ export function inScope(instances: RuleInstances, instanceId: string): boolean {
 /** materialize 'all' into an explicit list (used when narrowing a scope) */
 export function materializeScope(instances: RuleInstances, allIds: string[]): string[] {
   return instances === 'all' ? [...allIds] : [...instances];
+}
+
+/**
+ * Value for tvheadend's channel setter, always an instance-local uuid:
+ *  - pinned number: the exact (name, number) channel; if several share both,
+ *    the first grid entry wins (deterministic per topology order);
+ *  - no number (legacy rules): the LOWEST-numbered channel with that name
+ *    (numberless channels sort last, grid order breaks ties) - an unpinned
+ *    rule must deterministically target one channel, never whichever
+ *    same-name channel tvheadend happens to resolve a bare name to.
+ * Falls back to the bare name when nothing matches (unreachable after
+ * validateNames, but keeps the function total).
+ */
+export function channelSetterValue(channels: TvhChannel[], name: string, number: string | null): string {
+  if (!name) return name;
+  if (number != null) {
+    return channels.find((c) => c.name === name && (c.number ?? null) === number)?.uuid ?? name;
+  }
+  const matches = channels.filter((c) => c.name === name);
+  if (matches.length === 0) return name;
+  const lowest = matches.reduce((a, b) =>
+    chanNumberOrder(b.number) < chanNumberOrder(a.number) ? b : a,
+  );
+  return lowest.uuid;
 }

@@ -19,7 +19,7 @@
 export interface FieldSpec {
   key: string;
   label: string;
-  type: 'bool' | 'int' | 'str';
+  type: 'bool' | 'int' | 'str' | 'channel';
   placeholder?: string;
   help?: string;
 }
@@ -38,6 +38,7 @@ export const RECORDING_FIELDS: FieldSpec[] = [
 /** master-rule payload fields exposed in the autorec batch edit */
 export const RULE_FIELDS: FieldSpec[] = [
   { key: 'enabled', label: 'Enabled', type: 'bool' },
+  { key: 'channel', label: 'Channel', type: 'channel', help: 'blank = any channel' },
   { key: 'pri', label: 'Priority', type: 'int', placeholder: '6 = default, 0 = highest' },
   { key: 'config_name', label: 'DVR profile', type: 'str', placeholder: '(default)' },
   { key: 'comment', label: 'Comment', type: 'str' },

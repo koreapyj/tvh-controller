@@ -153,11 +153,12 @@ export interface UnifiedGroup {
   items: UnifiedItem[];
 }
 
-/** channel known to one or more instances, merged by name */
+/** channel known to one or more instances, merged by name + number identity (see chanKey) */
 export interface ChannelOption {
   name: string;
-  number: number | null;
-  /** instance ids where a channel with this name exists */
+  /** channel number label (e.g. "9.1"); null = unknown */
+  number: string | null;
+  /** instance ids where a channel with this name + number exists */
   instances: string[];
   /**
    * EIT zone offset of the channel's network in minutes, resolved from

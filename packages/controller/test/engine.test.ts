@@ -87,8 +87,14 @@ describe('pushRule: happy path', () => {
     expect(binding).toBeTruthy();
     expect(binding!.tvh_uuid).toBe(stored.uuid);
     expect(binding!.master_hash).toBe(payloadHash(rule.payload));
-    // pushed_hash must come from the normalized READ-BACK, not the raw payload
-    expect(binding!.pushed_hash).toBe(payloadHash(normalizeRule(stored, nameMaps())));
+    // pushed_hash must come from the normalized READ-BACK, not the raw payload.
+    // createRule's write-time normalization already pinned the null number to
+    // KBS1's lowest-numbered channel (#1), so the read-back matches the master
+    // directly — no channelNumberTolerated fold is needed here
+    const readBack = normalizeRule(stored, nameMaps());
+    expect(readBack.channel_number).toBe('1');
+    expect(rule.payload.channel_number).toBe('1');
+    expect(binding!.pushed_hash).toBe(payloadHash(readBack));
 
     await destroy();
   });
@@ -212,7 +218,9 @@ describe('createClone: linked clone', () => {
     const resolved = await engine.listResolved();
     const effClone = resolved.find((r) => r.id === clone.id)!;
     expect(effClone.payload).toEqual({}); // payload still untouched
-    expect(effClone.overlay).toEqual({ channel: 'MBC1' });
+    // overlay overriding the channel with no explicit number is write-time
+    // pinned to the lowest-numbered MBC1 channel (#2), same as a plain rule
+    expect(effClone.overlay).toEqual({ channel: 'MBC1', channel_number: '2' });
     expect(effClone.effective?.channel).toBe('MBC1'); // overridden
     expect(effClone.effective?.title).toBe('Parent Title'); // inherited
     expect(effClone.effective?.pri).toBe(6); // inherited
@@ -645,6 +653,130 @@ describe('updateRule: scope shrink', () => {
   });
 });
 
+// ---------- 15b. channel identity (name, number) pairing ----------
+
+describe('pushRule: pinned channel number', () => {
+  it('resolves the (name, number) pair to the instance-local uuid; channel_number never reaches tvheadend', async () => {
+    const { destroy, engine, clients } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'News51',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'News51', channel: 'KBS1', channel_number: '51' }),
+    });
+
+    const [result] = await engine.pushRule(rule.id);
+    expect(result?.action).toBe('created');
+
+    const client = clients.get('tyo1')!;
+    const conf = client.autorecCreate.mock.calls[0]![0] as Record<string, unknown>;
+    expect(conf.channel).toBe('ch-kbs51');
+    expect('channel_number' in conf).toBe(false);
+
+    await destroy();
+  });
+
+  it('legacy null channel_number: pushes the lowest-numbered same-name channel uuid', async () => {
+    const { destroy, engine, clients } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'NewsLegacy',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'NewsLegacy', channel: 'KBS1', channel_number: null }),
+    });
+
+    await engine.pushRule(rule.id);
+
+    const client = clients.get('tyo1')!;
+    const conf = client.autorecCreate.mock.calls[0]![0] as Record<string, unknown>;
+    expect(conf.channel).toBe('ch-kbs1'); // KBS1 #1, not KBS1 #51
+    expect('channel_number' in conf).toBe(false);
+
+    await destroy();
+  });
+
+  it('blocks when the pinned number has no matching channel on the instance', async () => {
+    const { destroy, engine, clients } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'GhostNumber',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'GhostNumber', channel: 'KBS1', channel_number: '99' }),
+    });
+
+    const [result] = await engine.pushRule(rule.id);
+    expect(result?.action).toBe('blocked');
+    expect(result?.detail).toMatch(/#99 not found/);
+
+    const client = clients.get('tyo1')!;
+    expect(client.autorecCreate).not.toHaveBeenCalled();
+    expect(client.idnodeSave).not.toHaveBeenCalled();
+
+    await destroy();
+  });
+
+  it('drift: an instance-side channel change after a pinned push reports both channel fields', async () => {
+    const { destroy, engine, clients, pollers } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'News51Drift',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'News51Drift', channel: 'KBS1', channel_number: '51' }),
+    });
+    await engine.pushRule(rule.id);
+    const client = clients.get('tyo1')!;
+    const uuid = client.rules[0]!.uuid;
+
+    // out-of-band: the instance rule is repointed to a different channel uuid
+    client.rules[0]!.channel = 'ch-mbc1';
+    await pollers.get('tyo1')!.pollAutorecs();
+
+    const items = await engine.computeDrift();
+    const item = items.find((i) => i.kind === 'modified-on-instance' && i.tvhUuid === uuid);
+    expect(item).toBeTruthy();
+    const fields = item!.diffs?.map((d) => d.field) ?? [];
+    expect(fields).toContain('channel');
+    expect(fields).toContain('channel_number');
+
+    await destroy();
+  });
+
+  it('no false drift: a legacy (null) rule read back with a concrete instance number is not reported', async () => {
+    const { destroy, engine, clients, pollers } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'NewsNoFalseDrift',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'NewsNoFalseDrift', channel: 'KBS1', channel_number: null }),
+    });
+    await engine.pushRule(rule.id);
+    const client = clients.get('tyo1')!;
+
+    // simulate tvheadend reading the name back as its numbered channel uuid
+    client.rules[0]!.channel = 'ch-kbs1';
+    await pollers.get('tyo1')!.pollAutorecs();
+
+    const drift = await engine.computeDrift();
+    expect(drift.some((i) => i.tvhUuid === client.rules[0]!.uuid)).toBe(false);
+
+    const issues = await engine.integrityCheck();
+    expect(issues.some((i) => i.kind === 'content-mismatch' && i.masterRuleId === rule.id)).toBe(false);
+
+    await destroy();
+  });
+
+  it('import: a rule bound to a numbered channel picks up channel_number on import', async () => {
+    const { destroy, engine, clients } = await setup(['tyo1']);
+    const client = clients.get('tyo1')!;
+    client.rules.push(tvhAutorecRule({ name: 'Imported51', channel: 'ch-kbs51' }));
+
+    await engine.importFromInstance('tyo1');
+
+    const rules = await engine.listRules();
+    const imported = rules.find((r) => r.name === 'Imported51');
+    expect(imported).toBeTruthy();
+    expect(imported!.payload.channel).toBe('KBS1');
+    expect(imported!.payload.channel_number).toBe('51');
+
+    await destroy();
+  });
+});
+
 // ---------- 15. importFromInstance bootstrap ----------
 
 describe('importFromInstance', () => {
@@ -692,6 +824,190 @@ describe('importFromInstance', () => {
     ).toBe(true);
     // the identical-content match must NOT show as drift
     expect(drift.some((d) => d.masterRuleId === hashMatch.id && d.instanceId === 'osk1')).toBe(false);
+
+    await destroy();
+  });
+});
+
+// ---------- 16. write-time channel_number pinning ----------
+
+describe('write-time channel_number pinning (null -> lowest-numbered same-name channel)', () => {
+  it('createRule: a null channel_number is pinned to the lowest-numbered same-name channel', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'Pin1',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'Pin1', channel: 'KBS1', channel_number: null }),
+    });
+
+    expect(rule.payload.channel_number).toBe('1');
+    const reloaded = await engine.getRule(rule.id);
+    expect(reloaded!.payload.channel_number).toBe('1');
+
+    await destroy();
+  });
+
+  it('createRule: an already-pinned channel_number is left untouched', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'Pin51',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'Pin51', channel: 'KBS1', channel_number: '51' }),
+    });
+
+    expect(rule.payload.channel_number).toBe('51');
+
+    await destroy();
+  });
+
+  it('createRule: an unresolvable channel name keeps a null channel_number', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'PinGhost',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'PinGhost', channel: 'GHOST', channel_number: null }),
+    });
+
+    expect(rule.payload.channel_number).toBeNull();
+
+    await destroy();
+  });
+
+  it('createRule: an empty channel keeps a null channel_number (no injection)', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'PinEmpty',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'PinEmpty', channel: '', channel_number: null }),
+    });
+
+    expect(rule.payload.channel).toBe('');
+    expect(rule.payload.channel_number).toBeNull();
+
+    await destroy();
+  });
+
+  it('updateRule: flipping the channel name without a number resolves to the lowest-numbered match', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'PinFlip',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'PinFlip', channel: 'MBC1', channel_number: null }),
+    });
+    expect(rule.payload.channel_number).toBe('2');
+
+    await engine.updateRule(rule.id, {
+      name: 'PinFlip',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'PinFlip', channel: 'KBS1', channel_number: null }),
+    });
+
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.payload.channel).toBe('KBS1');
+    expect(updated!.payload.channel_number).toBe('1');
+
+    await destroy();
+  });
+
+  it('batchEdit: a channel-only patch resolves every affected rule to the lowest-numbered match', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const rule1 = await engine.createRule({
+      name: 'Batch1',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'Batch1', channel: 'MBC1' }),
+    });
+    const rule2 = await engine.createRule({
+      name: 'Batch2',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'Batch2', channel: 'MBC1' }),
+    });
+
+    const results = await engine.batchEdit([rule1.id, rule2.id], { channel: 'KBS1' });
+    expect(results.every((r) => r.ok)).toBe(true);
+
+    const updated1 = await engine.getRule(rule1.id);
+    const updated2 = await engine.getRule(rule2.id);
+    expect(updated1!.payload.channel_number).toBe('1');
+    expect(updated2!.payload.channel_number).toBe('1');
+
+    await destroy();
+  });
+
+  it('clone overlay: a channel-overriding overlay is pinned; an overlay leaving the channel alone is untouched', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const parent = await engine.createRule({
+      name: 'PinParent',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'PinParent', channel: 'MBC1' }),
+    });
+    const clone = await engine.createClone(parent.id, true, 'PinClone');
+
+    await engine.updateRule(clone.id, {
+      name: 'PinClone',
+      instances: clone.instances,
+      parentId: parent.id,
+      overlay: { channel: 'KBS1' },
+    });
+    let reloaded = await engine.getRule(clone.id);
+    expect(reloaded!.overlay).toEqual({ channel: 'KBS1', channel_number: '1' });
+
+    // an overlay that does not override the channel must never have a
+    // channel_number injected out of nowhere
+    await engine.updateRule(clone.id, {
+      name: 'PinClone',
+      instances: clone.instances,
+      parentId: parent.id,
+      overlay: { title: 'Something' },
+    });
+    reloaded = await engine.getRule(clone.id);
+    expect(reloaded!.overlay).toEqual({ title: 'Something' });
+
+    await destroy();
+  });
+});
+
+// ---------- 17. regression: batch patch with a non-integer string channel_number ----------
+
+describe('batchEdit: non-integer string channel_number (regression)', () => {
+  it('a batch patch carrying a string channel_number (e.g. "9.1") validates and stores it', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'MxRule',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'MxRule', channel: 'TOKYO MX1' }),
+    });
+
+    // this is the exact shape rejected before the string schema fix:
+    // {"channel":"ＴＯＫＹＯ　ＭＸ１","channel_number":"9.1"} used to fail with
+    // "invalid patch: /channel_number Expected union value" because the
+    // schema demanded a number.
+    const results = await engine.batchEdit([rule.id], {
+      channel: 'TOKYO MX1',
+      channel_number: '9.1',
+    });
+    expect(results.every((r) => r.ok)).toBe(true);
+
+    const reloaded = await engine.getRule(rule.id);
+    expect(reloaded!.payload.channel).toBe('TOKYO MX1');
+    expect(reloaded!.payload.channel_number).toBe('9.1');
+
+    await destroy();
+  });
+
+  it('a batch patch with only the channel name (no channel_number) pins to the lowest-numbered match', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'MxRuleNoNumber',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'MxRuleNoNumber', channel: 'KBS1' }),
+    });
+
+    const results = await engine.batchEdit([rule.id], { channel: 'TOKYO MX1' });
+    expect(results.every((r) => r.ok)).toBe(true);
+
+    const reloaded = await engine.getRule(rule.id);
+    expect(reloaded!.payload.channel).toBe('TOKYO MX1');
+    expect(reloaded!.payload.channel_number).toBe('9.1'); // only TOKYO MX1 channel on the topology fixture
 
     await destroy();
   });

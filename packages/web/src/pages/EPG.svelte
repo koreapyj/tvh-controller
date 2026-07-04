@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
   import { onMount, untrack } from 'svelte';
-  import type { EpgChannel, MasterRulePayload, TvhEpgEvent, UnifiedEpgEvent } from '@tvhc/shared';
+  import { chanKey as sharedChanKey, chanLabel, type EpgChannel, type MasterRulePayload, type TvhEpgEvent, type UnifiedEpgEvent } from '@tvhc/shared';
   import { api, type RuleInput } from '../lib/api.js';
   import { duration, ts } from '../lib/format.js';
   import { parseListParam } from '../lib/query.js';
@@ -27,8 +27,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
   import { notify } from '../lib/notifications.js';
 
-  /** channel identity used for filtering — must match the server's chanKey() */
-  const chanKey = (c: EpgChannel) => `${c.name} ${c.number ?? ''}`;
+  /** channel identity used for filtering — the server compares the same chanKey() strings */
+  const chanKey = (c: EpgChannel) => sharedChanKey(c.name, c.number);
 
   // virtual scroll (tvheadend livegrid style): full-height scrollbar, only a
   // window of rows in the DOM, pages fetched on demand as they scroll into view
@@ -54,7 +54,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let viewing: UnifiedEpgEvent | null = $state(null);
   let details: TvhEpgEvent | null = $state(null);
   let busy = $state(false);
-  let autorecInit: { name: string; channel: string } | null = $state(null);
+  let autorecInit: { name: string; channel: string; channelNumber: string | null } | null =
+    $state(null);
 
   // record modal: pick one or more instances for (redundant) recording
   let recordingFor: UnifiedEpgEvent | null = $state(null);
@@ -71,7 +72,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   const channelOptions = $derived(
     channels.map((ch) => ({
       value: chanKey(ch),
-      label: `${ch.number ? `${ch.number} · ` : ''}${ch.name}`,
+      label: chanLabel(ch.name, ch.number),
       search: `${ch.name} ${ch.number ?? ''}`,
     })),
   );
@@ -269,7 +270,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   function startAutorec(): void {
     if (!viewing) return;
-    autorecInit = { name: viewing.title, channel: viewing.channelName };
+    autorecInit = {
+      name: viewing.title,
+      channel: viewing.channelName,
+      channelNumber: viewing.channelNumber || null,
+    };
     viewing = null;
   }
 
@@ -284,10 +289,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }
   }
 
-  function autorecPayload(title: string, channel: string): MasterRulePayload {
+  function autorecPayload(
+    title: string,
+    channel: string,
+    channelNumber: string | null,
+  ): MasterRulePayload {
     return {
       enabled: true, name: '', title, fulltext: false, mergetext: false,
-      channel, tag: '', btype: 0, content_type: 0, star_rating: 0,
+      channel, channel_number: channelNumber, tag: '', btype: 0, content_type: 0, star_rating: 0,
       start: '', start_window: '', start_extra: 0, stop_extra: 0, weekdays: [1, 2, 3, 4, 5, 6, 7],
       minduration: 0, maxduration: 0, minyear: 0, maxyear: 0, minseason: 0,
       maxseason: 0, pri: 6, record: 0, retention: 0, removal: 0, maxcount: 0,
@@ -341,7 +350,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         onkeydown={(ev) => e && (ev.key === 'Enter' || ev.key === ' ') && openDetails(e)}
       >
         {#if e}
-          <span class="epg-ch muted small">{#if e.channelNumber}{e.channelNumber} · {/if}{e.channelName}</span>
+          <span class="epg-ch muted small">{chanLabel(e.channelName, e.channelNumber || null)}</span>
           <span class="epg-time muted small">{ts(e.start)}–{endTime(e.stop)}</span>
           <span class="epg-title">{e.title}{#if e.subtitle}<span class="muted small"> · {e.subtitle}</span>{/if}</span>
           {#if isScheduled(e)}<span class="badge info">scheduled</span>{/if}
@@ -375,7 +384,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
       <table>
         <tbody>
-          <tr><td class="muted small">Channel</td><td>{viewing.channelNumber ? `${viewing.channelNumber} · ` : ''}{viewing.channelName}</td></tr>
+          <tr><td class="muted small">Channel</td><td>{chanLabel(viewing.channelName, viewing.channelNumber || null)}</td></tr>
           <tr><td class="muted small">Time</td><td>{ts(viewing.start)}–{endTime(viewing.stop)} · {duration(viewing.start, viewing.stop)}</td></tr>
           {#if details.episodeOnscreen}<tr><td class="muted small">Episode</td><td>{details.episodeOnscreen}</td></tr>{/if}
           {#if details.starRating}<tr><td class="muted small">Rating</td><td>{details.starRating}/4</td></tr>{/if}
@@ -419,7 +428,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   >
     <div class="modal" role="dialog" aria-modal="true" aria-label={`Record ${recordingFor.title}`}>
       <h2>Record "{recordingFor.title}"</h2>
-      <div class="muted small">{recordingFor.channelName} · {ts(recordingFor.start)}–{endTime(recordingFor.stop)}</div>
+      <div class="muted small">{chanLabel(recordingFor.channelName, recordingFor.channelNumber || null)} · {ts(recordingFor.start)}–{endTime(recordingFor.stop)}</div>
       <p class="muted small">Select instances — check more than one for a redundant recording.</p>
       <div style="display:flex;flex-direction:column;gap:6px">
         {#each recordingFor.copies as c (c.instanceId)}
@@ -451,7 +460,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <RuleEditor
     initialName={autorecInit.name}
     initialInstances="all"
-    initialPayload={autorecPayload(autorecInit.name, autorecInit.channel)}
+    initialPayload={autorecPayload(autorecInit.name, autorecInit.channel, autorecInit.channelNumber)}
     onsave={saveAutorec}
     oncancel={() => (autorecInit = null)}
   />

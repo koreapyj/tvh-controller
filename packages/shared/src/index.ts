@@ -19,5 +19,6 @@
 export * from './tvh-types.js';
 export * from './master-rule.js';
 export * from './content-identity.js';
+export * from './channel-identity.js';
 export * from './rclone-rc.js';
 export * from './controller-api.js';

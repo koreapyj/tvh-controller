@@ -16,14 +16,16 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
-  import type { MasterRulePayload } from '@tvhc/shared';
+  import { chanLabel, type MasterRulePayload } from '@tvhc/shared';
   import { conversionFor, toEitTime } from '../lib/eit.js';
   import { weekdays } from '../lib/format.js';
   import { channelOptions, instances } from '../lib/stores.js';
 
   let { payload, compact = false }: { payload: MasterRulePayload; compact?: boolean } = $props();
 
-  const conv = $derived(conversionFor(payload.channel, $channelOptions, $instances));
+  const conv = $derived(
+    conversionFor(payload.channel, payload.channel_number ?? null, $channelOptions, $instances),
+  );
 
   // labels from tvheadend dvr.h enums
   const RECORD_MODES: Record<number, string> = {
@@ -87,7 +89,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       value: payload.fulltext ? 'yes' : 'no',
       isDefault: !payload.fulltext,
     },
-    { label: 'Channel', value: payload.channel || 'Any channel', isDefault: !payload.channel },
+    {
+      label: 'Channel',
+      value: payload.channel ? chanLabel(payload.channel, payload.channel_number ?? null) : 'Any channel',
+      isDefault: !payload.channel,
+    },
     { label: 'Channel tag', value: payload.tag || '—', isDefault: !payload.tag },
     {
       label: 'Weekdays',

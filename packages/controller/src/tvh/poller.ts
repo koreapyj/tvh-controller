@@ -389,8 +389,16 @@ export class InstancePoller {
       }),
     );
 
+    // defensive: normalize channel numbers to strings at the single ingestion
+    // choke point — older tvheadend variants (and our mock) may still emit
+    // numerics even though real tvheadend reports them as strings (e.g. "9.1")
+    const normalizedChannels = channels.map((c) => ({
+      ...c,
+      number: c.number == null ? undefined : String(c.number),
+    }));
+
     const topology: TopologySnapshot = {
-      channels,
+      channels: normalizedChannels,
       tags,
       dvrConfigs,
       muxes,

@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import type { ChannelOption, InstanceSummary } from '@tvhc/shared';
+import { chanNumberOrder, type ChannelOption, type InstanceSummary } from '@tvhc/shared';
 
 /**
  * Autorec time windows are interpreted by tvheadend in the SERVER's local
@@ -46,20 +46,37 @@ export function commonEitOffset(channels: ChannelOption[]): number | null {
 }
 
 /**
- * Conversion for a rule, resolved per channel; rules without a channel use
- * the common offset when every known channel agrees. null = no conversion
- * (zones match, or not enough information).
+ * Conversion for a rule, resolved per channel. Three modes:
+ *  - no channel name: the common offset when every known channel agrees;
+ *  - channel name + a pinned number: that exact (name, number) channel's
+ *    offset, falling back to the common offset when the pair isn't found;
+ *  - channel name, no number pinned: the LOWEST-numbered same-name channel's
+ *    offset (the channel an unpinned rule targets — see channelSetterValue),
+ *    falling back to the common offset when it is unknown.
+ * null = no conversion (zones match, or not enough information).
  */
 export function conversionFor(
   channelName: string,
+  channelNumber: string | null,
   channels: ChannelOption[],
   instances: InstanceSummary[],
 ): EitConversion | null {
   const server = serverOffset(instances);
   if (server === null) return null;
-  const eit = channelName
-    ? (channels.find((c) => c.name === channelName)?.eitOffsetMinutes ?? commonEitOffset(channels))
-    : commonEitOffset(channels);
+  let eit: number | null;
+  if (!channelName) {
+    eit = commonEitOffset(channels);
+  } else if (channelNumber != null) {
+    eit =
+      channels.find((c) => c.name === channelName && c.number === channelNumber)
+        ?.eitOffsetMinutes ?? commonEitOffset(channels);
+  } else {
+    const named = channels.filter((c) => c.name === channelName);
+    const lowest = named.length
+      ? named.reduce((a, b) => (chanNumberOrder(b.number) < chanNumberOrder(a.number) ? b : a))
+      : undefined;
+    eit = lowest?.eitOffsetMinutes ?? commonEitOffset(channels);
+  }
   if (eit === null) return null;
   const delta = eit - server;
   if (delta === 0) return null;

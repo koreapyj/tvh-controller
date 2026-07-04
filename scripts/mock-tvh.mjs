@@ -25,11 +25,23 @@ import { createServer } from 'node:http';
 const port = Number(process.argv[2] ?? 19981);
 const now = Math.floor(Date.now() / 1000);
 const H = 3600;
+const zone = port === 19981 ? 'A' : 'B';
 
+// channel `number` types mirror the real tvheadend wire (verified against
+// tvh 4.3 / API v19 prod): INTEGER numbers arrive as JSON numbers, dotted
+// sub-channel numbers as STRINGS — the controller stringifies at ingestion.
 const channels = [
   { uuid: 'ch1', enabled: true, name: 'KBS1', number: 1, services: ['svc1'], tags: [] },
   { uuid: 'ch2', enabled: true, name: 'MBC', number: 2, services: ['svc2'], tags: [] },
   { uuid: 'ch3', enabled: true, name: 'SBS', number: 3, services: ['svc3'], tags: [] },
+  // cross-zone collision fixtures: ch4 is identical on both zones (duplicate
+  // name, different number); ch5 collides on number but the name differs
+  // per zone, exercising both flavors of dedup ambiguity.
+  { uuid: 'ch4', enabled: true, name: 'KBS1', number: 51, services: ['svc4'], tags: [] },
+  { uuid: 'ch5', enabled: true, name: `Regional ${zone}`, number: 3, services: ['svc5'], tags: [] },
+  // non-integer channel number fixture ("9.1" sub-channels come as strings) —
+  // exercises the ingestion stringification and chanNumberOrder ordering.
+  { uuid: 'ch6', enabled: true, name: 'TOKYO MX1', number: '9.1', services: ['svc6'], tags: [] },
 ];
 
 const upcoming = [
@@ -98,6 +110,8 @@ const epgEvents = [
   { eventId: 102, channelUuid: 'ch2', channelName: 'MBC', channelNumber: '2', title: 'Friday Drama', start: now + 2 * H + 1800, stop: now + 3 * H + 1800, dvrUuid: 'e2', dvrState: 'scheduled' },
   { eventId: 103, channelUuid: 'ch3', channelName: 'SBS', channelNumber: '3', title: 'Variety Show', start: now + 2 * H + 2400, stop: now + 3 * H },
   { eventId: 104, channelUuid: 'ch1', channelName: 'KBS1', channelNumber: '1', title: 'Late Documentary', start: now + 4 * H, stop: now + 5 * H },
+  { eventId: 105, channelUuid: 'ch4', channelName: 'KBS1', channelNumber: '51', title: 'Subchannel Show', start: now + 3 * H, stop: now + 4 * H },
+  { eventId: 106, channelUuid: 'ch6', channelName: 'TOKYO MX1', channelNumber: '9.1', title: 'MX Anime Hour', start: now + 3 * H, stop: now + 4 * H },
 ];
 
 const routes = {
@@ -107,7 +121,6 @@ const routes = {
   '/api/dvr/entry/grid_upcoming': { entries: upcoming, total: upcoming.length },
   '/api/dvr/entry/grid_finished': { entries: finished, total: finished.length },
   '/api/dvr/entry/grid_failed': { entries: failed, total: failed.length },
-  '/api/dvr/autorec/grid': { entries: autorecs, total: autorecs.length },
   '/api/status/inputs': {
     entries: [
       { uuid: 'fe1', input: 'Mock DVB-T Tuner', stream: 'mux1 (KBS1)', subs: 0, weight: 0, signal: 80, signal_scale: 1, snr: 28000, snr_scale: 2 },
@@ -135,8 +148,11 @@ const routes = {
       { uuid: 'svc1', enabled: true, svcname: 'KBS1', multiplex: '177.5MHz', multiplex_uuid: 'mux1', channel: ['ch1'] },
       { uuid: 'svc2', enabled: true, svcname: 'MBC', multiplex: '189.5MHz', multiplex_uuid: 'mux2', channel: ['ch2'] },
       { uuid: 'svc3', enabled: true, svcname: 'SBS', multiplex: '189.5MHz', multiplex_uuid: 'mux2', channel: ['ch3'] },
+      { uuid: 'svc4', enabled: true, svcname: 'KBS1', multiplex: '177.5MHz', multiplex_uuid: 'mux1', channel: ['ch4'] },
+      { uuid: 'svc5', enabled: true, svcname: `Regional ${zone}`, multiplex: '189.5MHz', multiplex_uuid: 'mux2', channel: ['ch5'] },
+      { uuid: 'svc6', enabled: true, svcname: 'TOKYO MX1', multiplex: '177.5MHz', multiplex_uuid: 'mux1', channel: ['ch6'] },
     ],
-    total: 3,
+    total: 6,
   },
   '/api/mpegts/network/grid': {
     entries: [{ uuid: 'net1', networkname: 'DVB-T', enabled: true }],
@@ -151,12 +167,46 @@ const routes = {
   '/api/mpegts/input/network_list': { entries: [{ key: 'net1', val: 'DVB-T' }] },
 };
 
+// autorecs is the single mutable store for the write endpoints below; the
+// dynamic routes read/write it directly so grid reads reflect prior writes.
+let arSeq = 1;
+// tvheadend's channel setter accepts a uuid or a name and stores the uuid;
+// unknown values are silently cleared - mirror that
+const resolveChannel = (v) => (!v ? '' : (channels.find((c) => c.uuid === v || c.name === v)?.uuid ?? ''));
+const dynamic = {
+  '/api/dvr/autorec/grid': () => ({ entries: autorecs, total: autorecs.length }),
+  '/api/dvr/autorec/create': (p) => {
+    const conf = JSON.parse(p.get('conf') ?? '{}');
+    const uuid = `mock-ar-${port}-${arSeq++}`;
+    autorecs.push({ ...conf, uuid, channel: resolveChannel(conf.channel) });
+    return { uuid };
+  },
+  '/api/idnode/save': (p) => {
+    const node = JSON.parse(p.get('node') ?? '{}');
+    const i = autorecs.findIndex((r) => r.uuid === node.uuid);
+    if (i !== -1) autorecs[i] = { ...autorecs[i], ...node, channel: resolveChannel(node.channel ?? autorecs[i].channel) };
+    return {};
+  },
+  '/api/idnode/delete': (p) => {
+    const uuids = JSON.parse(p.get('uuid') ?? '[]');
+    for (let i = autorecs.length - 1; i >= 0; i--) if (uuids.includes(autorecs[i].uuid)) autorecs.splice(i, 1);
+    return {};
+  },
+};
+
 createServer((req, res) => {
   const path = req.url.split('?')[0];
-  const body = routes[path];
   let chunks = '';
   req.on('data', (c) => (chunks += c));
   req.on('end', () => {
+    const dyn = dynamic[path];
+    if (dyn) {
+      console.log(`[mock-tvh:${port}] 200 ${path} (dynamic)`);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(dyn(new URLSearchParams(chunks))));
+      return;
+    }
+    const body = routes[path];
     if (body === undefined) {
       console.log(`[mock-tvh:${port}] 404 ${path}`);
       res.writeHead(404, { 'content-type': 'application/json' });

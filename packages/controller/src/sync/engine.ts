@@ -28,14 +28,15 @@ import type {
   SyncState,
   TvhAutorecRule,
 } from '@tvhc/shared';
+import { chanLabel, chanNumberOrder } from '@tvhc/shared';
 import type { Db } from '../db/db.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { InstancePoller } from '../tvh/poller.js';
 import { httpError } from '../util/httpError.js';
-import { diffPayloads } from './diff.js';
+import { channelNumberTolerated, diffPayloads } from './diff.js';
 import { normalizePayload, normalizeRule, payloadHash, type NameMaps } from './normalize.js';
-import { inScope, materializeScope, resolveEffective } from './resolve.js';
+import { channelSetterValue, inScope, materializeScope, resolveEffective } from './resolve.js';
 
 export interface PushResult {
   masterRuleId: string;
@@ -112,7 +113,9 @@ export class SyncEngine {
     const topo = this.cache.get(instanceId).topology;
     if (!topo) throw new Error(`topology unavailable for instance "${instanceId}"`);
     return {
-      channelsByUuid: new Map(topo.channels.map((c) => [c.uuid, c.name])),
+      channelsByUuid: new Map(
+        topo.channels.map((c) => [c.uuid, { name: c.name, number: c.number ?? null }]),
+      ),
       tagsByUuid: new Map(topo.tags.map((t) => [t.uuid, t.name])),
       dvrConfigsByUuid: new Map(topo.dvrConfigs.map((d) => [d.uuid, d.name])),
     };
@@ -121,12 +124,21 @@ export class SyncEngine {
   /**
    * Pre-push validation. Tvheadend SILENTLY CLEARS an unknown channel/tag
    * name (rule would become all-channels), so a missing name must block.
+   * A pinned number additionally requires a channel matching BOTH name and
+   * number on the instance.
    */
   private validateNames(instanceId: string, payload: MasterRulePayload): string | null {
     const topo = this.cache.get(instanceId).topology;
     if (!topo) return 'topology not loaded';
-    if (payload.channel && !topo.channels.some((c) => c.name === payload.channel)) {
-      return `channel "${payload.channel}" not found on instance`;
+    if (payload.channel) {
+      const matches = topo.channels.filter((c) => c.name === payload.channel);
+      if (payload.channel_number != null) {
+        if (!matches.some((c) => (c.number ?? null) === payload.channel_number)) {
+          return `channel "${payload.channel}" #${payload.channel_number} not found on instance`;
+        }
+      } else if (matches.length === 0) {
+        return `channel "${payload.channel}" not found on instance`;
+      }
     }
     if (payload.tag && !topo.tags.some((t) => t.name === payload.tag)) {
       return `channel tag "${payload.tag}" not found on instance`;
@@ -135,6 +147,37 @@ export class SyncEngine {
       return `DVR profile "${payload.config_name}" not found on instance`;
     }
     return null;
+  }
+
+  /**
+   * Write-time normalization: a non-empty channel with a null number is pinned
+   * to the lowest-numbered channel with that name across the rule's in-scope
+   * instances (mirrors channelSetterValue's push-time resolution). Unresolvable
+   * names keep null - push falls back to lowest-at-push and validateNames
+   * reports the missing channel.
+   */
+  private pinLowestChannelNumber<T extends { channel?: string; channel_number?: string | null }>(
+    payload: T,
+    instances: RuleInstances,
+  ): T {
+    if (!payload.channel || payload.channel_number != null) return payload;
+    const ids = instances === 'all' ? this.cache.ids() : instances;
+    let lowest: string | null = null;
+    for (const id of ids) {
+      if (!this.cache.has(id)) continue;
+      const topo = this.cache.get(id).topology;
+      if (!topo) continue;
+      for (const c of topo.channels) {
+        if (
+          c.name === payload.channel &&
+          c.number != null &&
+          (lowest == null || chanNumberOrder(c.number) < chanNumberOrder(lowest))
+        ) {
+          lowest = c.number;
+        }
+      }
+    }
+    return lowest == null ? payload : { ...payload, channel_number: lowest };
   }
 
   // ---------- master rule CRUD ----------
@@ -250,19 +293,23 @@ export class SyncEngine {
     }
     const id = randomUUID();
     let payloadJson: string;
+    let overlayJson: string | null = null;
     let enabled: boolean;
     if (input.parentId) {
       const parent = await this.assertValidParent(input.parentId);
+      const overlay = this.pinLowestChannelNumber(input.overlay ?? {}, input.instances);
       payloadJson = JSON.stringify({});
+      overlayJson = JSON.stringify(overlay);
       const effective = resolveEffective(
-        { name: input.name, payload: {} as MasterRulePayload, parentId: input.parentId, overlay: input.overlay ?? {} },
+        { name: input.name, payload: {} as MasterRulePayload, parentId: input.parentId, overlay },
         parent,
       );
       enabled = effective.enabled;
     } else {
       const normalized = normalizePayload({ ...(input.payload as MasterRulePayload), name: input.name });
-      payloadJson = JSON.stringify(normalized);
-      enabled = normalized.enabled;
+      const pinned = this.pinLowestChannelNumber(normalized, input.instances);
+      payloadJson = JSON.stringify(pinned);
+      enabled = pinned.enabled;
     }
     await this.db
       .insertInto('master_rules')
@@ -273,7 +320,7 @@ export class SyncEngine {
         enabled: enabled ? 1 : 0,
         updated_at: now(),
         parent_id: input.parentId ?? null,
-        overlay: input.parentId ? JSON.stringify(input.overlay ?? {}) : null,
+        overlay: overlayJson,
         instances: input.instances === 'all' ? null : JSON.stringify(input.instances),
       })
       .execute();
@@ -328,23 +375,30 @@ export class SyncEngine {
 
     const isClone = !!(input.parentId ?? existing.parentId);
     let payloadJson: string | undefined;
+    let overlayJson: string | null = null;
     let enabled: boolean;
     if (isClone) {
       const parent = await this.getRule(input.parentId ?? existing.parentId!);
+      const overlay = this.pinLowestChannelNumber(
+        input.overlay ?? existing.overlay ?? {},
+        input.instances,
+      );
+      overlayJson = JSON.stringify(overlay);
       const effective = resolveEffective(
         {
           name: input.name,
           payload: {} as MasterRulePayload,
           parentId: input.parentId ?? existing.parentId,
-          overlay: input.overlay ?? existing.overlay ?? {},
+          overlay,
         },
         parent,
       );
       enabled = effective.enabled;
     } else {
       const normalized = normalizePayload({ ...(input.payload as MasterRulePayload), name: input.name });
-      payloadJson = JSON.stringify(normalized);
-      enabled = normalized.enabled;
+      const pinned = this.pinLowestChannelNumber(normalized, input.instances);
+      payloadJson = JSON.stringify(pinned);
+      enabled = pinned.enabled;
     }
 
     await this.db
@@ -355,7 +409,7 @@ export class SyncEngine {
         enabled: enabled ? 1 : 0,
         updated_at: now(),
         parent_id: input.parentId ?? existing.parentId,
-        overlay: isClone ? JSON.stringify(input.overlay ?? existing.overlay ?? {}) : null,
+        overlay: isClone ? overlayJson : null,
         instances: input.instances === 'all' ? null : JSON.stringify(input.instances),
       })
       .where('id', '=', id)
@@ -373,6 +427,17 @@ export class SyncEngine {
     const existing = await this.getRule(id);
     if (!existing) throw new Error(`rule ${id} not found`);
     if (existing.deletedAt) throw new Error(`rule "${existing.name}" is deleted — restore it first`);
+    // channel identity is a (name, number) pair: a change that sets the name
+    // without an explicit number must not inherit the previous pin
+    if ('channel' in change && !('channel_number' in change)) {
+      change = { ...change, channel_number: null };
+    }
+    // a channel change with no pinned number resolves to the lowest-numbered
+    // same-name channel across the rule's own instance scope (write-time
+    // normalization mirrors channelSetterValue's push-time fallback)
+    if ('channel' in change) {
+      change = this.pinLowestChannelNumber(change, existing.instances);
+    }
     const input: RuleInput = existing.parentId
       ? {
           name: existing.name,
@@ -606,6 +671,12 @@ export class SyncEngine {
       if (blocked) return { ...base, action: 'blocked', detail: blocked };
 
       const conf: Record<string, unknown> = { ...rule.effective };
+      delete conf.channel_number; // controller-only field - must not leak to tvheadend
+      conf.channel = channelSetterValue(
+        this.cache.get(instanceId).topology!.channels,
+        rule.effective.channel,
+        rule.effective.channel_number,
+      );
       let tvhUuid: string;
       if (binding) {
         await poller.client.idnodeSave({ uuid: binding.tvh_uuid, ...conf });
@@ -619,7 +690,15 @@ export class SyncEngine {
       const rules = await poller.client.autorecGrid();
       const stored = rules.find((r) => r.uuid === tvhUuid);
       if (!stored) return { ...base, action: 'error', detail: 'rule vanished after push' };
-      const pushedHash = payloadHash(normalizeRule(stored, maps));
+      const readBack = normalizeRule(stored, maps);
+      // fold a tolerated channel_number the same way diffPayloads does: a
+      // legacy (null) rule whose read-back resolved to a concrete channel
+      // uuid must not perpetually hash-mismatch its own pushed baseline
+      const pushedHash = payloadHash(
+        channelNumberTolerated(rule.effective, readBack)
+          ? { ...readBack, channel_number: rule.effective.channel_number }
+          : readBack,
+      );
 
       await this.db
         .insertInto('rule_bindings')
@@ -692,7 +771,13 @@ export class SyncEngine {
           continue;
         }
         const normalized = normalizeRule(instanceRule, maps);
-        if (payloadHash(normalized) !== b.pushed_hash) {
+        // same fold as at push time: compare against the tolerant baseline,
+        // not the raw read-back, or a legacy rule would show perpetual
+        // false drift purely from tvheadend's internal uuid resolution
+        const canonical = channelNumberTolerated(master.effective, normalized)
+          ? { ...normalized, channel_number: master.effective.channel_number }
+          : normalized;
+        if (payloadHash(canonical) !== b.pushed_hash) {
           items.push({
             id: `modified-on-instance:${instanceId}:${b.tvh_uuid}`,
             kind: 'modified-on-instance',
@@ -930,7 +1015,9 @@ export class SyncEngine {
         }
         const cloneName = await this.uniqueRuleName(
           master.name,
-          item.instancePayload.channel || item.instanceId,
+          item.instancePayload.channel
+            ? chanLabel(item.instancePayload.channel, item.instancePayload.channel_number ?? null)
+            : item.instanceId,
         );
         const clone = await this.createRuleInner({
           name: cloneName,
@@ -961,7 +1048,9 @@ export class SyncEngine {
         const instanceHash = payloadHash(normalizePayload(item.instancePayload));
         const name = await this.uniqueRuleName(
           item.instancePayload.name,
-          item.instancePayload.channel || undefined,
+          item.instancePayload.channel
+            ? chanLabel(item.instancePayload.channel, item.instancePayload.channel_number ?? null)
+            : undefined,
         );
         // scoped to its own instance: adopting must not replicate the rule
         // to other zones — widen the scope explicitly if that is wanted

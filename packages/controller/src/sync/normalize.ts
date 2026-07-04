@@ -21,8 +21,8 @@ import { Value } from '@sinclair/typebox/value';
 import { MasterRulePayload, type TvhAutorecRule } from '@tvhc/shared';
 
 export interface NameMaps {
-  /** channel uuid -> channel name */
-  channelsByUuid: Map<string, string>;
+  /** channel uuid -> channel name + number (see channel-identity.ts) */
+  channelsByUuid: Map<string, { name: string; number: string | null }>;
   /** tag uuid -> tag name */
   tagsByUuid: Map<string, string>;
   /** dvr config uuid -> profile name */
@@ -60,7 +60,8 @@ export function normalizeRule(rule: TvhAutorecRule, maps: NameMaps): MasterRuleP
     title: rule.title ?? '',
     fulltext: rule.fulltext ?? false,
     mergetext: rule.mergetext ?? false,
-    channel: rule.channel ? (maps.channelsByUuid.get(rule.channel) ?? rule.channel) : '',
+    channel: rule.channel ? (maps.channelsByUuid.get(rule.channel)?.name ?? rule.channel) : '',
+    channel_number: rule.channel ? (maps.channelsByUuid.get(rule.channel)?.number ?? null) : null,
     tag: rule.tag ? (maps.tagsByUuid.get(rule.tag) ?? rule.tag) : '',
     btype: rule.btype ?? 0,
     content_type: rule.content_type ?? 0,
@@ -100,9 +101,17 @@ export function payloadHash(payload: MasterRulePayload): string {
 }
 
 export function normalizePayload(payload: MasterRulePayload): MasterRulePayload {
-  return {
+  const merged: MasterRulePayload = {
     ...(Value.Default(MasterRulePayload, {}) as MasterRulePayload),
     ...payload,
     weekdays: canonWeekdays(payload.weekdays),
   };
+  // channel identity travels as a (name, number) pair — canonicalize so an
+  // empty channel never carries a stray number: one hash per semantic payload.
+  // Also canonicalize legacy numeric values: dev-era rows stored
+  // channel_number as a JSON number before the type was corrected to string.
+  merged.channel_number = merged.channel
+    ? (merged.channel_number == null ? null : String(merged.channel_number))
+    : null;
+  return merged;
 }

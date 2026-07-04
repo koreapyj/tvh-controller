@@ -20,8 +20,12 @@ import { Type, type Static } from '@sinclair/typebox';
 
 /**
  * Canonical autorec rule owned by the controller. All instance-local uuid
- * references (channel, tag, dvr profile) are stored as NAMES so the same
- * payload can be pushed to any instance; tvheadend's setters accept names.
+ * references (tag, dvr profile) are stored as NAMES so the same payload can
+ * be pushed to any instance; tvheadend's setters accept names. Channel
+ * identity is the (name, number) pair (see channel-identity.ts): the sync
+ * engine resolves it to the instance-local channel uuid at push time.
+ * `channel_number: null` (legacy rules) targets the LOWEST-numbered channel
+ * with that name on each instance - never "any same-name channel".
  */
 export const MasterRulePayload = Type.Object({
   enabled: Type.Boolean({ default: true }),
@@ -31,6 +35,12 @@ export const MasterRulePayload = Type.Object({
   mergetext: Type.Boolean({ default: false }),
   /** channel NAME, '' = any channel */
   channel: Type.String({ default: '' }),
+  /**
+   * channel NUMBER paired with `channel`; null = lowest-numbered channel with
+   * that name. A string, exactly as tvheadend reports it (e.g. "9.1") -
+   * identity is exact string match, never float comparison.
+   */
+  channel_number: Type.Union([Type.String(), Type.Null()], { default: null }),
   /** channel tag NAME, '' = none */
   tag: Type.String({ default: '' }),
   btype: Type.Number({ default: 0 }),

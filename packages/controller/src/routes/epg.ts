@@ -18,6 +18,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import {
+  chanKey,
   compareRecordings,
   type ConflictWindow,
   type EpgChannel,
@@ -43,15 +44,6 @@ function parseChannelNo(s?: string | null): number | null {
   if (!s) return null;
   const n = Number.parseFloat(s.replace(/[^\d.]/g, ''));
   return Number.isFinite(n) ? n : null;
-}
-
-/**
- * Channel identity: name + number. Subchannels (e.g. 5.1/5.2/5.3 sharing one
- * name) differ only by number, and different channels can share a number
- * (e.g. 3.1 on two regional broadcasters) - so neither alone is unique.
- */
-function chanKey(name: string, number: string | null): string {
-  return `${name} ${number ?? ''}`;
 }
 
 /** prefer a reachable instance not already over-capacity during the broadcast */

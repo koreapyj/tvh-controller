@@ -27,12 +27,20 @@ export function tvhAutorecRule(overrides: Partial<TvhAutorecRule> = {}): TvhAuto
   };
 }
 
-/** the topology every test instance is seeded with: one channel/tag/dvr config */
+/**
+ * The topology every test instance is seeded with: two named channels plus a
+ * collision twin ('ch-kbs51') sharing KBS1's name at a different number — so
+ * pinned-number resolution/validation has something to disambiguate. 'ch-mx'
+ * exercises non-integer channel numbers (e.g. "9.1") and the
+ * `{"channel":..., "channel_number":"9.1"}` regression case.
+ */
 export function topologySnapshot(overrides: Partial<TopologySnapshot> = {}): TopologySnapshot {
   return {
     channels: [
-      { uuid: 'ch-kbs1', name: 'KBS1' },
-      { uuid: 'ch-mbc1', name: 'MBC1' },
+      { uuid: 'ch-kbs1', name: 'KBS1', number: '1' },
+      { uuid: 'ch-mbc1', name: 'MBC1', number: '2' },
+      { uuid: 'ch-kbs51', name: 'KBS1', number: '51' },
+      { uuid: 'ch-mx', name: 'TOKYO MX1', number: '9.1' },
     ],
     tags: [{ uuid: 'tag-1', name: 'Terrestrial' }],
     dvrConfigs: [{ uuid: 'cfg-1', name: 'default profile' }],
@@ -50,8 +58,10 @@ export function topologySnapshot(overrides: Partial<TopologySnapshot> = {}): Top
 export function nameMaps(): NameMaps {
   return {
     channelsByUuid: new Map([
-      ['ch-kbs1', 'KBS1'],
-      ['ch-mbc1', 'MBC1'],
+      ['ch-kbs1', { name: 'KBS1', number: '1' }],
+      ['ch-mbc1', { name: 'MBC1', number: '2' }],
+      ['ch-kbs51', { name: 'KBS1', number: '51' }],
+      ['ch-mx', { name: 'TOKYO MX1', number: '9.1' }],
     ]),
     tagsByUuid: new Map([['tag-1', 'Terrestrial']]),
     dvrConfigsByUuid: new Map([['cfg-1', 'default profile']]),

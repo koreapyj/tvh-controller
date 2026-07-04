@@ -112,7 +112,8 @@ export interface TvhChannel {
   uuid: string;
   enabled?: boolean;
   name: string;
-  number?: number;
+  /** channel number label as tvheadend reports it (e.g. "9.1") */
+  number?: string;
   tags?: string[];
   /** service uuids mapped to this channel */
   services?: string[];

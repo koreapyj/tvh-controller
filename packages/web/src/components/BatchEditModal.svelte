@@ -16,6 +16,9 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
+  import { chanKey, chanLabel } from '@tvhc/shared';
+  import { resolveChannelPick } from '../lib/channelPick.js';
+  import { channelOptions } from '../lib/stores.js';
   import type { FieldSpec } from './batchFields.js';
 
   // tvheadend-style batch edit: a checkbox per field — only ticked fields are
@@ -128,6 +131,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           return;
         }
         out[f.key] = n;
+      } else if (f.type === 'channel') {
+        const pick = resolveChannelPick(vals[f.key] ?? '', $channelOptions);
+        if (!pick) {
+          formError = 'channel not found — pick one from the list';
+          return;
+        }
+        out.channel = pick.name;
+        out.channel_number = pick.number;
       } else {
         out[f.key] = vals[f.key];
       }
@@ -205,6 +216,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               <option value="yes">yes</option>
               <option value="no">no</option>
             </select>
+          {:else if f.type === 'channel'}
+            <input
+              id="bf-{f.key}"
+              style="flex:1"
+              list="be-channel-options"
+              placeholder={mode === 'single' && differingKeys.includes(f.key)
+                ? '(multiple values)'
+                : (f.placeholder ?? '')}
+              disabled={mode === 'batch' && !apply[f.key]}
+              bind:value={vals[f.key]}
+            />
+            <datalist id="be-channel-options">
+              {#each $channelOptions as c (chanKey(c.name, c.number))}
+                <option value={chanLabel(c.name, c.number)}></option>
+              {/each}
+            </datalist>
           {:else}
             <input
               id="bf-{f.key}"

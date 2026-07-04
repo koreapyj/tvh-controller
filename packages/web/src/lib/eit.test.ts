@@ -20,8 +20,12 @@ import { describe, expect, it } from 'vitest';
 import type { ChannelOption, InstanceSummary } from '@tvhc/shared';
 import { commonEitOffset, conversionFor, offsetLabel, toEitTime } from './eit.js';
 
-function channel(name: string, eitOffsetMinutes: number | null): ChannelOption {
-  return { name, number: null, instances: [], eitOffsetMinutes };
+function channel(
+  name: string,
+  eitOffsetMinutes: number | null,
+  number: string | null = null,
+): ChannelOption {
+  return { name, number, instances: [], eitOffsetMinutes };
 }
 
 function instance(serverOffsetMinutes: number | null): InstanceSummary {
@@ -58,42 +62,135 @@ describe('commonEitOffset', () => {
 
 describe('conversionFor', () => {
   it('returns null when no instance has a known server offset', () => {
-    expect(conversionFor('a', [channel('a', 540)], [instance(null)])).toBeNull();
-    expect(conversionFor('a', [channel('a', 540)], [])).toBeNull();
+    expect(conversionFor('a', null, [channel('a', 540)], [instance(null)])).toBeNull();
+    expect(conversionFor('a', null, [channel('a', 540)], [])).toBeNull();
   });
 
   it('resolves per-channel eit offset and computes delta = eit - server', () => {
-    const result = conversionFor('a', [channel('a', 540), channel('b', 0)], [instance(0)]);
+    const result = conversionFor('a', null, [channel('a', 540), channel('b', 0)], [instance(0)]);
     expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
   });
 
   it('falls back to the common offset when the named channel is not found', () => {
     // 'missing' channel not in the list -> falls back to commonEitOffset([a, b])
-    const result = conversionFor('missing', [channel('a', 540), channel('b', 540)], [instance(0)]);
+    const result = conversionFor(
+      'missing',
+      null,
+      [channel('a', 540), channel('b', 540)],
+      [instance(0)],
+    );
     expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
   });
 
   it('falls back to the common offset when the named channel has an unknown (null) offset', () => {
-    const result = conversionFor('a', [channel('a', null), channel('b', 540)], [instance(0)]);
+    const result = conversionFor(
+      'a',
+      null,
+      [channel('a', null), channel('b', 540)],
+      [instance(0)],
+    );
     // commonEitOffset([a(null), b(540)]) -> 540 (the null is filtered out)
     expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
   });
 
   it('uses the common offset directly when no channel name is given', () => {
-    const result = conversionFor('', [channel('a', 540), channel('b', 540)], [instance(0)]);
+    const result = conversionFor('', null, [channel('a', 540), channel('b', 540)], [instance(0)]);
     expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
   });
 
   it('returns null when the eit offset cannot be resolved', () => {
-    expect(conversionFor('missing', [channel('a', 540), channel('b', 0)], [instance(0)])).toBeNull();
+    expect(
+      conversionFor('missing', null, [channel('a', 540), channel('b', 0)], [instance(0)]),
+    ).toBeNull();
   });
 
   it('returns null when server and eit zones match (no conversion needed)', () => {
-    expect(conversionFor('a', [channel('a', 540)], [instance(540)])).toBeNull();
+    expect(conversionFor('a', null, [channel('a', 540)], [instance(540)])).toBeNull();
+  });
+
+  it('same-name duplicates -> uses the lowest-numbered channel offset', () => {
+    const result = conversionFor(
+      'a',
+      null,
+      [channel('a', 540, '1'), channel('a', 540, '2')],
+      [instance(0)],
+    );
+    expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
+  });
+
+  it('same-name duplicates, higher one unknown -> lowest still wins', () => {
+    const result = conversionFor(
+      'a',
+      null,
+      [channel('a', 540, '1'), channel('a', null, '2')],
+      [instance(0)],
+    );
+    expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
+  });
+
+  it('same-name duplicates disagree -> the lowest-numbered channel wins (the unpinned push target)', () => {
+    const result = conversionFor(
+      'a',
+      null,
+      [channel('a', 540, '1'), channel('a', 0, '2')],
+      [instance(0)],
+    );
+    expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
+  });
+
+  it('same-name duplicates, listed out of order -> still picks the lowest number, not the first entry', () => {
+    const result = conversionFor(
+      'a',
+      null,
+      [channel('a', 0, '51'), channel('a', 540, '1')],
+      [instance(0)],
+    );
+    expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
+  });
+
+  it('lowest-numbered channel offset unknown -> falls back to the global common offset', () => {
+    const result = conversionFor(
+      'a',
+      null,
+      [channel('a', null, '1'), channel('a', 0, '2'), channel('b', 540)],
+      [instance(0)],
+    );
+    // lowest (#1) is unknown; global set {0, 540} is mixed -> no conversion
+    expect(result).toBeNull();
+  });
+
+  it('same-name duplicates all unknown, but the global common offset resolves', () => {
+    const result = conversionFor(
+      'a',
+      null,
+      [channel('a', null, '1'), channel('a', null, '2'), channel('b', 540)],
+      [instance(0)],
+    );
+    expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
+  });
+
+  it('pinned number resolves exactly that channel, even when a same-name sibling differs', () => {
+    const result = conversionFor(
+      'a',
+      '51',
+      [channel('a', 0, '1'), channel('a', 540, '51')],
+      [instance(0)],
+    );
+    expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
+  });
+
+  it('pinned (name, number) pair not found -> falls back to the common offset', () => {
+    const result = conversionFor(
+      'a',
+      '99',
+      [channel('a', 540, '1'), channel('b', 540)],
+      [instance(0)],
+    );
+    expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 540, deltaMinutes: 540 });
   });
 
   it('uses the first instance with a known offset, ignoring unknown ones', () => {
-    const result = conversionFor('a', [channel('a', 60)], [instance(null), instance(0)]);
+    const result = conversionFor('a', null, [channel('a', 60)], [instance(null), instance(0)]);
     expect(result).toEqual({ serverOffsetMinutes: 0, eitOffsetMinutes: 60, deltaMinutes: 60 });
   });
 });
