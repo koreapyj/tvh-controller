@@ -12,7 +12,7 @@ import type { InstancePoller } from '../src/tvh/poller.js';
 import { SyncEngine } from '../src/sync/engine.js';
 import { InstanceCache } from '../src/state/instanceCache.js';
 import { EventBus } from '../src/state/events.js';
-import { normalizeRule, payloadHash } from '../src/sync/normalize.js';
+import { normalizePayload, normalizeRule, payloadHash } from '../src/sync/normalize.js';
 import { createTestDb } from './support/testDb.js';
 import { fakePoller, fakeTvhClient, type FakePoller, type FakeTvhClient } from './support/fakePoller.js';
 import {
@@ -1008,6 +1008,275 @@ describe('batchEdit: non-integer string channel_number (regression)', () => {
     const reloaded = await engine.getRule(rule.id);
     expect(reloaded!.payload.channel).toBe('TOKYO MX1');
     expect(reloaded!.payload.channel_number).toBe('9.1'); // only TOKYO MX1 channel on the topology fixture
+
+    await destroy();
+  });
+});
+
+// ---------- 18. integrityCheck: "Any" time-window sentinel + unverifiable instances ----------
+
+describe('integrityCheck: tvheadend "Any" start/start_window sentinel', () => {
+  it('a rule pushed with no time restriction and read back as "Any" is not a content-mismatch (and not drift)', async () => {
+    const { destroy, engine, clients, pollers } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'AnyWindow',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'AnyWindow', start: '', start_window: '' }),
+    });
+    await engine.pushRule(rule.id);
+
+    // tvheadend reports an unrestricted time window as the literal "Any"
+    const client = clients.get('tyo1')!;
+    client.rules[0]!.start = 'Any';
+    client.rules[0]!.start_window = 'Any';
+    await pollers.get('tyo1')!.pollAutorecs();
+
+    const drift = await engine.computeDrift();
+    expect(drift).toHaveLength(0);
+
+    const issues = await engine.integrityCheck();
+    expect(issues.filter((i) => i.kind === 'content-mismatch')).toHaveLength(0);
+
+    await destroy();
+  });
+
+  it('a genuinely different start time still reports a content-mismatch', async () => {
+    const { destroy, engine, clients } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'RealWindowDiff',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'RealWindowDiff', start: '', start_window: '' }),
+    });
+    await engine.pushRule(rule.id);
+
+    const client = clients.get('tyo1')!;
+    client.rules[0]!.start = '09:30';
+
+    const issues = await engine.integrityCheck();
+    const mismatch = issues.find((i) => i.kind === 'content-mismatch' && i.masterRuleId === rule.id);
+    expect(mismatch).toBeTruthy();
+    expect(mismatch!.diffs?.map((d) => d.field)).toEqual(['start']);
+
+    await destroy();
+  });
+
+  it('a master payload carrying the legacy "Any" spelling hashes and compares as unrestricted', async () => {
+    expect(payloadHash(normalizePayload(masterRulePayload({ start: 'Any', start_window: 'Any' })))).toBe(
+      payloadHash(normalizePayload(masterRulePayload({ start: '', start_window: '' }))),
+    );
+  });
+});
+
+describe('computeDrift: stale pushed_hash baseline', () => {
+  it('a hash-only mismatch with zero field diffs against the master is not drift', async () => {
+    const { db, destroy, engine } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'StaleBaseline',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'StaleBaseline' }),
+    });
+    await engine.pushRule(rule.id);
+
+    // simulate a baseline stored under older normalization rules: the hash no
+    // longer matches, but the instance rule is field-identical to the master
+    await db
+      .updateTable('rule_bindings')
+      .set({ pushed_hash: 'hash-from-an-older-normalization' })
+      .where('master_rule_id', '=', rule.id)
+      .execute();
+
+    const items = await engine.computeDrift();
+    expect(items).toHaveLength(0);
+
+    // and the rule still reads as in-sync, not pending
+    const [status] = await engine.rulesWithStatus();
+    expect(status!.perInstance['tyo1']!.state).toBe('in-sync');
+
+    await destroy();
+  });
+});
+
+describe('integrityCheck: unverifiable instance', () => {
+  it('an instance whose topology cannot be loaded is reported, not silently skipped', async () => {
+    const { destroy, engine, cache } = await setup(['tyo1']);
+    // fake pollTopology is a no-op, so a cleared snapshot stays unavailable
+    cache.get('tyo1').topology = null;
+
+    const issues = await engine.integrityCheck();
+    const skipped = issues.find((i) => i.kind === 'missing-on-instance' && i.instanceId === 'tyo1');
+    expect(skipped).toBeTruthy();
+    expect(skipped!.detail).toMatch(/topology unavailable/);
+
+    await destroy();
+  });
+});
+
+// ---------- 19. batchEdit: per-instance scope delta ----------
+
+describe('batchEdit: instance scope delta', () => {
+  it('checking an instance grows a list scope without touching tvheadend; the new instance reads unpushed', async () => {
+    const { destroy, engine, clients } = await setup(['tyo1', 'osk1']);
+    const rule = await engine.createRule({
+      name: 'GrowScope',
+      instances: ['tyo1'],
+      payload: masterRulePayload({ name: 'GrowScope' }),
+    });
+
+    const results = await engine.batchEdit([rule.id], {}, { osk1: true });
+    expect(results).toEqual([{ id: rule.id, ok: true }]);
+
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.instances).toEqual(['tyo1', 'osk1']);
+    // growing the scope is master-only — no tvh call until push
+    const oskClient = clients.get('osk1')!;
+    expect(oskClient.autorecCreate).not.toHaveBeenCalled();
+    expect(oskClient.idnodeSave).not.toHaveBeenCalled();
+    const [status] = await engine.rulesWithStatus();
+    expect(status!.perInstance['osk1']!.state).toBe('unpushed');
+
+    await destroy();
+  });
+
+  it('unchecking an instance deletes the bound rule there and drops the binding', async () => {
+    const { db, destroy, engine, clients } = await setup(['tyo1', 'osk1']);
+    const rule = await engine.createRule({
+      name: 'ShrinkScope',
+      instances: ['tyo1', 'osk1'],
+      payload: masterRulePayload({ name: 'ShrinkScope' }),
+    });
+    await engine.pushRule(rule.id);
+    const oskClient = clients.get('osk1')!;
+    const oskUuid = oskClient.rules[0]!.uuid;
+
+    const results = await engine.batchEdit([rule.id], {}, { osk1: false });
+    expect(results).toEqual([{ id: rule.id, ok: true }]);
+
+    expect(oskClient.idnodeDelete).toHaveBeenCalledWith(oskUuid);
+    expect(oskClient.rules).toHaveLength(0);
+    expect(await getBinding(db, rule.id, 'osk1')).toBeFalsy();
+    expect(await getBinding(db, rule.id, 'tyo1')).toBeTruthy();
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.instances).toEqual(['tyo1']);
+
+    await destroy();
+  });
+
+  it("a check-only delta keeps an 'all' scope as 'all' (never needlessly materialized)", async () => {
+    const { destroy, engine } = await setup(['tyo1', 'osk1']);
+    const rule = await engine.createRule({
+      name: 'AllStaysAll',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'AllStaysAll' }),
+    });
+
+    const results = await engine.batchEdit([rule.id], {}, { osk1: true });
+    expect(results).toEqual([{ id: rule.id, ok: true }]);
+
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.instances).toBe('all');
+
+    await destroy();
+  });
+
+  it("unchecking one instance materializes an 'all' scope into the remaining instances", async () => {
+    const { destroy, engine } = await setup(['tyo1', 'osk1']);
+    const rule = await engine.createRule({
+      name: 'AllMinusOne',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'AllMinusOne' }),
+    });
+
+    const results = await engine.batchEdit([rule.id], {}, { osk1: false });
+    expect(results).toEqual([{ id: rule.id, ok: true }]);
+
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.instances).toEqual(['tyo1']);
+
+    await destroy();
+  });
+
+  it('removing the last instance fails per-rule and leaves the rule unchanged', async () => {
+    const { destroy, engine } = await setup(['tyo1', 'osk1']);
+    const rule = await engine.createRule({
+      name: 'LastOne',
+      instances: ['tyo1'],
+      payload: masterRulePayload({ name: 'LastOne' }),
+    });
+
+    const results = await engine.batchEdit([rule.id], {}, { tyo1: false });
+    expect(results).toHaveLength(1);
+    expect(results[0]!.ok).toBe(false);
+    expect(results[0]!.error).toMatch(/cannot remove the last instance — delete the rule instead/);
+
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.instances).toEqual(['tyo1']);
+
+    await destroy();
+  });
+
+  it('a linked clone keeps its overlay when the scope changes with an empty patch', async () => {
+    const { destroy, engine } = await setup(['tyo1', 'osk1']);
+    const parent = await engine.createRule({
+      name: 'ScopeParent',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'ScopeParent', title: 'Parent Title' }),
+    });
+    const clone = await engine.createClone(parent.id, true, 'ScopeClone');
+    await engine.updateRule(clone.id, {
+      name: 'ScopeClone',
+      instances: 'all',
+      parentId: parent.id,
+      overlay: { title: 'Override Title' },
+    });
+
+    const results = await engine.batchEdit([clone.id], {}, { osk1: false });
+    expect(results).toEqual([{ id: clone.id, ok: true }]);
+
+    const updated = await engine.getRule(clone.id);
+    expect(updated!.instances).toEqual(['tyo1']);
+    expect(updated!.overlay).toEqual({ title: 'Override Title' });
+    expect(updated!.payload).toEqual({}); // still a placeholder, never resolved
+    expect(updated!.parentId).toBe(parent.id);
+
+    await destroy();
+  });
+
+  it('an unknown instance id in the delta is rejected upfront with a 400', async () => {
+    const { destroy, engine } = await setup(['tyo1', 'osk1']);
+    const rule = await engine.createRule({
+      name: 'UnknownInst',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'UnknownInst' }),
+    });
+
+    // rejected upfront (httpError 400), before anything enters the op chain
+    expect(() => engine.batchEdit([rule.id], {}, { nrt9: true })).toThrow(
+      /unknown instance "nrt9"/,
+    );
+
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.instances).toBe('all');
+
+    await destroy();
+  });
+
+  it('an untouched delta with an empty patch is a no-op that still reports ok', async () => {
+    const { destroy, engine, clients } = await setup(['tyo1', 'osk1']);
+    const rule = await engine.createRule({
+      name: 'NoopDelta',
+      instances: ['tyo1'],
+      payload: masterRulePayload({ name: 'NoopDelta' }),
+    });
+    const before = (await engine.getRule(rule.id))!.updatedAt;
+
+    // tyo1 is already in scope: checking it again changes nothing
+    const results = await engine.batchEdit([rule.id], {}, { tyo1: true });
+    expect(results).toEqual([{ id: rule.id, ok: true }]);
+
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.instances).toEqual(['tyo1']);
+    expect(updated!.updatedAt).toBe(before); // update skipped entirely
+    expect(clients.get('tyo1')!.idnodeDelete).not.toHaveBeenCalled();
 
     await destroy();
   });

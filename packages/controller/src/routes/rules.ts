@@ -124,9 +124,10 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
       action?: 'edit' | 'delete' | 'push';
       ids?: string[];
       patch?: unknown;
+      instances?: unknown;
     };
   }>('/api/rules/batch', async (req) => {
-    const { action, ids, patch } = req.body ?? {};
+    const { action, ids, patch, instances } = req.body ?? {};
     if (!Array.isArray(ids) || ids.length === 0) throw httpError(400, 'ids[] is required');
     switch (action) {
       case 'delete':
@@ -139,10 +140,26 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
           const first = [...Value.Errors(PartialPayload, p)][0];
           throw httpError(400, `invalid patch: ${first?.path ?? ''} ${first?.message ?? ''}`);
         }
-        if (Object.keys(p as Record<string, unknown>).length === 0) {
-          throw httpError(400, 'patch must contain at least one field');
+        // per-instance scope delta: check = add, uncheck = remove
+        const inst = instances ?? {};
+        if (typeof inst !== 'object' || inst === null || Array.isArray(inst)) {
+          throw httpError(400, 'instances must be an object of booleans');
         }
-        return sync().batchEdit(ids, p as Partial<MasterRulePayload>);
+        for (const [k, v] of Object.entries(inst)) {
+          if (typeof v !== 'boolean') throw httpError(400, `instances["${k}"] must be a boolean`);
+          if (!ctx.cache.has(k)) throw httpError(400, `unknown instance "${k}"`);
+        }
+        if (
+          Object.keys(p as Record<string, unknown>).length === 0 &&
+          Object.keys(inst).length === 0
+        ) {
+          throw httpError(400, 'patch or instances must contain at least one change');
+        }
+        return sync().batchEdit(
+          ids,
+          p as Partial<MasterRulePayload>,
+          inst as Record<string, boolean>,
+        );
       }
       default:
         throw httpError(400, `unknown action "${String(action)}"`);

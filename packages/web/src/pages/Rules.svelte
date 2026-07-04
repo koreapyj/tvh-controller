@@ -424,11 +424,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     action: 'edit' | 'delete' | 'push',
     ids: string[],
     patch?: Partial<MasterRulePayload>,
+    instances?: Record<string, boolean>,
   ): Promise<void> {
     if (!ids.length) return;
     busy = true;
     try {
-      const res = await api.batchRules(action, ids, patch);
+      const res = await api.batchRules(action, ids, patch, instances);
       const fails = res.filter((r) => !r.ok);
       if (fails.length) {
         notify.error(
@@ -444,10 +445,45 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     }
   }
 
-  function batchEditSave(out: { fields: Record<string, unknown> }): void {
+  /** instance checkboxes for the batch modal: checked when every selected rule
+   *  already targets the instance ('all' counts), mixed when only some do — the
+   *  modal returns only the boxes the user touched (delta semantics) */
+  const batchInstanceSelector = $derived.by(() => {
+    const sel = ordered.filter((r) => selected[r.id]);
+    return {
+      instances: $instances.map((inst) => {
+        const n = sel.filter((r) => r.instances === 'all' || r.instances.includes(inst.id)).length;
+        return {
+          id: inst.id,
+          name: inst.name,
+          initial: n === sel.length && sel.length > 0 ? true : n === 0 ? false : ('mixed' as const),
+        };
+      }),
+      hint: '(check = add to instance, uncheck = remove — cancels its scheduled recordings there; untouched = unchanged)',
+    };
+  });
+
+  function batchEditSave(out: {
+    fields: Record<string, unknown>;
+    instanceEnabled: Record<string, boolean>;
+  }): void {
     const ids = selectedIds;
+    const removing = Object.keys(out.instanceEnabled).filter((i) => !out.instanceEnabled[i]);
+    if (
+      removing.length &&
+      !confirm(
+        `Unchecking ${removing.join(', ')} REMOVES the selected rules from those instance(s).\n\n` +
+          'Tvheadend will CANCEL the scheduled recordings each rule created there. Continue?',
+      )
+    )
+      return;
     batchEditing = false;
-    void runRuleBatch('edit', ids, out.fields as Partial<MasterRulePayload>);
+    void runRuleBatch(
+      'edit',
+      ids,
+      out.fields as Partial<MasterRulePayload>,
+      Object.keys(out.instanceEnabled).length ? out.instanceEnabled : undefined,
+    );
   }
 
   async function batchDelete(): Promise<void> {
@@ -844,6 +880,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     title={`Edit ${selectedIds.length} rule${selectedIds.length === 1 ? '' : 's'}`}
     subtitle="Ticked fields are applied to every selected rule; rules stay pending until you push."
     fields={RULE_FIELDS}
+    instanceSelector={batchInstanceSelector}
     onsave={batchEditSave}
     oncancel={() => (batchEditing = false)}
   />

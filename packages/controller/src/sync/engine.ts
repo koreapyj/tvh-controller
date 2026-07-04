@@ -419,14 +419,50 @@ export class SyncEngine {
   // ---------- batch operations ----------
 
   /**
+   * Apply a per-instance check/uncheck delta to a rule scope. 'all' stays 'all'
+   * when only additions were ticked (they are already included); an uncheck
+   * materializes it into an explicit list first. List scopes keep their order,
+   * with additions appended.
+   */
+  private applyScopeDelta(current: RuleInstances, delta: Record<string, boolean>): RuleInstances {
+    const removed = Object.keys(delta).filter((i) => delta[i] === false);
+    if (current === 'all') {
+      if (!removed.length) return 'all';
+      return materializeScope('all', this.cache.ids()).filter((i) => !removed.includes(i));
+    }
+    const added = Object.keys(delta).filter((i) => delta[i] && !current.includes(i));
+    return [...current.filter((i) => !removed.includes(i)), ...added];
+  }
+
+  private scopeChanged(before: RuleInstances, after: RuleInstances): boolean {
+    if (before === 'all' || after === 'all') return before !== after;
+    return before.length !== after.length || before.some((i) => !after.includes(i));
+  }
+
+  /**
    * Apply a field change to one rule, writing to the payload (plain rule) or the
    * overlay (linked clone) so plain/clone semantics match a single edit exactly.
    * Master only — like single edit, the change is left pending until pushed.
+   * `instanceEnabled` is a scope DELTA: true adds the instance to the rule's
+   * scope, false removes it (updateRuleInner deletes the bound rule there),
+   * untouched instances are left as they are.
    */
-  private async applyRuleChangeInner(id: string, change: Partial<MasterRulePayload>): Promise<void> {
+  private async applyRuleChangeInner(
+    id: string,
+    change: Partial<MasterRulePayload>,
+    instanceEnabled: Record<string, boolean> = {},
+  ): Promise<void> {
     const existing = await this.getRule(id);
     if (!existing) throw new Error(`rule ${id} not found`);
     if (existing.deletedAt) throw new Error(`rule "${existing.name}" is deleted — restore it first`);
+    const instances = this.applyScopeDelta(existing.instances, instanceEnabled);
+    if (instances !== 'all' && instances.length === 0) {
+      throw new Error(
+        `"${existing.name}" cannot remove the last instance — delete the rule instead`,
+      );
+    }
+    // nothing to write — skip the no-op update (counts as ok in a batch)
+    if (!Object.keys(change).length && !this.scopeChanged(existing.instances, instances)) return;
     // channel identity is a (name, number) pair: a change that sets the name
     // without an explicit number must not inherit the previous pin
     if ('channel' in change && !('channel_number' in change)) {
@@ -436,18 +472,18 @@ export class SyncEngine {
     // same-name channel across the rule's own instance scope (write-time
     // normalization mirrors channelSetterValue's push-time fallback)
     if ('channel' in change) {
-      change = this.pinLowestChannelNumber(change, existing.instances);
+      change = this.pinLowestChannelNumber(change, instances);
     }
     const input: RuleInput = existing.parentId
       ? {
           name: existing.name,
-          instances: existing.instances,
+          instances,
           parentId: existing.parentId,
           overlay: { ...(existing.overlay ?? {}), ...change },
         }
       : {
           name: existing.name,
-          instances: existing.instances,
+          instances,
           payload: { ...existing.payload, ...change } as MasterRulePayload,
         };
     await this.updateRuleInner(id, input);
@@ -488,11 +524,25 @@ export class SyncEngine {
     });
   }
 
-  /** merge a field patch into many rules (master only — left pending until pushed) */
-  batchEdit(ids: string[], patch: Partial<MasterRulePayload>): Promise<RuleBatchResult[]> {
+  /**
+   * Merge a field patch into many rules (master only — left pending until
+   * pushed). `instanceEnabled` is an optional per-instance scope delta applied
+   * to every rule: check = add the instance, uncheck = remove it (deletes the
+   * bound rule there, cancelling its scheduled entries), untouched = unchanged.
+   */
+  batchEdit(
+    ids: string[],
+    patch: Partial<MasterRulePayload>,
+    instanceEnabled: Record<string, boolean> = {},
+  ): Promise<RuleBatchResult[]> {
     const clean = { ...patch };
     delete (clean as Record<string, unknown>).name; // names stay per-rule unique
-    return this.serialize(() => this.runBatch(ids, (id) => this.applyRuleChangeInner(id, clean)));
+    for (const inst of Object.keys(instanceEnabled)) {
+      if (!this.cache.has(inst)) throw httpError(400, `unknown instance "${inst}"`);
+    }
+    return this.serialize(() =>
+      this.runBatch(ids, (id) => this.applyRuleChangeInner(id, clean, instanceEnabled)),
+    );
   }
 
   /** push many rules to their targeted instances */
@@ -778,6 +828,11 @@ export class SyncEngine {
           ? { ...normalized, channel_number: master.effective.channel_number }
           : normalized;
         if (payloadHash(canonical) !== b.pushed_hash) {
+          const diffs = diffPayloads(master.effective, normalized);
+          // a stale baseline alone is not drift: when the instance matches the
+          // master field-for-field there is nothing to reconcile (happens when
+          // normalization rules change after pushed_hash was stored)
+          if (diffs.length === 0) continue;
           items.push({
             id: `modified-on-instance:${instanceId}:${b.tvh_uuid}`,
             kind: 'modified-on-instance',
@@ -786,7 +841,7 @@ export class SyncEngine {
             masterRuleName: master.name,
             tvhUuid: b.tvh_uuid,
             instanceRuleName: instanceRule.name,
-            diffs: diffPayloads(master.effective, normalized),
+            diffs,
             instancePayload: normalized,
             masterPayload: master.effective,
           });
@@ -865,7 +920,13 @@ export class SyncEngine {
       let maps: NameMaps;
       try {
         maps = await this.ensureTopology(instanceId);
-      } catch {
+      } catch (err) {
+        // never skip an instance silently — an absent section reads as "clean"
+        issues.push({
+          kind: 'missing-on-instance',
+          instanceId,
+          detail: `topology unavailable — could not verify: ${err instanceof Error ? err.message : String(err)}`,
+        });
         continue;
       }
       const snap = this.cache.get(instanceId);

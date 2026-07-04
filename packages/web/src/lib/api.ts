@@ -125,11 +125,13 @@ export const api = {
     action: 'edit' | 'delete' | 'push',
     ids: string[],
     patch?: Partial<MasterRulePayload>,
+    instances?: Record<string, boolean>,
   ) =>
     http<Array<{ id: string; ok: boolean; error?: string }>>('POST', '/api/rules/batch', {
       action,
       ids,
       ...(patch ? { patch } : {}),
+      ...(instances ? { instances } : {}),
     }),
   pushAll: () => http<unknown[]>('POST', '/api/sync/push'),
   drift: () => http<DriftItem[]>('GET', '/api/sync/drift'),

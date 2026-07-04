@@ -22,8 +22,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import type { FieldSpec } from './batchFields.js';
 
   // tvheadend-style batch edit: a checkbox per field — only ticked fields are
-  // written. An optional instance selector (recordings only) doubles as the
-  // per-instance enable/disable control.
+  // written. An optional instance selector doubles as the per-instance control
+  // (enable/disable for recordings, scope add/remove for rules) — only touched
+  // checkboxes are reported back.
 
   interface InstanceOption {
     id: string;

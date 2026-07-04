@@ -44,6 +44,16 @@ function canonWeekdays(days: number[] | undefined): number[] {
 }
 
 /**
+ * Canonical "no time restriction". Tvheadend's grid reports an unrestricted
+ * start/start_window as the literal string "Any" (push sends '', tvheadend
+ * accepts it and reads it back as "Any") — fold the sentinel so both
+ * spellings diff and hash identically.
+ */
+function canonTimeWindow(v: string | undefined): string {
+  return !v || v === 'Any' ? '' : v;
+}
+
+/**
  * Instance autorec rule -> canonical MasterRulePayload.
  * - drops uuid / serieslink / owner / creator (instance-local or read-only)
  * - resolves channel/tag/config uuids to NAMES (push uses names; tvheadend
@@ -66,8 +76,8 @@ export function normalizeRule(rule: TvhAutorecRule, maps: NameMaps): MasterRuleP
     btype: rule.btype ?? 0,
     content_type: rule.content_type ?? 0,
     star_rating: rule.star_rating ?? 0,
-    start: rule.start ?? '',
-    start_window: rule.start_window ?? '',
+    start: canonTimeWindow(rule.start),
+    start_window: canonTimeWindow(rule.start_window),
     start_extra: rule.start_extra ?? 0,
     stop_extra: rule.stop_extra ?? 0,
     weekdays: canonWeekdays(rule.weekdays),
@@ -113,5 +123,9 @@ export function normalizePayload(payload: MasterRulePayload): MasterRulePayload 
   merged.channel_number = merged.channel
     ? (merged.channel_number == null ? null : String(merged.channel_number))
     : null;
+  // masters that imported/adopted a rule before the "Any" fold existed may
+  // carry the sentinel — canonicalize here too so they hash like ''
+  merged.start = canonTimeWindow(merged.start);
+  merged.start_window = canonTimeWindow(merged.start_window);
   return merged;
 }
