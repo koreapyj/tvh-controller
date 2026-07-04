@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
   import { untrack } from 'svelte';
-  import type { UploadJob } from '@tvhc/shared';
+  import { chanLabel, type UploadJob } from '@tvhc/shared';
   import { api } from '../lib/api.js';
   import { bytes, pct, ts } from '../lib/format.js';
   import { notify } from '../lib/notifications.js';
@@ -111,7 +111,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {/if}
           <div class="muted small">{ts(j.start)}</div>
         </td>
-        <td class="small m-inline">{j.channelname}</td>
+        <td class="small m-inline">{chanLabel(j.channelname, j.channelnumber ?? null)}</td>
         <td class="small m-inline"><span class="m-only">from</span>{$instName(j.instanceId)}</td>
         <td class="m-inline">
           <span class="badge {statusBadge(j.status)}">{j.status}</span>

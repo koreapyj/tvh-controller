@@ -55,6 +55,7 @@ export interface UploadsTable {
   dvr_uuid: string;
   title: string | null;
   channelname: string;
+  channelnumber: string | null;
   start: number;
   stop: number;
   filesize: number | null;

@@ -37,6 +37,12 @@ export interface ClaimResult {
 export interface ClaimOptions {
   origin?: UploadOrigin;
   incompletePick?: boolean;
+  /**
+   * channel number at claim time (e.g. "9.1"), resolved by the caller from
+   * the instance's channel list via entry.channel (uuid) — never from the
+   * channel name
+   */
+  channelNumber?: string | null;
   /** remote object replaced by this upload; deleted after this one verifies */
   supersedesPath?: string | null;
   /**
@@ -56,6 +62,7 @@ function rowToJob(r: {
   dvr_uuid: string;
   title: string | null;
   channelname: string;
+  channelnumber: string | null;
   start: number | string;
   stop: number | string;
   filesize: number | string | null;
@@ -82,6 +89,7 @@ function rowToJob(r: {
     dvrUuid: r.dvr_uuid,
     title: r.title,
     channelname: r.channelname,
+    channelnumber: r.channelnumber,
     start: Number(r.start),
     stop: Number(r.stop),
     filesize: r.filesize === null ? null : Number(r.filesize),
@@ -195,6 +203,7 @@ export class UploadLedger {
           dvr_uuid: entry.uuid,
           title: entry.disp_title ?? null,
           channelname,
+          channelnumber: opts.channelNumber ?? null,
           start,
           stop,
           filesize: entry.filesize ?? null,

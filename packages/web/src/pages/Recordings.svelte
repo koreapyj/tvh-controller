@@ -16,7 +16,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
-  import type { UnifiedCopy, UnifiedGroup, UnifiedItem } from '@tvhc/shared';
+  import { chanLabel, chanNumberOrder, type UnifiedCopy, type UnifiedGroup, type UnifiedItem } from '@tvhc/shared';
   import { api } from '../lib/api.js';
   import { latestWins } from '../lib/fetchGuard.js';
   import { bytes, duration, ts } from '../lib/format.js';
@@ -127,10 +127,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   const commentFilterOptions = $derived(
     [...new Set(allRows.map((r) => r.ruleComment).filter(Boolean))].sort(),
   );
+  // options are keyed by the full name+number label (channel identity) — two
+  // same-name channels with different numbers become separate options
   const channelOptions = $derived(
-    [...new Set(allRows.map((r) => r.item.channelname).filter(Boolean))]
-      .sort()
-      .map((c) => ({ value: c, label: c })),
+    [
+      ...new Map(
+        allRows
+          .filter((r) => r.item.channelname)
+          .map((r) => [chanLabel(r.item.channelname, r.item.channelNumber ?? null), r.item] as const),
+      ),
+    ]
+      .sort(
+        ([, a], [, b]) =>
+          chanNumberOrder(a.channelNumber ?? null) - chanNumberOrder(b.channelNumber ?? null) ||
+          a.channelname.localeCompare(b.channelname),
+      )
+      .map(([label]) => ({ value: label, label })),
   );
 
   const hasFilters = $derived(
@@ -154,7 +166,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       (r) =>
         (filterRule === null || r.rule === filterRule) &&
         (filterComment === null || r.ruleComment === filterComment) &&
-        (filterChannels.length === 0 || filterChannels.includes(r.item.channelname)) &&
+        (filterChannels.length === 0 ||
+          filterChannels.includes(chanLabel(r.item.channelname, r.item.channelNumber ?? null))) &&
         (!filterDateFrom || dateOf(r.item.start) >= filterDateFrom) &&
         (!filterDateTo || dateOf(r.item.start) <= filterDateTo),
     );
@@ -200,6 +213,23 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   function copyFor(item: { copies: UnifiedCopy[] }, instanceId: string): UnifiedCopy | null {
     return item.copies.find((c) => c.instanceId === instanceId) ?? null;
+  }
+
+  /**
+   * one traffic-light dot per instance: red = conflict, yellow = low margin,
+   * gray = disabled, green = scheduled; the detail lives in the hover title
+   */
+  function dotFor(c: UnifiedCopy, instName: string): { cls: string; title: string } {
+    const notes: string[] = [];
+    if (c.conflictLevel === 'conflict') notes.push('conflict');
+    else if (c.conflictLevel === 'low-margin') notes.push('low margin');
+    if (!c.enabled) notes.push('recording disabled');
+    const cls =
+      c.conflictLevel === 'conflict' ? 'bad'
+      : c.conflictLevel === 'low-margin' ? 'warn'
+      : !c.enabled ? 'off'
+      : 'ok';
+    return { cls, title: `${notes.length ? notes.join(' · ') : 'scheduled'} on ${instName}` };
   }
 
   /**
@@ -730,23 +760,23 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {#if item.copies.some((c) => !c.enabled)}<span class="badge neutral" title="recording disabled on one or more instances">disabled</span>{/if}
           {#if diffs.length}<span class="badge warn" title="copies differ on: {diffs.join(', ')}">differs</span>{/if}
         </td>
-        <td class="small">
-          <a class="linklike muted" title="filter by this rule" href={recordingsUrl({ rule })}>{rule}</a>
+        <td class="small cell-clip" title={rule + (ruleComment ? ` (${ruleComment})` : '')}>
+          <a class="linklike muted" href={recordingsUrl({ rule })}>{rule}</a>
           {#if ruleComment}<span class="muted small"> ({ruleComment})</span>{/if}
         </td>
-        <td class="small m-inline">
+        <td class="small m-inline cell-clip" title={item.channelname ? chanLabel(item.channelname, item.channelNumber ?? null) : ''}>
           {#if item.channelname}
-            <a class="linklike" title="filter by this channel" href={recordingsUrl({ channels: [item.channelname] })}>
-              {item.channelname}
+            <a class="linklike" href={recordingsUrl({ channels: [chanLabel(item.channelname, item.channelNumber ?? null)] })}>
+              {chanLabel(item.channelname, item.channelNumber ?? null)}
             </a>
           {/if}
         </td>
-        <td class="small m-inline">
+        <td class="small m-inline" style="white-space:nowrap">
           <a class="linklike muted" title="filter to this date" href={recordingsUrl({ from: dateOf(item.start), to: dateOf(item.start) })}>
             {ts(item.start)}
           </a>
         </td>
-        <td class="small muted m-inline">{duration(item.start, item.stop)}</td>
+        <td class="small muted m-inline" style="white-space:nowrap">{duration(item.start, item.stop)}</td>
         {#if tab === 'failed'}
           {@const c = item.copies[0]}
           <td class="small m-inline"><span class="m-only">on</span>{c?.instanceId ?? '—'}</td>
@@ -773,20 +803,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <td style="white-space:nowrap" class="m-inline">
               <span class="m-only">{inst.name}</span>
               {#if !c}
-                <span class="badge bad" title="this broadcast is not {tab} on {inst.name}">missing</span>
+                <span class="rec-dot bad" title="this broadcast is not {tab} on {inst.name}"></span>
               {:else if tab === 'upcoming'}
                 {#if c.schedStatus === 'recording'}
-                  <span class="rec-dot rec-blink" title="recording"></span>
+                  <span
+                    class="rec-dot rec-blink"
+                    title={`recording on ${inst.name}${c.conflictLevel ? ` · ${c.conflictLevel === 'conflict' ? 'conflict' : 'low margin'}` : ''}`}
+                  ></span>
                   <span class="muted small">{bytes(c.filesize)}</span>
                 {:else}
-                  <span class="badge neutral">scheduled</span>
+                  {@const d = dotFor(c, inst.name)}
+                  <span class="rec-dot {d.cls}" title={d.title}></span>
                 {/if}
-                {#if c.conflictLevel === 'conflict'}<span class="badge bad">conflict</span>
-                {:else if c.conflictLevel === 'low-margin'}<span class="badge warn">low margin</span>{/if}
               {:else}
                 <span class="muted small">{bytes(c.filesize)}</span>
+                {#if !c.enabled}<span class="rec-dot off" title="recording disabled on {inst.name}"></span>{/if}
               {/if}
-              {#if c && !c.enabled}<span class="badge neutral" title="recording disabled on {inst.name}">disabled</span>{/if}
             </td>
             <td style="white-space:nowrap" class="m-inline">
               {#if c && hasErrorInfo(c)}

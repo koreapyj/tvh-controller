@@ -75,6 +75,8 @@ export interface UploadJob {
   dvrUuid: string;
   title: string | null;
   channelname: string;
+  /** channel number label like "9.1"; null on rows created before this field existed or when unknown */
+  channelnumber: string | null;
   start: number;
   stop: number;
   filesize: number | null;

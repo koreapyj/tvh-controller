@@ -138,6 +138,14 @@ label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px
   display: inline-block; width: 9px; height: 9px; border-radius: 50%;
   background: var(--bad); vertical-align: middle; margin-right: 2px;
 }
+.rec-dot.ok { background: var(--ok); }
+.rec-dot.warn { background: var(--warn); }
+.rec-dot.off { background: var(--muted); }
+
+/* keep wide free-text columns from squeezing the rest; full text in the title */
+td.cell-clip {
+  max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
 th.sortable:hover { color: var(--text); }
 button.expander {
@@ -255,6 +263,8 @@ header.mobile-bar { display: none; }
   }
   table.m-cards .subtable { display: block; overflow-x: auto; }
   table.m-cards .subtable td { white-space: nowrap; }
+  /* clipped desktop columns flow freely inside cards */
+  table.m-cards td.cell-clip { max-width: none; }
 
   .cards { grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); }
 

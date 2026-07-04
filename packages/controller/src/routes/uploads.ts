@@ -49,10 +49,15 @@ export function registerUploadRoutes(app: FastifyInstance, ctx: AppContext): voi
         continue;
       }
       try {
+        // channel number resolved via the DVR entry's instance-local channel
+        // uuid — NEVER by matching the channel name
+        const channelNumber =
+          snap.topology?.channels?.find((c) => c.uuid === entry.channel)?.number ?? null;
         // a manual upload always overwrites any previous copy of this programme
         const r = await dispatcher().enqueue(instanceId, entry, storageRoots, {
           origin: 'manual',
           overwrite: true,
+          channelNumber,
         });
         results.push({
           dvrUuid: uuid,

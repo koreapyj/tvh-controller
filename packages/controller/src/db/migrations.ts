@@ -172,6 +172,18 @@ migrations['006_upload_retry'] = {
   },
 };
 
+migrations['007_upload_channel_number'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // channel number at claim time (e.g. "9.1"), resolved from the instance's
+    // channel list via the DVR entry's channel uuid; NULL for rows claimed
+    // before this field existed or when the channel couldn't be resolved
+    await db.schema.alterTable('uploads').addColumn('channelnumber', 'varchar(32)').execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('uploads').dropColumn('channelnumber').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

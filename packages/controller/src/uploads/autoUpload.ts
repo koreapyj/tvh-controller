@@ -225,6 +225,15 @@ export class AutoUploader {
       .filter((s): s is string => !!s);
   }
 
+  /**
+   * Channel number at claim time, resolved via the DVR entry's instance-local
+   * channel uuid against that same instance's channel list — NEVER by
+   * matching the channel name.
+   */
+  private channelNumber(snap: InstanceSnapshot, entry: TvhDvrEntry): string | null {
+    return snap.topology?.channels?.find((c) => c.uuid === entry.channel)?.number ?? null;
+  }
+
   private async evaluate(): Promise<void> {
     const threshold = this.cfg.overlapThreshold;
     const snaps = this.cache.all();
@@ -272,11 +281,16 @@ export class AutoUploader {
         );
         if (!best) continue;
         try {
+          const bestSnap = this.cache.get(best.instanceId);
           const result = await this.dispatcher.enqueue(
             best.instanceId,
             best.entry,
-            this.storageRoots(this.cache.get(best.instanceId)),
-            { origin: 'auto', incompletePick: anyUnreachable },
+            this.storageRoots(bestSnap),
+            {
+              origin: 'auto',
+              incompletePick: anyUnreachable,
+              channelNumber: this.channelNumber(bestSnap, best.entry),
+            },
           );
           if (result.job) {
             console.log(
@@ -317,12 +331,12 @@ export class AutoUploader {
       ) {
         await this.ledger.supersede(row.id);
         try {
-          await this.dispatcher.enqueue(
-            best.instanceId,
-            best.entry,
-            this.storageRoots(this.cache.get(best.instanceId)),
-            { origin: 'auto', supersedesPath: row.remotePath },
-          );
+          const bestSnap = this.cache.get(best.instanceId);
+          await this.dispatcher.enqueue(best.instanceId, best.entry, this.storageRoots(bestSnap), {
+            origin: 'auto',
+            supersedesPath: row.remotePath,
+            channelNumber: this.channelNumber(bestSnap, best.entry),
+          });
           console.log(
             `auto-upload: superseding "${row.title ?? row.id}" with the better copy from ${best.instanceId}`,
           );

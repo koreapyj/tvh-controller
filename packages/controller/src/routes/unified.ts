@@ -81,6 +81,10 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
         const autorecByUuid = new Map(
           snap.autorecs.map((a) => [a.uuid, { name: a.name ?? '', comment: a.comment ?? '' }]),
         );
+        // channel number is resolved by instance-local uuid only — never by name
+        const channelNumberByUuid = new Map(
+          (snap.topology?.channels ?? []).map((c) => [c.uuid, c.number ?? null]),
+        );
         const conflictByEntry = new Map<string, 'conflict' | 'low-margin'>();
         for (const w of snap.conflicts) {
           for (const uuid of w.entryUuids) {
@@ -109,6 +113,7 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
                     ctx.config.overlapThreshold,
                   ).isDuplicate,
                 );
+          const channelNumber = e.channel ? (channelNumberByUuid.get(e.channel) ?? null) : null;
           if (!item) {
             const master = e.autorec
               ? masterByBinding.get(`${snap.summary.id}:${e.autorec}`)
@@ -118,6 +123,7 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
               title: e.disp_title ?? '',
               subtitle: e.disp_subtitle,
               channelname: e.channelname ?? '',
+              channelNumber,
               start: e.start,
               stop: e.stop,
               copies: [],
@@ -128,6 +134,10 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
               uuids: new Set(),
             };
             items.push(item);
+          } else if (item.channelNumber == null && channelNumber != null) {
+            // backfill when an earlier-seen instance didn't resolve a number
+            // for this same broadcast
+            item.channelNumber = channelNumber;
           }
           const copy: UnifiedCopy = {
             instanceId: snap.summary.id,

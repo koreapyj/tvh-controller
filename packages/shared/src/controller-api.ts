@@ -140,6 +140,8 @@ export interface UnifiedItem {
   title: string;
   subtitle?: string;
   channelname: string;
+  /** resolved from the instance channel list by the entry's channel uuid; null when unknown */
+  channelNumber?: string | null;
   start: number;
   stop: number;
   copies: UnifiedCopy[];
