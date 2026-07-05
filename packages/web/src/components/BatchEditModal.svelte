@@ -18,8 +18,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import { chanKey, chanLabel } from '@tvhc/shared';
   import { resolveChannelPick } from '../lib/channelPick.js';
+  import { parseFieldValue, type FieldSpec } from '../lib/ruleFields.js';
   import { channelOptions } from '../lib/stores.js';
-  import type { FieldSpec } from './batchFields.js';
+  import RuleFieldRow from './RuleFieldRow.svelte';
 
   // tvheadend-style batch edit: a checkbox per field — only ticked fields are
   // written. An optional instance selector doubles as the per-instance control
@@ -84,7 +85,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   {
     for (const f of fields) {
       apply[f.key] = false;
-      const init = mode === 'single' ? (initialValues[f.key] ?? '') : f.type === 'bool' ? 'yes' : '';
+      const init =
+        mode === 'single'
+          ? (initialValues[f.key] ?? '')
+          : f.type === 'bool'
+            ? 'yes'
+            : f.type === 'enum'
+              ? (f.initial ?? String(f.options?.[0]?.value ?? ''))
+              : f.type === 'weekdays'
+                ? '1,2,3,4,5,6,7'
+                : '';
       vals[f.key] = init;
       initialVals[f.key] = init;
     }
@@ -118,21 +128,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     for (const f of fields) {
       const include = mode === 'single' ? vals[f.key] !== initialVals[f.key] : apply[f.key];
       if (!include) continue;
-      if (f.type === 'bool') {
-        out[f.key] = vals[f.key] === 'yes';
-      } else if (f.type === 'int') {
-        if (vals[f.key] === '') {
-          if (mode === 'single') continue; // cleared = leave unchanged
-          formError = `"${f.label}" must be a number`;
-          return;
-        }
-        const n = Number(vals[f.key]);
-        if (Number.isNaN(n)) {
-          formError = `"${f.label}" must be a number`;
-          return;
-        }
-        out[f.key] = n;
-      } else if (f.type === 'channel') {
+      if (f.type === 'channel') {
+        // channel stays in the modal: it needs the channel store to resolve
+        // the picked label into the {channel, channel_number} identity pair
         const pick = resolveChannelPick(vals[f.key] ?? '', $channelOptions);
         if (!pick) {
           formError = 'channel not found — pick one from the list';
@@ -140,9 +138,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         }
         out.channel = pick.name;
         out.channel_number = pick.number;
-      } else {
-        out[f.key] = vals[f.key];
+        continue;
       }
+      if (f.type === 'int' && mode === 'single' && vals[f.key] === '') continue; // cleared = leave unchanged
+      const parsed = parseFieldValue(f, vals[f.key] ?? '');
+      if (!parsed.ok) {
+        formError = parsed.error;
+        return;
+      }
+      out[f.key] = parsed.value;
     }
     const instanceEnabled: Record<string, boolean> = {};
     if (instanceSelector) {
@@ -161,7 +165,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <svelte:window onkeydown={(e) => e.key === 'Escape' && oncancel()} />
 
 <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && oncancel()}>
-  <div class="modal" style="width:560px" role="dialog" aria-modal="true" aria-label={title}>
+  <div class="modal" role="dialog" aria-modal="true" aria-label={title}>
     <h2 style="margin-top:0">{title}</h2>
     {#if subtitle}<p class="muted small" style="margin-top:0">{subtitle}</p>{/if}
     {#if formError}<div class="error-banner">{formError}</div>{/if}
@@ -201,53 +205,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           ? 'Tick a field to apply it; unticked fields are left unchanged.'
           : 'Only fields you change are saved; the rest are left unchanged.'}
       </div>
-      {#each fields as f (f.key)}
-        <div style="display:flex;gap:10px;align-items:center">
-          {#if mode === 'batch'}
-            <input type="checkbox" bind:checked={apply[f.key]} title="apply this field" />
-          {/if}
-          <label for="bf-{f.key}" style="margin:0;width:150px;flex:none">{f.label}</label>
-          {#if f.type === 'bool'}
-            <select
-              id="bf-{f.key}"
-              style="width:auto"
-              disabled={mode === 'batch' && !apply[f.key]}
-              bind:value={vals[f.key]}
-            >
-              <option value="yes">yes</option>
-              <option value="no">no</option>
-            </select>
-          {:else if f.type === 'channel'}
-            <input
-              id="bf-{f.key}"
-              style="flex:1"
-              list="be-channel-options"
-              placeholder={mode === 'single' && differingKeys.includes(f.key)
-                ? '(multiple values)'
-                : (f.placeholder ?? '')}
-              disabled={mode === 'batch' && !apply[f.key]}
-              bind:value={vals[f.key]}
-            />
-            <datalist id="be-channel-options">
-              {#each $channelOptions as c (chanKey(c.name, c.number))}
-                <option value={chanLabel(c.name, c.number)}></option>
-              {/each}
-            </datalist>
-          {:else}
-            <input
-              id="bf-{f.key}"
-              style="flex:1"
-              inputmode={f.type === 'int' ? 'numeric' : undefined}
-              placeholder={mode === 'single' && differingKeys.includes(f.key)
-                ? '(multiple values)'
-                : (f.placeholder ?? '')}
-              disabled={mode === 'batch' && !apply[f.key]}
-              bind:value={vals[f.key]}
-            />
-          {/if}
-          {#if f.help}<span class="muted small">{f.help}</span>{/if}
-        </div>
+      {#each fields as f, i (f.key)}
+        {#if f.section && f.section !== fields[i - 1]?.section}
+          <div class="muted small" style="margin-top:8px;text-transform:uppercase;font-size:11px">
+            {f.section}
+          </div>
+        {/if}
+        <RuleFieldRow
+          spec={f}
+          mode={mode === 'single' ? 'plain' : 'batch'}
+          bind:value={vals[f.key]}
+          bind:apply={apply[f.key]}
+          inheritPlaceholder={mode === 'single' && differingKeys.includes(f.key)
+            ? '(multiple values)'
+            : undefined}
+          datalistId={f.type === 'channel' ? 'be-channel-options' : undefined}
+        />
       {/each}
+      {#if fields.some((f) => f.type === 'channel')}
+        <datalist id="be-channel-options">
+          {#each $channelOptions as c (chanKey(c.name, c.number))}
+            <option value={chanLabel(c.name, c.number)}></option>
+          {/each}
+        </datalist>
+      {/if}
     </div>
 
     <div style="display:flex;gap:8px;align-items:center;margin-top:16px">

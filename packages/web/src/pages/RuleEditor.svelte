@@ -17,10 +17,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
   import { chanKey, chanLabel, chanNumberOrder, type ChannelOption, type MasterRulePayload, type RuleInstances } from '@tvhc/shared';
+  import RuleFieldRow from '../components/RuleFieldRow.svelte';
   import type { RuleInput } from '../lib/api.js';
   import { parseChannelInput, resolveChannelPick } from '../lib/channelPick.js';
   import { conversionFor, toEitTime } from '../lib/eit.js';
-  import { WEEKDAY_LABELS } from '../lib/format.js';
+  import { buildRulePatch, formatFieldValue, needsOverrideToggle, RULE_FIELD_SPECS, RULE_PAYLOAD_DEFAULTS, type FieldSpec } from '../lib/ruleFields.js';
   import { channelOptions, instances } from '../lib/stores.js';
 
   let {
@@ -47,36 +48,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   } = $props();
 
   const overlayMode = $derived(parentPayload !== null);
-
-  const DEFAULTS: MasterRulePayload = {
-    enabled: true, name: '', title: '', fulltext: false, mergetext: false,
-    channel: '', channel_number: null, tag: '', btype: 0, content_type: 0, star_rating: 0,
-    start: '', start_window: '', start_extra: 0, stop_extra: 0, weekdays: [],
-    minduration: 0, maxduration: 0, minyear: 0, maxyear: 0, minseason: 0,
-    maxseason: 0, pri: 6, record: 0, retention: 0, removal: 0, maxcount: 0,
-    maxsched: 0, config_name: '', directory: '', comment: '',
-  };
-
-  type StrField =
-    | 'title' | 'channel' | 'tag' | 'config_name' | 'start' | 'start_window' | 'comment';
-  type NumField =
-    | 'pri' | 'minduration' | 'maxduration' | 'record' | 'start_extra' | 'stop_extra' | 'maxcount';
-  type BoolField = 'enabled' | 'fulltext';
+  const rowMode = $derived(overlayMode ? ('overlay' as const) : ('plain' as const));
 
   const base = $derived((parentPayload ?? null) as MasterRulePayload | null);
 
-  // form state: '' = inherit (overlay mode) / default (plain mode)
+  // form state: one string per field spec; '' = inherit (overlay mode) /
+  // default (plain mode). The channel value may be a full identity label
+  // ("N　Name") — resolveChannelPick maps it back to {channel, channel_number}.
   let name = $state('');
-  let sf: Record<StrField | NumField, string> = $state({
-    title: '', channel: '', tag: '', config_name: '', start: '', start_window: '',
-    comment: '', pri: '', minduration: '', maxduration: '', record: '',
-    start_extra: '', stop_extra: '', maxcount: '',
-  });
-  /** '' = inherit/default, 'yes' / 'no' = explicit */
-  let bf: Record<BoolField, '' | 'yes' | 'no'> = $state({ enabled: '', fulltext: '' });
-  let wdOverride = $state(false);
-  // default to every day (all selected); the user narrows down from there
-  let wd: number[] = $state([1, 2, 3, 4, 5, 6, 7]);
+  let vals: Record<string, string> = $state({});
+  /**
+   * per-field Override checkboxes (overlay mode, needsOverrideToggle types):
+   * on ⇒ the key is written even when blank ('' = Any); off ⇒ inherit.
+   * Plain mode only uses the weekdays entry, which it forces on.
+   */
+  let overrides: Record<string, boolean> = $state({});
   let allInstances = $state(true);
   let selectedInstances: string[] = $state([]);
   let formError = $state('');
@@ -90,28 +76,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     const source: Partial<MasterRulePayload> | null = overlayMode
       ? (initialOverlay ?? {})
       : initialPayload;
-    if (source) {
-      for (const k of Object.keys(sf) as Array<StrField | NumField>) {
-        const v = source[k as keyof MasterRulePayload];
-        if (v !== undefined && v !== null) sf[k] = String(v);
-      }
-      for (const k of ['enabled', 'fulltext'] as BoolField[]) {
-        const v = source[k];
-        if (v !== undefined && v !== null) bf[k] = v ? 'yes' : 'no';
-      }
-      if (source.weekdays !== undefined && source.weekdays !== null) {
-        wdOverride = true;
-        // empty = every day in our model, shown as all selected
-        wd = source.weekdays.length ? [...source.weekdays] : [1, 2, 3, 4, 5, 6, 7];
-      }
-      // seed the channel input with the full identity label when the source
-      // carries its own pinned number (absent on legacy overlays that
-      // predate channel numbers, or when the source targets "any number").
-      if (source.channel && source.channel_number != null) {
-        sf.channel = chanLabel(String(source.channel), source.channel_number);
-      }
+    for (const f of RULE_FIELD_SPECS) {
+      const v = source?.[f.key as keyof MasterRulePayload];
+      vals[f.key] = v !== undefined && v !== null ? formatFieldValue(f, v) : '';
+      // key presence — even with an empty value ('' = Any) — turns the field's
+      // override on, so an explicit-empty overlay round-trips instead of
+      // collapsing into "inherit". Always a boolean: rows bind the entry, and
+      // binding undefined to a prop with a fallback is a runtime error.
+      overrides[f.key] = needsOverrideToggle(f) && v !== undefined && v !== null;
     }
-    if (!overlayMode && !wdOverride) wdOverride = true; // plain mode always edits weekdays
+    // weekdays: empty = every day in our model, shown as all seven selected
+    if (overrides.weekdays && source?.weekdays) {
+      vals.weekdays = source.weekdays.length ? source.weekdays.join(',') : '1,2,3,4,5,6,7';
+    }
+    if (!overlayMode && !overrides.weekdays) {
+      // plain mode always edits weekdays; default to every day (all selected)
+      overrides.weekdays = true;
+      vals.weekdays = '1,2,3,4,5,6,7';
+    }
+    // seed the channel input with the full identity label when the source
+    // carries its own pinned number (absent on legacy overlays that
+    // predate channel numbers, or when the source targets "any number").
+    if (source?.channel && source.channel_number != null) {
+      vals.channel = chanLabel(String(source.channel), source.channel_number);
+    }
   }
 
   function ph(field: keyof MasterRulePayload, fallback = ''): string {
@@ -124,41 +112,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return fallback;
   }
 
-  function toggleDay(d: number): void {
-    wd = wd.includes(d) ? wd.filter((x) => x !== d) : [...wd, d].sort((a, b) => a - b);
+  /** overlay mode: the formatted parent value shown as the inherit placeholder */
+  function inheritText(f: FieldSpec): string | undefined {
+    if (!overlayMode || !base) return undefined;
+    if (f.type === 'enum') {
+      const v = base[f.key as keyof MasterRulePayload];
+      return f.options?.find((o) => o.value === v)?.label ?? String(v ?? '');
+    }
+    return ph(f.key as keyof MasterRulePayload, f.placeholder ?? '');
   }
 
   function toggleInstance(id: string): void {
     selectedInstances = selectedInstances.includes(id)
       ? selectedInstances.filter((x) => x !== id)
       : [...selectedInstances, id];
-  }
-
-  function buildOverlay(): Partial<MasterRulePayload> {
-    const o: Partial<MasterRulePayload> = {};
-    for (const k of ['title', 'tag', 'config_name', 'start', 'start_window', 'comment'] as Exclude<StrField, 'channel'>[]) {
-      if (sf[k] !== '') o[k] = sf[k];
-    }
-    for (const k of ['pri', 'minduration', 'maxduration', 'record', 'start_extra', 'stop_extra', 'maxcount'] as NumField[]) {
-      if (sf[k] !== '') o[k] = Number(sf[k]);
-    }
-    for (const k of ['enabled', 'fulltext'] as BoolField[]) {
-      if (bf[k] !== '') o[k] = bf[k] === 'yes';
-    }
-    if (wdOverride) o.weekdays = [...wd];
-    // channel + channel_number are always written together; save() already
-    // validated that a non-empty sf.channel resolves to a real channel
-    if (sf.channel !== '') {
-      const pick = resolveChannelPick(sf.channel, channels)!;
-      o.channel = pick.name;
-      o.channel_number = pick.number;
-    }
-    return o;
-  }
-
-  function buildPayload(): MasterRulePayload {
-    const o = buildOverlay();
-    return { ...DEFAULTS, ...o, name, weekdays: wdOverride ? [...wd] : [] };
   }
 
   function save(): void {
@@ -171,32 +138,52 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       formError = 'select at least one instance (or All)';
       return;
     }
-    if (sf.channel !== '' && !resolveChannelPick(sf.channel, channels)) {
+    const chanRaw = vals.channel ?? '';
+    if (chanRaw !== '' && !resolveChannelPick(chanRaw, channels)) {
       formError = 'channel not found on any instance — pick one from the list';
       return;
     }
-    for (const k of ['pri', 'minduration', 'maxduration', 'record', 'start_extra', 'stop_extra', 'maxcount'] as NumField[]) {
-      if (sf[k] !== '' && Number.isNaN(Number(sf[k]))) {
-        formError = `"${k}" must be a number`;
-        return;
-      }
+    const built = buildRulePatch(RULE_FIELD_SPECS, vals, {
+      mode: overlayMode ? 'overlay' : 'plain',
+      overrides: $state.snapshot(overrides),
+    });
+    if (!built.ok) {
+      formError = built.error;
+      return;
+    }
+    const patch = built.patch;
+    // channel + channel_number are always written together; a non-empty
+    // channel input was validated above to resolve to a real channel
+    if (chanRaw !== '') {
+      const pick = resolveChannelPick(chanRaw, channels)!;
+      patch.channel = pick.name;
+      patch.channel_number = pick.number;
+    } else if (overlayMode && overrides.channel) {
+      // Override checked with a blank input: explicitly any channel
+      patch.channel = '';
+      patch.channel_number = null;
     }
     const instancesOut: RuleInstances = allInstances ? 'all' : [...selectedInstances];
     if (overlayMode) {
-      onsave({ name: name.trim(), instances: instancesOut, overlay: buildOverlay() });
+      onsave({ name: name.trim(), instances: instancesOut, overlay: patch });
     } else {
-      onsave({ name: name.trim(), instances: instancesOut, payload: buildPayload() });
+      onsave({
+        name: name.trim(),
+        instances: instancesOut,
+        payload: { ...RULE_PAYLOAD_DEFAULTS, ...patch, name },
+      });
     }
   }
 
   const channels: ChannelOption[] = $derived($channelOptions);
 
-  const picked = $derived(parseChannelInput(sf.channel, channels));
-  // effective identity: typed value, else the inherited parent pair (overlay mode)
+  const picked = $derived(parseChannelInput(vals.channel ?? '', channels));
+  // effective identity: typed value, else the inherited parent pair (overlay
+  // mode, unless the channel override forces "any channel")
   const effPick = $derived(
-    sf.channel
+    vals.channel
       ? picked
-      : overlayMode && base?.channel
+      : overlayMode && !overrides.channel && base?.channel
         ? { name: base.channel, number: base.channel_number ?? null }
         : { name: '', number: null },
   );
@@ -230,9 +217,24 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return t ? `= ${t.time} EIT` : '';
   }
 
+  /** EIT hint for the start/start_window rows (typed value, else the inherited one) */
+  function hintFor(f: FieldSpec): string {
+    if (f.key !== 'start' && f.key !== 'start_window') return '';
+    const key = f.key as 'start' | 'start_window';
+    return eitHint(vals[key] || (overlayMode && !overrides[key] ? ph(key) : ''));
+  }
+
+  // a typed channel auto-checks its override (mirrors RuleFieldRow's rule);
+  // unchecking clears the input first, so this never re-fires against it
+  $effect(() => {
+    if (vals.channel) overrides.channel = true;
+  });
+
   /** the inherited parent channel, shown with its pinned number when known */
   const channelPlaceholder = $derived(
-    base?.channel ? chanLabel(base.channel, base.channel_number ?? null) : 'Any channel',
+    base?.channel && !overrides.channel
+      ? chanLabel(base.channel, base.channel_number ?? null)
+      : 'Any channel',
   );
 </script>
 
@@ -252,20 +254,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {#if overlayMode}
       <p class="muted small" style="margin-top:0">
         Empty fields inherit from <b>{parentName}</b> (inherited values shown as placeholders);
-        filled fields override.
+        filled fields override. Tick <b>Override</b> with a blank field to explicitly clear it
+        (Any) instead of inheriting.
       </p>
     {/if}
     {#if formError}<div class="error-banner">{formError}</div>{/if}
 
-    <div class="form-grid">
-      <div class="wide">
-        <label for="re-name">Name</label>
-        <input id="re-name" bind:value={name} />
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <div style="display:flex;gap:10px;align-items:center">
+        <label for="re-name" style="margin:0;width:150px;flex:none">Name</label>
+        <input id="re-name" style="flex:1" bind:value={name} />
       </div>
 
-      <div class="wide">
-        <label for="re-instances">Instances</label>
-        <div id="re-instances" style="display:flex;gap:10px;align-items:center">
+      <div style="display:flex;gap:10px;align-items:center">
+        <span style="width:150px;flex:none">Instances</span>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
           <label style="display:flex;gap:6px;align-items:center;margin:0">
             <input type="checkbox" style="width:auto" bind:checked={allInstances} />
             All (includes instances added later)
@@ -286,118 +289,67 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </div>
       </div>
 
-      <div class="wide">
-        <label for="re-title">Title pattern (regex)</label>
-        <input id="re-title" bind:value={sf.title} placeholder={ph('title', '(any)')} />
-      </div>
-      <div>
-        <label for="re-channel">Channel {overlayMode ? '' : '(blank = any)'}</label>
-        <input id="re-channel" bind:value={sf.channel} list="channel-options" placeholder={channelPlaceholder} />
-        <datalist id="channel-options">
-          {#each channels as c (chanKey(c.name, c.number))}
-            <option value={chanLabel(c.name, c.number)}></option>
-          {/each}
-        </datalist>
-        {#if effectiveChannel}
-          <div class="muted small">
-            {chanLabel(effectiveChannel.name, effectiveChannel.number)}{#if effPick.number === null && effectiveChannel.number !== null}&nbsp;(lowest — will be pinned on save){/if}
-            · on {matchedInstances.join(', ')}
-            {#if missingOn.length}<span style="color:var(--warn)"> — missing on {missingOn.join(', ')}</span>{/if}
+      {#each RULE_FIELD_SPECS as f, i (f.key)}
+        {#if f.section && f.section !== RULE_FIELD_SPECS[i - 1]?.section}
+          <div class="muted small" style="margin-top:8px;text-transform:uppercase;font-size:11px">
+            {f.section}
           </div>
-        {:else if effPick.name}
-          <div class="small" style="color:var(--bad)">channel not found on any instance — pick one from the list</div>
         {/if}
-      </div>
-      <div>
-        <label for="re-tag">Channel tag</label>
-        <input id="re-tag" bind:value={sf.tag} placeholder={ph('tag', '—')} />
-      </div>
-      <div>
-        <label for="re-config">DVR profile</label>
-        <input id="re-config" bind:value={sf.config_name} placeholder={ph('config_name', '(default)')} />
-      </div>
-      <div>
-        <label for="re-start">Start after (HH:MM, server time)</label>
-        <input id="re-start" bind:value={sf.start} placeholder={ph('start', 'Any')} />
-        {#if eitHint(sf.start || (overlayMode ? ph('start') : ''))}
-          <div class="muted small">{eitHint(sf.start || (overlayMode ? ph('start') : ''))}</div>
-        {/if}
-      </div>
-      <div>
-        <label for="re-window">Start before (HH:MM, server time)</label>
-        <input id="re-window" bind:value={sf.start_window} placeholder={ph('start_window', 'Any')} />
-        {#if eitHint(sf.start_window || (overlayMode ? ph('start_window') : ''))}
-          <div class="muted small">{eitHint(sf.start_window || (overlayMode ? ph('start_window') : ''))}</div>
-        {/if}
-      </div>
-      <div>
-        <label for="re-pri">Priority (0 high … 6 default)</label>
-        <input id="re-pri" inputmode="numeric" bind:value={sf.pri} placeholder={ph('pri', '6')} />
-      </div>
-
-      <div class="wide">
-        <label for="re-wd">Weekdays</label>
-        <div id="re-wd" style="display:flex;gap:6px;align-items:center">
-          {#if overlayMode}
-            <label style="display:flex;gap:6px;align-items:center;margin:0">
-              <input type="checkbox" style="width:auto" bind:checked={wdOverride} /> Override
+        {#if f.key === 'channel'}
+          <!-- bespoke channel block: datalist picker + per-instance diagnostics -->
+          <div style="display:flex;gap:10px;align-items:flex-start">
+            <label for="re-channel" style="margin:0;width:150px;flex:none;padding-top:6px">
+              Channel
             </label>
-          {/if}
-          {#if wdOverride}
-            {#each WEEKDAY_LABELS as label, i}
-              <button type="button" class:primary={wd.includes(i + 1)} onclick={() => toggleDay(i + 1)}>
-                {label}
-              </button>
-            {/each}
-          {:else}
-            <span class="muted small">inherited: {ph('weekdays', 'every day')}</span>
-          {/if}
-        </div>
-      </div>
-
-      <div>
-        <label for="re-mind">Min duration (s)</label>
-        <input id="re-mind" inputmode="numeric" bind:value={sf.minduration} placeholder={ph('minduration', '0')} />
-      </div>
-      <div>
-        <label for="re-maxd">Max duration (s)</label>
-        <input id="re-maxd" inputmode="numeric" bind:value={sf.maxduration} placeholder={ph('maxduration', '0')} />
-      </div>
-      <div>
-        <label for="re-record">Dedup mode (record)</label>
-        <input id="re-record" inputmode="numeric" bind:value={sf.record} placeholder={ph('record', '0')} />
-      </div>
-      <div>
-        <label for="re-sx">Start padding (min)</label>
-        <input id="re-sx" inputmode="numeric" bind:value={sf.start_extra} placeholder={ph('start_extra', '0')} />
-      </div>
-      <div>
-        <label for="re-ex">Stop padding (min)</label>
-        <input id="re-ex" inputmode="numeric" bind:value={sf.stop_extra} placeholder={ph('stop_extra', '0')} />
-      </div>
-      <div>
-        <label for="re-maxc">Max recordings (0 = ∞)</label>
-        <input id="re-maxc" inputmode="numeric" bind:value={sf.maxcount} placeholder={ph('maxcount', '0')} />
-      </div>
-      <div class="wide">
-        <label for="re-comment">Comment</label>
-        <input id="re-comment" bind:value={sf.comment} placeholder={ph('comment', '—')} />
-      </div>
-
-      <div class="wide" style="display:flex;gap:14px;align-items:center">
-        <label for="re-enabled" style="margin:0">Enabled</label>
-        <select id="re-enabled" style="width:auto" bind:value={bf.enabled}>
-          <option value="">{overlayMode ? `inherit (${ph('enabled')})` : 'yes (default)'}</option>
-          <option value="yes">yes</option>
-          <option value="no">no</option>
-        </select>
-        <label for="re-fulltext" style="margin:0">Full-text match</label>
-        <select id="re-fulltext" style="width:auto" bind:value={bf.fulltext}>
-          <option value="">{overlayMode ? `inherit (${ph('fulltext')})` : 'no (default)'}</option>
-          <option value="yes">yes</option>
-          <option value="no">no</option>
-        </select>
-      </div>
+            {#if overlayMode}
+              <input
+                type="checkbox"
+                style="width:auto;flex:none;margin-top:6px"
+                checked={overrides.channel ?? false}
+                onchange={(e) => {
+                  overrides.channel = e.currentTarget.checked;
+                  vals.channel = '';
+                }}
+                title="tick with a blank field to explicitly match any channel instead of inheriting"
+                aria-label="override channel"
+              />
+            {/if}
+            <div style="flex:1">
+              <input
+                id="re-channel"
+                style="width:100%"
+                bind:value={vals.channel}
+                list="channel-options"
+                placeholder={channelPlaceholder}
+              />
+              <datalist id="channel-options">
+                {#each channels as c (chanKey(c.name, c.number))}
+                  <option value={chanLabel(c.name, c.number)}></option>
+                {/each}
+              </datalist>
+              {#if effectiveChannel}
+                <div class="muted small">
+                  {chanLabel(effectiveChannel.name, effectiveChannel.number)}{#if effPick.number === null && effectiveChannel.number !== null}&nbsp;(lowest — will be pinned on save){/if}
+                  · on {matchedInstances.join(', ')}
+                  {#if missingOn.length}<span style="color:var(--warn)"> — missing on {missingOn.join(', ')}</span>{/if}
+                </div>
+              {:else if effPick.name}
+                <div class="small" style="color:var(--bad)">channel not found on any instance — pick one from the list</div>
+              {/if}
+            </div>
+            {#if !overlayMode}<span class="muted small" style="padding-top:6px">{f.help}</span>{/if}
+          </div>
+        {:else}
+          <RuleFieldRow
+            spec={f}
+            mode={rowMode}
+            bind:value={vals[f.key]}
+            bind:override={overrides[f.key]}
+            inheritPlaceholder={inheritText(f)}
+            hint={hintFor(f)}
+          />
+        {/if}
+      {/each}
     </div>
 
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">

@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { chanLabel, type MasterRulePayload } from '@tvhc/shared';
   import { conversionFor, toEitTime } from '../lib/eit.js';
   import { weekdays } from '../lib/format.js';
+  import { BTYPES, CONTENT_TYPE_OPTIONS, PRIORITIES, RECORD_MODES } from '../lib/ruleFields.js';
   import { channelOptions, instances } from '../lib/stores.js';
 
   let { payload, compact = false }: { payload: MasterRulePayload; compact?: boolean } = $props();
@@ -27,40 +28,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     conversionFor(payload.channel, payload.channel_number ?? null, $channelOptions, $instances),
   );
 
-  // labels from tvheadend dvr.h enums
-  const RECORD_MODES: Record<number, string> = {
-    0: 'Record all',
-    14: 'Unique episode (EPG)',
-    1: 'Different episode number',
-    2: 'Different subtitle',
-    3: 'Different description',
-    12: 'Once per month',
-    4: 'Once per week',
-    5: 'Once per day',
-    6: 'Local: different episode number',
-    7: 'Local: different title',
-    8: 'Local: different subtitle',
-    9: 'Local: different description',
-    13: 'Local: once per month',
-    10: 'Local: once per week',
-    11: 'Local: once per day',
-    15: 'Use DVR profile setting',
-  };
-  const BTYPES: Record<number, string> = {
-    0: 'Any',
-    1: 'New / unknown',
-    2: 'Repeated',
-    3: 'New only',
-  };
-  const PRIORITIES: Record<number, string> = {
-    0: 'Important',
-    1: 'High',
-    2: 'Normal',
-    3: 'Low',
-    4: 'Unimportant',
-    5: 'Not set',
-    6: 'Default',
-  };
+  const CONTENT_TYPES: Record<number, string> = Object.fromEntries(
+    CONTENT_TYPE_OPTIONS.map((o) => [o.value, o.label]),
+  );
 
   function seconds(v: number): string {
     if (!v) return '—';
@@ -88,6 +58,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       label: 'Full-text match',
       value: payload.fulltext ? 'yes' : 'no',
       isDefault: !payload.fulltext,
+    },
+    {
+      label: 'Merge title & subtitle',
+      value: payload.mergetext ? 'yes' : 'no',
+      isDefault: !payload.mergetext,
     },
     {
       label: 'Channel',
@@ -127,6 +102,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       label: 'Broadcast type',
       value: enumLabel(BTYPES, payload.btype),
       isDefault: payload.btype === 0,
+    },
+    {
+      label: 'Content type',
+      value: enumLabel(CONTENT_TYPES, payload.content_type),
+      isDefault: payload.content_type === 0,
     },
     {
       label: 'Dedup (record)',

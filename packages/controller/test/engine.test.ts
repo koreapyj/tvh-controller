@@ -1013,6 +1013,41 @@ describe('batchEdit: non-integer string channel_number (regression)', () => {
   });
 });
 
+// ---------- 17b. batchEdit: full field patch (batch-edit modal now exposes every payload field) ----------
+
+describe('batchEdit: btype/content_type/mergetext/weekdays/directory patch', () => {
+  it('merges the patch into a plain rule payload and a linked clone overlay; names untouched', async () => {
+    const { destroy, engine } = await setup(['tyo1']);
+    const plain = await engine.createRule({
+      name: 'PatchPlain',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'PatchPlain' }),
+    });
+    const parent = await engine.createRule({
+      name: 'PatchParent',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'PatchParent' }),
+    });
+    const clone = await engine.createClone(parent.id, true, 'PatchClone');
+
+    const patch = { btype: 2, content_type: 16, mergetext: true, weekdays: [6, 7], directory: 'd' };
+    const results = await engine.batchEdit([plain.id, clone.id], patch);
+    expect(results.every((r) => r.ok)).toBe(true);
+
+    const updatedPlain = await engine.getRule(plain.id);
+    expect(updatedPlain!.payload).toMatchObject(patch);
+    expect(updatedPlain!.payload.name).toBe('PatchPlain');
+    expect(updatedPlain!.name).toBe('PatchPlain');
+
+    const updatedClone = await engine.getRule(clone.id);
+    expect(updatedClone!.overlay).toEqual(patch); // overlay only — payload stays a placeholder
+    expect(updatedClone!.payload).toEqual({});
+    expect(updatedClone!.name).toBe('PatchClone');
+
+    await destroy();
+  });
+});
+
 // ---------- 18. integrityCheck: "Any" time-window sentinel + unverifiable instances ----------
 
 describe('integrityCheck: tvheadend "Any" start/start_window sentinel', () => {
@@ -1064,6 +1099,72 @@ describe('integrityCheck: tvheadend "Any" start/start_window sentinel', () => {
     expect(payloadHash(normalizePayload(masterRulePayload({ start: 'Any', start_window: 'Any' })))).toBe(
       payloadHash(normalizePayload(masterRulePayload({ start: '', start_window: '' }))),
     );
+  });
+});
+
+// ---------- 18b. sparse overlay: explicit '' / null / [] overrides (web UI writes these) ----------
+
+describe('createClone: linked clone with an explicit-empty sparse overlay', () => {
+  it("an overlay of '' / null / [] explicitly overrides (not inherits) parent fields, survives push, and the tvh 'Any' readback is not drift", async () => {
+    const { destroy, engine, clients, pollers } = await setup(['tyo1']);
+    const parent = await engine.createRule({
+      name: 'NewsParent',
+      instances: 'all',
+      payload: masterRulePayload({
+        name: 'NewsParent',
+        title: '^News',
+        start: '20:00',
+        start_window: '22:00',
+        channel: 'KBS1',
+        channel_number: '1',
+        weekdays: [6, 7],
+      }),
+    });
+
+    const clone = await engine.createClone(parent.id, true, 'NewsClone');
+    await engine.updateRule(clone.id, {
+      name: 'NewsClone',
+      instances: clone.instances,
+      parentId: parent.id,
+      overlay: {
+        title: '',
+        start: '',
+        start_window: '',
+        channel: '',
+        channel_number: null,
+        weekdays: [],
+      },
+    });
+
+    const resolved = await engine.listResolved();
+    const effClone = resolved.find((r) => r.id === clone.id)!;
+    expect(effClone.effective?.title).toBe('');
+    expect(effClone.effective?.start).toBe('');
+    expect(effClone.effective?.start_window).toBe('');
+    expect(effClone.effective?.channel).toBe('');
+    expect(effClone.effective?.channel_number).toBeNull();
+    // '' / null / [] are explicit overrides, not gaps — definedProps only strips
+    // undefined/null, so the empty-string and empty-array overlay entries win
+    // over the parent's '^News' / '20:00' / '22:00' / [6,7]; weekdays: [] is
+    // then canonicalized to "every day" like any other empty selection
+    expect(effClone.effective?.weekdays).toEqual([1, 2, 3, 4, 5, 6, 7]);
+
+    const [result] = await engine.pushRule(clone.id);
+    expect(result?.action).toBe('created');
+
+    // tvheadend reports an unrestricted time window as the literal "Any"
+    const client = clients.get('tyo1')!;
+    client.rules[0]!.start = 'Any';
+    client.rules[0]!.start_window = 'Any';
+    await pollers.get('tyo1')!.pollAutorecs();
+
+    const drift = await engine.computeDrift();
+    expect(drift).toHaveLength(0);
+
+    const issues = await engine.integrityCheck();
+    expect(issues.some((i) => i.kind === 'content-mismatch' && i.masterRuleId === clone.id)).toBe(false);
+
+    await destroy();
   });
 });
 

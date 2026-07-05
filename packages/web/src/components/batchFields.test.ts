@@ -17,7 +17,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { RECORDING_FIELDS, RULE_FIELDS } from './batchFields.js';
+import { RECORDING_FIELDS } from './batchFields.js';
 
 // Mirrors ALLOWED_FIELDS in packages/controller/src/routes/recordings.ts (the
 // server rejects any batch-edit field not in this set with a 400). Keep in
@@ -49,9 +49,4 @@ describe('RECORDING_FIELDS', () => {
   });
 });
 
-describe('RULE_FIELDS', () => {
-  it('has unique keys', () => {
-    const keys = keysOf(RULE_FIELDS);
-    expect(new Set(keys).size).toBe(keys.length);
-  });
-});
+// autorec rule field coverage lives in ../lib/ruleFields.test.ts

@@ -28,7 +28,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import RuleDetails from '../components/RuleDetails.svelte';
   import BatchEditModal from '../components/BatchEditModal.svelte';
   import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
-  import { RULE_FIELDS } from '../components/batchFields.js';
+  import { RULE_FIELD_SPECS } from '../lib/ruleFields.js';
 
   let rules: RuleWithStatus[] = $state([]);
   let busy = $state(false);
@@ -879,7 +879,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <BatchEditModal
     title={`Edit ${selectedIds.length} rule${selectedIds.length === 1 ? '' : 's'}`}
     subtitle="Ticked fields are applied to every selected rule; rules stay pending until you push."
-    fields={RULE_FIELDS}
+    fields={RULE_FIELD_SPECS}
     instanceSelector={batchInstanceSelector}
     onsave={batchEditSave}
     oncancel={() => (batchEditing = false)}

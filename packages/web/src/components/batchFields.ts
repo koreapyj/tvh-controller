@@ -16,32 +16,15 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-export interface FieldSpec {
-  key: string;
-  label: string;
-  type: 'bool' | 'int' | 'str' | 'channel';
-  placeholder?: string;
-  help?: string;
-}
+import type { FieldSpec } from '../lib/ruleFields.js';
+
+export type { FieldSpec } from '../lib/ruleFields.js';
 
 /** DVR-entry fields exposed in the recordings batch edit (keys = tvheadend idnode fields) */
 export const RECORDING_FIELDS: FieldSpec[] = [
   { key: 'enabled', label: 'Enabled', type: 'bool' },
   { key: 'comment', label: 'Comment', type: 'str' },
   { key: 'pri', label: 'Priority', type: 'int', placeholder: '6 = default, 0 = highest' },
-  { key: 'start_extra', label: 'Start padding (min)', type: 'int', placeholder: '0' },
-  { key: 'stop_extra', label: 'Stop padding (min)', type: 'int', placeholder: '0' },
-  { key: 'retention', label: 'Keep log (days)', type: 'int', placeholder: '0 = config default' },
-  { key: 'removal', label: 'Keep file (days)', type: 'int', placeholder: '0 = config default' },
-];
-
-/** master-rule payload fields exposed in the autorec batch edit */
-export const RULE_FIELDS: FieldSpec[] = [
-  { key: 'enabled', label: 'Enabled', type: 'bool' },
-  { key: 'channel', label: 'Channel', type: 'channel', help: 'blank = any channel' },
-  { key: 'pri', label: 'Priority', type: 'int', placeholder: '6 = default, 0 = highest' },
-  { key: 'config_name', label: 'DVR profile', type: 'str', placeholder: '(default)' },
-  { key: 'comment', label: 'Comment', type: 'str' },
   { key: 'start_extra', label: 'Start padding (min)', type: 'int', placeholder: '0' },
   { key: 'stop_extra', label: 'Stop padding (min)', type: 'int', placeholder: '0' },
   { key: 'retention', label: 'Keep log (days)', type: 'int', placeholder: '0 = config default' },
