@@ -16,6 +16,7 @@ import { normalizePayload, normalizeRule, payloadHash } from '../src/sync/normal
 import { createTestDb } from './support/testDb.js';
 import { fakePoller, fakeTvhClient, type FakePoller, type FakeTvhClient } from './support/fakePoller.js';
 import {
+  TS,
   masterRulePayload,
   nameMaps,
   seedIgnoredOrphan,
@@ -597,6 +598,72 @@ describe('deleteRule: parent/clone guard and 404 tolerance', () => {
     const binding = await getBinding(db, parent.id, 'tyo1');
     expect(binding).toBeFalsy();
     void uuid;
+
+    await destroy();
+  });
+});
+
+// ---------- 13b. batchRestore / batchPurge parent-clone ordering ----------
+
+describe('batchRestore: parent/clone ordering', () => {
+  it('restores parents before clones regardless of the requested order', async () => {
+    const { db, destroy, engine } = await setup(['tyo1']);
+    const parentId = await seedMasterRule(db, { name: 'Parent', deletedAt: TS });
+    const cloneId = await seedMasterRule(db, { name: 'Clone A', parentId, deletedAt: TS });
+
+    const results = await engine.batchRestore([cloneId, parentId]); // clone first on purpose
+    expect(results.every((r) => r.ok)).toBe(true);
+
+    const parent = await engine.getRule(parentId);
+    const clone = await engine.getRule(cloneId);
+    expect(parent?.deletedAt).toBeNull();
+    expect(clone?.deletedAt).toBeNull();
+
+    await destroy();
+  });
+
+  it('a clone alone fails while its parent is still deleted', async () => {
+    const { db, destroy, engine } = await setup(['tyo1']);
+    const parentId = await seedMasterRule(db, { name: 'Parent', deletedAt: TS });
+    const cloneId = await seedMasterRule(db, { name: 'Clone A', parentId, deletedAt: TS });
+
+    const results = await engine.batchRestore([cloneId]);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.ok).toBe(false);
+    expect(results[0]!.error).toContain('restore its parent first');
+
+    await destroy();
+  });
+});
+
+describe('batchPurge: parent/clone ordering', () => {
+  it('purges clones before parents regardless of the requested order', async () => {
+    const { db, destroy, engine } = await setup(['tyo1']);
+    const parentId = await seedMasterRule(db, { name: 'Parent', deletedAt: TS });
+    const cloneId = await seedMasterRule(db, { name: 'Clone A', parentId, deletedAt: TS });
+
+    const results = await engine.batchPurge([parentId, cloneId]); // parent first on purpose
+    expect(results.every((r) => r.ok)).toBe(true);
+
+    const rows = await db
+      .selectFrom('master_rules')
+      .select('id')
+      .where('id', 'in', [parentId, cloneId])
+      .execute();
+    expect(rows).toHaveLength(0);
+
+    await destroy();
+  });
+
+  it('a parent alone fails while it still has clone rows', async () => {
+    const { db, destroy, engine } = await setup(['tyo1']);
+    const parentId = await seedMasterRule(db, { name: 'Parent', deletedAt: TS });
+    await seedMasterRule(db, { name: 'Clone A', parentId, deletedAt: TS });
+
+    const results = await engine.batchPurge([parentId]);
+    expect(results).toHaveLength(1);
+    expect(results[0]!.ok).toBe(false);
+    expect(results[0]!.error).toContain('linked clones');
 
     await destroy();
   });

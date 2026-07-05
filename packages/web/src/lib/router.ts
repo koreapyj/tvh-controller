@@ -29,6 +29,8 @@ export interface Route {
     | 'conflicts'
     | 'uploads';
   instanceId?: string;
+  /** sub-view within a page (rules: 'deleted' tab) */
+  sub?: 'deleted';
   /** query string at NAVIGATION time (in-page filter changes update the URL via replaceState without touching this) */
   search: string;
 }
@@ -47,7 +49,7 @@ function parse(pathname: string, search: string): Route {
     case 'recordings':
       return { page: 'recordings', search };
     case 'rules':
-      return { page: 'rules', search };
+      return { page: 'rules', sub: segs[1] === 'deleted' ? 'deleted' : undefined, search };
     case 'drift':
       return { page: 'drift', search };
     case 'conflicts':

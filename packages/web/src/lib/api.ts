@@ -122,7 +122,7 @@ export const api = {
   deleteRule: (id: string) => http<{ ok: boolean }>('DELETE', `/api/rules/${id}`),
   pushRule: (id: string) => http<unknown[]>('POST', `/api/rules/${id}/push`),
   batchRules: (
-    action: 'edit' | 'delete' | 'push',
+    action: 'edit' | 'delete' | 'push' | 'restore' | 'purge',
     ids: string[],
     patch?: Partial<MasterRulePayload>,
     instances?: Record<string, boolean>,

@@ -16,20 +16,25 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-export function ts(epoch: number | undefined): string {
-  if (!epoch) return '—';
-  return new Date(epoch * 1000).toLocaleString(undefined, {
-    month: 'short',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  });
+const pad = (n: number): string => String(n).padStart(2, '0');
+
+/** local-time `YYYY-MM-DD HH:mm:ss` (fixed format, no locale APIs) */
+function formatLocal(d: Date): string {
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+    `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  );
 }
 
-/** full date+time, always 24h */
+/** full date+time as local `YYYY-MM-DD HH:mm:ss` (always 24h, with seconds) */
+export function ts(epoch: number | undefined): string {
+  if (!epoch) return '—';
+  return formatLocal(new Date(epoch * 1000));
+}
+
+/** full date+time as local `YYYY-MM-DD HH:mm:ss` (always 24h, with seconds) */
 export function dateTime(iso: string): string {
-  return new Date(iso).toLocaleString(undefined, { hourCycle: 'h23' });
+  return formatLocal(new Date(iso));
 }
 
 export function duration(startEpoch?: number, stopEpoch?: number): string {

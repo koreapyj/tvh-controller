@@ -121,7 +121,7 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
 
   app.post<{
     Body: {
-      action?: 'edit' | 'delete' | 'push';
+      action?: 'edit' | 'delete' | 'push' | 'restore' | 'purge';
       ids?: string[];
       patch?: unknown;
       instances?: unknown;
@@ -134,6 +134,10 @@ export function registerRuleRoutes(app: FastifyInstance, ctx: AppContext): void 
         return sync().batchDelete(ids);
       case 'push':
         return sync().batchPush(ids);
+      case 'restore':
+        return sync().batchRestore(ids);
+      case 'purge':
+        return sync().batchPurge(ids);
       case 'edit': {
         const p = (patch ?? {}) as unknown;
         if (!Value.Check(PartialPayload, p)) {

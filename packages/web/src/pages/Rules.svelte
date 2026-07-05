@@ -61,7 +61,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   /** the Details modal shows a deleted rule (no sync state, no Edit) */
   let viewingDeleted = $state(false);
 
-  function openDeletedDetails(rule: MasterRule): void {
+  /** effective payload of a deleted rule: the parent (active or deleted) merged with its overlay */
+  function deletedEffective(rule: MasterRule): MasterRulePayload {
     const parent =
       rule.parentId
         ? (rules.find((r) => r.id === rule.parentId) ??
@@ -72,9 +73,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       parent && 'effectivePayload' in parent
         ? (parent as RuleWithStatus).effectivePayload
         : ((parent as MasterRule | null)?.payload ?? null);
-    const effectivePayload = rule.parentId
+    return rule.parentId
       ? ({ ...(parentPayload as MasterRulePayload), ...(rule.overlay ?? {}), name: rule.name } as MasterRulePayload)
       : ({ ...rule.payload, name: rule.name } as MasterRulePayload);
+  }
+
+  function openDeletedDetails(rule: MasterRule): void {
+    const parent =
+      rule.parentId
+        ? (rules.find((r) => r.id === rule.parentId) ??
+           deletedRules.find((r) => r.id === rule.parentId) ??
+           null)
+        : null;
+    const effectivePayload = deletedEffective(rule);
     viewingDeleted = true;
     viewing = {
       id: rule.id,
@@ -138,28 +149,43 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let filterChannels: string[] = $state([]);
   let filterComment: string | null = $state(null);
   let filterZeroMatch = $state(false);
+  let filterDeletedChannels: string[] = $state([]);
+  let filterDeletedComment: string | null = $state(null);
 
-  /** the /rules URL for the current filters, with the given overrides applied */
+  /** the URL for the current tab and its filters, with the given overrides
+   *  applied: `/rules` = Active, `/rules/deleted` = Deleted; both tabs share
+   *  the `channels`/`comment` param names (+ `zero` on Active only), and the
+   *  URL carries only the CURRENT tab's filters */
   function rulesUrl(
     over: { channels?: string[]; comment?: string | null; zero?: boolean } = {},
   ): string {
-    const channels = over.channels !== undefined ? over.channels : filterChannels;
-    const comment = over.comment !== undefined ? over.comment : filterComment;
+    const deleted = view === 'deleted';
+    const channels =
+      over.channels !== undefined ? over.channels : deleted ? filterDeletedChannels : filterChannels;
+    const comment =
+      over.comment !== undefined ? over.comment : deleted ? filterDeletedComment : filterComment;
     const zero = over.zero !== undefined ? over.zero : filterZeroMatch;
     const q = new URLSearchParams();
     if (channels.length) q.set('channels', JSON.stringify(channels));
     if (comment !== null) q.set('comment', comment);
-    if (zero) q.set('zero', '1');
+    if (!deleted && zero) q.set('zero', '1');
     const qs = q.toString();
-    return `/rules${qs ? `?${qs}` : ''}`;
+    return `${deleted ? '/rules/deleted' : '/rules'}${qs ? `?${qs}` : ''}`;
   }
 
-  // restore filters from the URL on (re)navigation
+  // restore the tab + its filters from the URL on (re)navigation — only the
+  // current tab's filter state is overwritten, the other tab keeps its own
   $effect(() => {
     const q = new URLSearchParams($route.search);
-    filterChannels = parseListParam(q.get('channels'));
-    filterComment = q.get('comment');
-    filterZeroMatch = q.get('zero') === '1';
+    view = $route.sub === 'deleted' ? 'deleted' : 'active';
+    if ($route.sub === 'deleted') {
+      filterDeletedChannels = parseListParam(q.get('channels'));
+      filterDeletedComment = q.get('comment');
+    } else {
+      filterChannels = parseListParam(q.get('channels'));
+      filterComment = q.get('comment');
+      filterZeroMatch = q.get('zero') === '1';
+    }
   });
 
   // mirror the active filters into the URL so they survive reload / are shareable
@@ -197,6 +223,24 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         (filterChannels.length === 0 || filterChannels.includes(chLabel(r.effectivePayload))) &&
         (filterComment === null || r.effectivePayload.comment === filterComment) &&
         (!filterZeroMatch || (r.enabled && r.upcomingMatches === 0)),
+    ),
+  );
+
+  const deletedChannelFilterOptions = $derived(
+    [...new Set(deletedRules.map((r) => chLabel(deletedEffective(r))).filter(Boolean))]
+      .sort()
+      .map((c) => ({ value: c, label: c })),
+  );
+  const deletedCommentFilterOptions = $derived(
+    [...new Set(deletedRules.map((r) => deletedEffective(r).comment).filter(Boolean))].sort(),
+  );
+
+  const filteredDeleted = $derived(
+    deletedRules.filter(
+      (r) =>
+        (filterDeletedChannels.length === 0 ||
+          filterDeletedChannels.includes(chLabel(deletedEffective(r)))) &&
+        (filterDeletedComment === null || deletedEffective(r).comment === filterDeletedComment),
     ),
   );
 
@@ -420,6 +464,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     selected = next;
   }
 
+  let selectedDeleted: Record<string, boolean> = $state({});
+
+  const selectedDeletedIds = $derived(filteredDeleted.filter((r) => selectedDeleted[r.id]).map((r) => r.id));
+  const allDeletedSelected = $derived(filteredDeleted.length > 0 && filteredDeleted.every((r) => selectedDeleted[r.id]));
+
+  function toggleSelectDeleted(id: string, checked: boolean): void {
+    selectedDeleted = { ...selectedDeleted, [id]: checked };
+  }
+  function toggleAllDeleted(checked: boolean): void {
+    const next = { ...selectedDeleted };
+    for (const r of filteredDeleted) next[r.id] = checked;
+    selectedDeleted = next;
+  }
+
   async function runRuleBatch(
     action: 'edit' | 'delete' | 'push',
     ids: string[],
@@ -498,6 +556,51 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     )
       return;
     await runRuleBatch('delete', ids);
+  }
+
+  async function runDeletedBatch(action: 'restore' | 'purge', ids: string[]): Promise<void> {
+    if (!ids.length) return;
+    busy = true;
+    try {
+      const res = await api.batchRules(action, ids);
+      const fails = res.filter((r) => !r.ok);
+      if (fails.length) {
+        notify.error(
+          `${fails.length} of ${res.length} failed: ${fails.slice(0, 3).map((f) => f.error ?? 'failed').join('; ')}`,
+        );
+      }
+      selectedDeleted = {};
+      await refreshDeleted();
+      if (action === 'restore') await refresh();
+    } catch (err) {
+      notify.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function batchRestore(): Promise<void> {
+    const ids = selectedDeletedIds;
+    if (!ids.length) return;
+    if (
+      !confirm(
+        `Restore ${ids.length} rule${ids.length === 1 ? '' : 's'} and push them back to their instances?`,
+      )
+    )
+      return;
+    await runDeletedBatch('restore', ids);
+  }
+
+  async function batchPurge(): Promise<void> {
+    const ids = selectedDeletedIds;
+    if (!ids.length) return;
+    if (
+      !confirm(
+        `PERMANENTLY delete ${ids.length} rule${ids.length === 1 ? '' : 's'}? This cannot be undone.`,
+      )
+    )
+      return;
+    await runDeletedBatch('purge', ids);
   }
 </script>
 
@@ -723,23 +826,97 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   Deleted rules were removed from the instances (their scheduled recordings cancelled) but are
   kept here. Restore pushes a rule back to its instances; purge removes it permanently.
 </p>
+
+<div class="toolbar">
+  <span style="display:flex;gap:6px;align-items:center">
+    <span style="margin:0">Channel</span>
+    <MultiSelectDropdown
+      options={deletedChannelFilterOptions}
+      selected={filterDeletedChannels}
+      onchange={(next) => (filterDeletedChannels = next)}
+      allLabel="All channels"
+      unit="channels"
+      searchPlaceholder="Search channel…"
+    />
+    <label for="rf-dcomment" style="margin:0">Comment</label>
+    <select id="rf-dcomment" style="width:auto" bind:value={filterDeletedComment}>
+      <option value={null}>(any)</option>
+      {#each deletedCommentFilterOptions as c}<option value={c}>{c}</option>{/each}
+    </select>
+    {#if filterDeletedChannels.length || filterDeletedComment !== null}
+      <button onclick={() => { filterDeletedChannels = []; filterDeletedComment = null; }}>Clear</button>
+      <span class="muted small">{filteredDeleted.length} / {deletedRules.length}</span>
+    {/if}
+  </span>
+</div>
+
+{#if selectedDeletedIds.length}
+  <div class="toolbar">
+    <span class="muted small">{selectedDeletedIds.length} selected</span>
+    <button disabled={busy} onclick={batchRestore}>Restore</button>
+    <button class="danger" disabled={busy} onclick={batchPurge}>Delete forever</button>
+    <button onclick={() => (selectedDeleted = {})}>Clear selection</button>
+  </div>
+{/if}
+
 <table class="m-cards">
   <thead>
     <tr>
+      <th style="width:28px">
+        <input
+          type="checkbox"
+          checked={allDeletedSelected}
+          onchange={(e) => toggleAllDeleted(e.currentTarget.checked)}
+          title="select all"
+        />
+      </th>
       <th>Rule</th>
+      <th>Channel</th>
+      <th>Comment</th>
       <th>Instances</th>
       <th>Deleted at</th>
       <th></th>
     </tr>
   </thead>
   <tbody>
-    {#each deletedRules as rule (rule.id)}
+    {#each filteredDeleted as rule (rule.id)}
+      {@const p = deletedEffective(rule)}
       <tr class="m-card">
         <td>
+          <input
+            type="checkbox"
+            checked={selectedDeleted[rule.id] ?? false}
+            onchange={(e) => toggleSelectDeleted(rule.id, e.currentTarget.checked)}
+            title="select"
+          />
+        </td>
+        <td>
+          {#if rule.parentId}<span class="muted">↳ </span>{/if}
           <button class="linklike" style="color:var(--text)" title="details" onclick={() => openDeletedDetails(rule)}>
             {rule.name}
           </button>
           {#if rule.parentId}<span class="badge info">linked clone</span>{/if}
+        </td>
+        <td class="small m-inline">
+          {#if p.channel}
+            {#if p.channel_number == null}
+              {@const n = resolvedNumber(p.channel)}
+              {#if n !== null}
+                <span class="muted" title="not pinned — targets the lowest-numbered channel with this name">{n}　</span>
+              {/if}
+            {/if}
+            <a class="linklike" title="filter by this channel" href={rulesUrl({ channels: [chLabel(p)] })}>
+              {chLabel(p)}
+            </a>
+          {:else}any{/if}
+          {#if rule.parentId && rule.overlay && ('channel' in rule.overlay || 'channel_number' in rule.overlay)}<span class="badge warn" title="overrides parent">override</span>{/if}
+        </td>
+        <td class="small m-inline">
+          {#if p.comment}
+            <a class="linklike" title="filter by this comment" href={rulesUrl({ comment: p.comment })}>
+              {p.comment}
+            </a>
+          {:else}<span class="muted m-hide">—</span>{/if}
         </td>
         <td class="small m-inline">
           <span class="m-only">on</span>

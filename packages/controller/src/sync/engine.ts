@@ -525,6 +525,44 @@ export class SyncEngine {
   }
 
   /**
+   * Restore many soft-deleted rules (pushes each back to its scoped
+   * instances). Parents are restored before clones — restoreRuleInner refuses
+   * a linked clone whose parent is still deleted.
+   */
+  batchRestore(ids: string[]): Promise<RuleBatchResult[]> {
+    return this.serialize(async () => {
+      const meta = await Promise.all(
+        ids.map(async (id) => ({ id, isClone: !!(await this.getRule(id))?.parentId })),
+      );
+      const order = meta
+        .slice()
+        .sort((a, b) => Number(a.isClone) - Number(b.isClone))
+        .map((m) => m.id);
+      return this.runBatch(order, async (id) => {
+        await this.restoreRuleInner(id);
+      });
+    });
+  }
+
+  /**
+   * Permanently remove many soft-deleted rules (no instance-side effect —
+   * that happened at delete time). Clones are purged before parents —
+   * purgeRuleInner refuses a parent that still has clone rows.
+   */
+  batchPurge(ids: string[]): Promise<RuleBatchResult[]> {
+    return this.serialize(async () => {
+      const meta = await Promise.all(
+        ids.map(async (id) => ({ id, isClone: !!(await this.getRule(id))?.parentId })),
+      );
+      const order = meta
+        .slice()
+        .sort((a, b) => Number(b.isClone) - Number(a.isClone))
+        .map((m) => m.id);
+      return this.runBatch(order, (id) => this.purgeRuleInner(id));
+    });
+  }
+
+  /**
    * Merge a field patch into many rules (master only — left pending until
    * pushed). `instanceEnabled` is an optional per-instance scope delta applied
    * to every rule: check = add the instance, uncheck = remove it (deletes the
@@ -623,44 +661,48 @@ export class SyncEngine {
 
   /** restore a soft-deleted rule and push it back to its scoped instances */
   restoreRule(id: string): Promise<PushResult[]> {
-    return this.serialize(async () => {
-      const rule = await this.getRule(id);
-      if (!rule) throw new Error(`rule ${id} not found`);
-      if (!rule.deletedAt) throw new Error(`rule "${rule.name}" is not deleted`);
-      if (rule.parentId) {
-        const parent = await this.getRule(rule.parentId);
-        if (!parent || parent.deletedAt) {
-          throw httpError(409, `cannot restore linked clone "${rule.name}" — restore its parent first`);
-        }
+    return this.serialize(() => this.restoreRuleInner(id));
+  }
+
+  private async restoreRuleInner(id: string): Promise<PushResult[]> {
+    const rule = await this.getRule(id);
+    if (!rule) throw new Error(`rule ${id} not found`);
+    if (!rule.deletedAt) throw new Error(`rule "${rule.name}" is not deleted`);
+    if (rule.parentId) {
+      const parent = await this.getRule(rule.parentId);
+      if (!parent || parent.deletedAt) {
+        throw httpError(409, `cannot restore linked clone "${rule.name}" — restore its parent first`);
       }
-      await this.db
-        .updateTable('master_rules')
-        .set({ deleted_at: null, updated_at: now() })
-        .where('id', '=', id)
-        .execute();
-      return this.pushRuleInner(id);
-    });
+    }
+    await this.db
+      .updateTable('master_rules')
+      .set({ deleted_at: null, updated_at: now() })
+      .where('id', '=', id)
+      .execute();
+    return this.pushRuleInner(id);
   }
 
   /** permanently remove a soft-deleted rule (no instance-side effect — that happened at delete time) */
   purgeRule(id: string): Promise<void> {
-    return this.serialize(async () => {
-      const rule = await this.getRule(id);
-      if (!rule) throw new Error(`rule ${id} not found`);
-      if (!rule.deletedAt) throw new Error(`rule "${rule.name}" is not deleted — delete it first`);
-      const children = await this.db
-        .selectFrom('master_rules')
-        .select('name')
-        .where('parent_id', '=', id)
-        .execute();
-      if (children.length) {
-        throw httpError(
-          409,
-          `rule still has linked clones (${children.map((c) => `"${c.name}"`).join(', ')}) — purge them first`,
-        );
-      }
-      await this.db.deleteFrom('master_rules').where('id', '=', id).execute();
-    });
+    return this.serialize(() => this.purgeRuleInner(id));
+  }
+
+  private async purgeRuleInner(id: string): Promise<void> {
+    const rule = await this.getRule(id);
+    if (!rule) throw new Error(`rule ${id} not found`);
+    if (!rule.deletedAt) throw new Error(`rule "${rule.name}" is not deleted — delete it first`);
+    const children = await this.db
+      .selectFrom('master_rules')
+      .select('name')
+      .where('parent_id', '=', id)
+      .execute();
+    if (children.length) {
+      throw httpError(
+        409,
+        `rule still has linked clones (${children.map((c) => `"${c.name}"`).join(', ')}) — purge them first`,
+      );
+    }
+    await this.db.deleteFrom('master_rules').where('id', '=', id).execute();
   }
 
   // ---------- push ----------
