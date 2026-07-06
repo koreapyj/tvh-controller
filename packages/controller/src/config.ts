@@ -29,6 +29,15 @@ export interface InstanceRcloneConfig {
   recordingPathPrefix?: { from: string; to: string };
 }
 
+export interface RestreamerNodeConfig {
+  id: string;
+  url: string;
+  /** public HLS base for viewer-facing segment URLs; absent = node not directly serveable */
+  serveUrl?: string;
+  /** expected serving bandwidth budget (Mbps), used by the rebalancer */
+  egressMbps?: number;
+}
+
 export interface InstanceConfig {
   id: string;
   name: string;
@@ -39,6 +48,16 @@ export interface InstanceConfig {
   /** UTC offset of the tvheadend host in minutes; overrides auto-detection via rclone rcd */
   serverOffsetMinutes?: number;
   rclone?: InstanceRcloneConfig;
+  /** restreamer daemon nodes at this tvheadend location; absent = feature off here */
+  restreamer?: { nodes: RestreamerNodeConfig[] };
+}
+
+/** standalone HLS switcher service (redundant-channel failover) */
+export interface SwitcherConfig {
+  id: string;
+  url: string;
+  /** viewer-facing base used for redundant-channel links in the M3U output */
+  publicUrl: string;
 }
 
 export interface AppConfig {
@@ -47,16 +66,19 @@ export interface AppConfig {
   /** null = run without persistence: overview only, rule sync and uploads disabled */
   databaseUrl: string | null;
   port: number;
-  pollIntervals: { dvr: number; autorec: number; topology: number; epg: number };
+  pollIntervals: { dvr: number; autorec: number; topology: number; epg: number; restreamer: number };
   overlapThreshold: number;
   /** auto-archive every finished recording's best copy */
   autoUpload: { enabled: boolean; graceSeconds: number };
+  /** standalone switcher service(s); absent = redundancy feature off */
+  restreamer?: { switchers: SwitcherConfig[] };
   webDistDir?: string;
 }
 
-interface RawInstance extends Omit<InstanceConfig, 'serverOffsetMinutes'> {
+interface RawInstance extends Omit<InstanceConfig, 'serverOffsetMinutes' | 'restreamer'> {
   /** "+09:00" style or minutes */
   serverOffset?: string | number;
+  restreamer?: { nodes?: RestreamerNodeConfig[] };
 }
 
 interface RawConfig {
@@ -67,6 +89,7 @@ interface RawConfig {
   autoUpload?: boolean | { enabled?: boolean; graceSeconds?: number };
   pollIntervals?: Partial<AppConfig['pollIntervals']>;
   overlapThreshold?: number;
+  restreamer?: { switchers?: SwitcherConfig[] };
 }
 
 /** "+09:00" / "-05:30" / minutes number -> minutes */
@@ -77,6 +100,49 @@ export function parseOffset(v: string | number | undefined): number | undefined 
   if (!m) throw new Error(`invalid UTC offset "${v}" — expected "+HH:MM" or minutes`);
   const sign = m[1] === '-' ? -1 : 1;
   return sign * (Number(m[2]) * 60 + Number(m[3]));
+}
+
+function parseRestreamerNodes(
+  instanceId: string,
+  raw: { nodes?: RestreamerNodeConfig[] } | undefined,
+): { nodes: RestreamerNodeConfig[] } | undefined {
+  if (!raw) return undefined;
+  const ids = new Set<string>();
+  const nodes = (raw.nodes ?? []).map((n) => {
+    if (!n.id) throw new Error(`instance "${instanceId}": restreamer node without an id`);
+    if (!n.url) throw new Error(`instance "${instanceId}": restreamer node "${n.id}" has no url`);
+    if (ids.has(n.id)) {
+      throw new Error(`instance "${instanceId}": duplicate restreamer node id "${n.id}"`);
+    }
+    ids.add(n.id);
+    return {
+      id: n.id,
+      url: n.url.replace(/\/+$/, ''),
+      serveUrl: n.serveUrl?.replace(/\/+$/, ''),
+      egressMbps: n.egressMbps,
+    };
+  });
+  return { nodes };
+}
+
+function parseSwitchers(
+  raw: { switchers?: SwitcherConfig[] } | undefined,
+): { switchers: SwitcherConfig[] } | undefined {
+  if (!raw) return undefined;
+  const ids = new Set<string>();
+  const switchers = (raw.switchers ?? []).map((s) => {
+    if (!s.id) throw new Error('restreamer switcher without an id');
+    if (!s.url) throw new Error(`restreamer switcher "${s.id}" has no url`);
+    if (!s.publicUrl) throw new Error(`restreamer switcher "${s.id}" has no publicUrl`);
+    if (ids.has(s.id)) throw new Error(`duplicate restreamer switcher id "${s.id}"`);
+    ids.add(s.id);
+    return {
+      id: s.id,
+      url: s.url.replace(/\/+$/, ''),
+      publicUrl: s.publicUrl.replace(/\/+$/, ''),
+    };
+  });
+  return { switchers };
 }
 
 function defaultConfigPath(): string {
@@ -124,6 +190,7 @@ export function loadConfig(path = defaultConfigPath()): AppConfig {
             recordingPathPrefix: i.rclone.recordingPathPrefix,
           }
         : undefined,
+      restreamer: parseRestreamerNodes(i.id, i.restreamer),
     };
   });
   return {
@@ -137,12 +204,14 @@ export function loadConfig(path = defaultConfigPath()): AppConfig {
       topology: raw.pollIntervals?.topology ?? 600_000,
       // EPG refreshes via the comet `epg` push; this is only the slow fallback
       epg: raw.pollIntervals?.epg ?? 600_000,
+      restreamer: raw.pollIntervals?.restreamer ?? 15_000,
     },
     overlapThreshold: raw.overlapThreshold ?? 0.7,
     autoUpload:
       typeof raw.autoUpload === 'object'
         ? { enabled: raw.autoUpload.enabled ?? true, graceSeconds: raw.autoUpload.graceSeconds ?? 120 }
         : { enabled: raw.autoUpload ?? false, graceSeconds: 120 },
+    restreamer: parseSwitchers(raw.restreamer),
     webDistDir: process.env.WEB_DIST_DIR,
   };
 }

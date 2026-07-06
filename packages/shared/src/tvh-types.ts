@@ -117,6 +117,10 @@ export interface TvhChannel {
   tags?: string[];
   /** service uuids mapped to this channel */
   services?: string[];
+  /** raw grid field: channel icon URL as tvheadend serves it (imagecache-resolved) */
+  icon_public_url?: string;
+  /** icon_public_url carried through topology normalization (camelCase for controller consumers) */
+  iconPublicUrl?: string;
 }
 
 export interface TvhChannelTag {
@@ -245,6 +249,8 @@ export interface TvhService {
   multiplex?: string;
   multiplex_uuid?: string;
   channel?: string[] | string;
+  /** MPEG-TS service id (program number) — drives `tsreadex -n` for restreams */
+  sid?: number;
 }
 
 export interface TvhNetwork {

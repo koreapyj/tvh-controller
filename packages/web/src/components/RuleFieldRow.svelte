@@ -133,6 +133,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <option value={String(o.value)}>{o.label}</option>
       {/each}
     </select>
+  {:else if spec.type === 'strenum'}
+    <select id="bf-{spec.key}" style="width:auto" {disabled} bind:value>
+      {#if mode !== 'batch'}
+        <option value="">
+          {mode === 'overlay' ? `inherit (${inheritPlaceholder ?? ''})` : '(default)'}
+        </option>
+      {/if}
+      {#each spec.strOptions ?? [] as o (o.value)}
+        <option value={o.value}>{o.label}</option>
+      {/each}
+    </select>
   {:else if spec.type === 'weekdays'}
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
       {#if mode === 'overlay'}

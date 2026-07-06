@@ -31,6 +31,8 @@ import type {
   TvhSubscription,
   ConflictWindow,
   InstanceSummary,
+  RestreamerNodeStatus,
+  SwitcherNodeStatus,
 } from '@tvhc/shared';
 
 export interface TopologySnapshot {
@@ -58,6 +60,8 @@ export interface InstanceSnapshot {
   autorecs: TvhAutorecRule[];
   topology: TopologySnapshot | null;
   conflicts: ConflictWindow[];
+  /** polled status of this location's restreamer daemon nodes (keyed by nodeId) */
+  restreamers: RestreamerNodeStatus[];
 }
 
 export function emptySnapshot(
@@ -86,11 +90,19 @@ export function emptySnapshot(
     autorecs: [],
     topology: null,
     conflicts: [],
+    restreamers: [],
   };
 }
 
 export class InstanceCache {
   private readonly snapshots = new Map<string, InstanceSnapshot>();
+
+  /**
+   * Polled status of the standalone switcher services, keyed by switcherId.
+   * Switchers are top-level (not per-instance), so they live beside the
+   * per-instance snapshots rather than inside one.
+   */
+  readonly switchers = new Map<string, SwitcherNodeStatus>();
 
   init(id: string, name: string, url: string, serverOffsetMinutes: number | null = null): void {
     this.snapshots.set(id, emptySnapshot(id, name, url, serverOffsetMinutes));

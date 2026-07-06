@@ -1,0 +1,395 @@
+/*
+ * tvh-controller - Centralized tvheadend controller
+ * Copyright (C) 2026 Yoonji Park
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+/**
+ * Switcher-side sync: computes the global switcher desired doc (redundant
+ * channels → upstream lists from placements × node serveUrls), pushes it with
+ * the same hash-skip/upsert/error semantics as node pushes
+ * (`restream_switcher_state` parallel to `restream_node_state`), and runs the
+ * slow rebalance driver over the pure policy in ./rebalance.ts.
+ *
+ * NOT serialized itself — RestreamerService owns the op chain and calls the
+ * *Inner methods from inside it, so switcher pushes interleave correctly with
+ * mutations and node pushes.
+ */
+
+import { RESTREAMER_API_VERSION } from '@tvhc/shared';
+import type {
+  PipelineParams,
+  SwitcherChannel,
+  SwitcherChannelStatus,
+  SwitcherDesiredState,
+  SwitcherNodeStatus,
+  SwitcherUpstream,
+} from '@tvhc/shared';
+import type { AppConfig, RestreamerNodeConfig } from '../config.js';
+import type { Db } from '../db/db.js';
+import type { EventBus } from '../state/events.js';
+import type { InstanceCache } from '../state/instanceCache.js';
+import type { SwitcherClient } from './client.js';
+import {
+  expectedChannelMbps,
+  planRebalance,
+  type RebalanceChannelInput,
+  type RebalanceNodeInput,
+} from './rebalance.js';
+import { sessionsHash } from './service.js';
+
+/** the client surface the sync actually uses (fakes implement exactly this) */
+export type SwitcherNodeClient = Pick<SwitcherClient, 'putDesired' | 'switchChannel'>;
+
+export interface SwitcherBlockedEntry {
+  channelId: string;
+  slug: string;
+  /** null = whole-channel reason (fewer than 2 usable upstreams) */
+  placementId: string | null;
+  reason: string;
+}
+
+export interface ComputedSwitcherDoc {
+  doc: SwitcherDesiredState;
+  blocked: SwitcherBlockedEntry[];
+}
+
+export interface SwitcherPushResult {
+  switcherId: string;
+  action: 'pushed' | 'skipped' | 'error';
+  detail?: string;
+  blocked: SwitcherBlockedEntry[];
+}
+
+interface RedundantGroup {
+  channelId: string;
+  slug: string;
+  profilePayload: string;
+  placements: Array<{
+    placementId: string;
+    instanceId: string;
+    nodeId: string;
+    priority: number;
+  }>;
+}
+
+function now(): string {
+  return new Date().toISOString().slice(0, 19).replace('T', ' ');
+}
+
+export class SwitcherSync {
+  constructor(
+    private readonly db: Db,
+    private readonly cache: InstanceCache,
+    private readonly bus: EventBus,
+    private readonly config: AppConfig,
+    /** keyed by switcherId */
+    private readonly clients: Map<string, SwitcherNodeClient>,
+  ) {}
+
+  private nodeConfig(instanceId: string, nodeId: string): RestreamerNodeConfig | null {
+    const inst = this.config.instances.find((i) => i.id === instanceId);
+    return inst?.restreamer?.nodes.find((n) => n.id === nodeId) ?? null;
+  }
+
+  /**
+   * Enabled channels with ≥2 enabled placements (the "redundant" set), with
+   * placements in (priority, id) order — the switcher's failover order.
+   */
+  private async redundantGroups(): Promise<RedundantGroup[]> {
+    const rows = await this.db
+      .selectFrom('restream_placements as p')
+      .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
+      .innerJoin('restream_profiles as pr', 'pr.id', 'c.profile_id')
+      .select([
+        'p.id as placement_id',
+        'p.instance_id',
+        'p.node_id',
+        'p.priority',
+        'c.id as channel_id',
+        'c.slug',
+        'pr.payload as profile_payload',
+      ])
+      .where('p.enabled', '=', 1)
+      .where('c.enabled', '=', 1)
+      .orderBy('c.slug')
+      .orderBy('p.priority')
+      .orderBy('p.id')
+      .execute();
+
+    const byChannel = new Map<string, RedundantGroup>();
+    for (const r of rows) {
+      let group = byChannel.get(r.channel_id);
+      if (!group) {
+        group = {
+          channelId: r.channel_id,
+          slug: r.slug,
+          profilePayload: r.profile_payload,
+          placements: [],
+        };
+        byChannel.set(r.channel_id, group);
+      }
+      group.placements.push({
+        placementId: r.placement_id,
+        instanceId: r.instance_id,
+        nodeId: r.node_id,
+        priority: r.priority,
+      });
+    }
+    return [...byChannel.values()].filter((g) => g.placements.length >= 2);
+  }
+
+  /**
+   * Global switcher desired doc (one doc, pushed to every configured
+   * switcher). Channels = enabled channels with ≥2 enabled placements;
+   * upstreams = placements in priority order at `<node serveUrl>/<slug>`.
+   * Placements on unknown or serveUrl-less nodes are skipped with a reason; a
+   * channel needs ≥2 usable upstreams or it is skipped with a reason too.
+   * Unlike node docs this never defers — no topology resolution is involved.
+   */
+  async computeDoc(): Promise<ComputedSwitcherDoc> {
+    const groups = await this.redundantGroups();
+    const channels: SwitcherChannel[] = [];
+    const blocked: SwitcherBlockedEntry[] = [];
+
+    for (const g of groups) {
+      const upstreams: SwitcherUpstream[] = [];
+      for (const p of g.placements) {
+        const nodeCfg = this.nodeConfig(p.instanceId, p.nodeId);
+        if (!nodeCfg) {
+          blocked.push({
+            channelId: g.channelId,
+            slug: g.slug,
+            placementId: p.placementId,
+            reason: `restreamer node "${p.nodeId}" is not configured on instance ${p.instanceId}`,
+          });
+          continue;
+        }
+        if (!nodeCfg.serveUrl) {
+          blocked.push({
+            channelId: g.channelId,
+            slug: g.slug,
+            placementId: p.placementId,
+            reason: `node ${p.instanceId}/${p.nodeId} has no serveUrl — unusable as a switcher upstream`,
+          });
+          continue;
+        }
+        upstreams.push({
+          id: p.placementId,
+          url: `${nodeCfg.serveUrl}/${g.slug}`,
+          priority: p.priority,
+        });
+      }
+      if (upstreams.length < 2) {
+        blocked.push({
+          channelId: g.channelId,
+          slug: g.slug,
+          placementId: null,
+          reason: `fewer than 2 usable upstreams (${upstreams.length}) — channel left out of the switcher doc`,
+        });
+        continue;
+      }
+      const payload = JSON.parse(g.profilePayload) as PipelineParams;
+      channels.push({
+        slug: g.slug,
+        segmentSeconds: payload.hls?.segmentSeconds ?? 5,
+        upstreams,
+      });
+    }
+
+    channels.sort((a, b) => a.slug.localeCompare(b.slug));
+    const doc: SwitcherDesiredState = {
+      apiVersion: RESTREAMER_API_VERSION,
+      revision: sessionsHash(channels),
+      channels,
+    };
+    return { doc, blocked };
+  }
+
+  private state(switcherId: string): Promise<{ pushed_hash: string } | undefined> {
+    return this.db
+      .selectFrom('restream_switcher_state')
+      .select('pushed_hash')
+      .where('switcher_id', '=', switcherId)
+      .executeTakeFirst();
+  }
+
+  /** push one switcher; semantics mirror RestreamerService.pushNodeInner */
+  async pushInner(
+    switcherId: string,
+    force = false,
+    precomputed?: ComputedSwitcherDoc,
+  ): Promise<SwitcherPushResult> {
+    try {
+      const { doc, blocked } = precomputed ?? (await this.computeDoc());
+      const state = await this.state(switcherId);
+      if (!force && state?.pushed_hash === doc.revision) {
+        this.updateStatus(switcherId, { pendingPush: false });
+        return { switcherId, action: 'skipped', detail: 'already up to date', blocked };
+      }
+      // never-pushed switcher with nothing to serve: leave it alone — pushing
+      // an empty doc to an unmanaged switcher would tear down whatever it does
+      if (!state && doc.channels.length === 0) {
+        return { switcherId, action: 'skipped', detail: 'nothing to manage', blocked };
+      }
+      const client = this.clients.get(switcherId);
+      if (!client) {
+        return { switcherId, action: 'error', detail: 'no client configured for switcher', blocked };
+      }
+      await client.putDesired(doc);
+      await this.db
+        .insertInto('restream_switcher_state')
+        .values({ switcher_id: switcherId, pushed_hash: doc.revision, pushed_at: now() })
+        .onDuplicateKeyUpdate({ pushed_hash: doc.revision, pushed_at: now() })
+        .execute();
+      this.updateStatus(switcherId, { pendingPush: false });
+      return { switcherId, action: 'pushed', blocked };
+    } catch (err) {
+      // failed push: the stored hash stays, the switcher stays pending — the
+      // 60s sweep (or the poller's revision-mismatch trigger) heals it later
+      const detail = err instanceof Error ? err.message : String(err);
+      this.updateStatus(switcherId, { pendingPush: true, error: detail });
+      return { switcherId, action: 'error', detail, blocked: [] };
+    }
+  }
+
+  /** one shared doc computation per pass — every switcher gets the same doc */
+  async pushAllInner(force = false): Promise<SwitcherPushResult[]> {
+    const switchers = this.config.restreamer?.switchers ?? [];
+    if (!switchers.length) return [];
+    let computed: ComputedSwitcherDoc | undefined;
+    try {
+      computed = await this.computeDoc();
+    } catch (err) {
+      // doc computation failed (database down): every switcher reports error
+      const detail = err instanceof Error ? err.message : String(err);
+      return switchers.map((sw) => ({
+        switcherId: sw.id,
+        action: 'error' as const,
+        detail,
+        blocked: [],
+      }));
+    }
+    const results: SwitcherPushResult[] = [];
+    for (const sw of switchers) {
+      results.push(await this.pushInner(sw.id, force, computed));
+    }
+    return results;
+  }
+
+  /**
+   * True when the computed doc differs from what the controller believes is
+   * pushed (twin of RestreamerService.getPendingPush, sans defer states).
+   */
+  async getPendingPush(switcherId: string): Promise<boolean> {
+    const { doc } = await this.computeDoc();
+    const state = await this.state(switcherId);
+    if (!state) return doc.channels.length > 0;
+    return state.pushed_hash !== doc.revision;
+  }
+
+  /** revision the switcher is expected to report (its last pushed doc hash) */
+  async getExpectedRevision(switcherId: string): Promise<string | null> {
+    const state = await this.state(switcherId);
+    return state?.pushed_hash ?? null;
+  }
+
+  /** patch a switcher's cached status and publish SSE `restreamer-switcher` on change */
+  private updateStatus(switcherId: string, patch: Partial<SwitcherNodeStatus>): void {
+    const current = this.cache.switchers.get(switcherId);
+    if (!current) return; // poller hasn't polled yet — its next tick reflects the state
+    const next = { ...current, ...patch };
+    if (JSON.stringify(next) === JSON.stringify(current)) return;
+    this.cache.switchers.set(switcherId, next);
+    this.bus.publish({ type: 'restreamer-switcher', data: next });
+  }
+
+  // ---------- rebalance driver ----------
+
+  /** first configured switcher whose polled status reports this slug */
+  private switcherForSlug(
+    slug: string,
+  ): { switcherId: string; channel: SwitcherChannelStatus } | null {
+    for (const sw of this.config.restreamer?.switchers ?? []) {
+      const channel = this.cache.switchers.get(sw.id)?.channels.find((c) => c.slug === slug);
+      if (channel) return { switcherId: sw.id, channel };
+    }
+    return null;
+  }
+
+  /**
+   * One rebalance evaluation: build the pure-policy input from the DB
+   * (redundant channels + profile bitrates), the switchers' polled status
+   * (active upstream, per-upstream health, last switch) and the config egress
+   * budgets, then execute the proposed move (at most one per pass) via the
+   * switcher's switch endpoint. Channels the switcher does not report yet are
+   * never rebalanced. Failures are logged, never thrown.
+   */
+  async rebalanceTickInner(nowDate = new Date()): Promise<void> {
+    const switchers = this.config.restreamer?.switchers ?? [];
+    if (!switchers.length) return;
+
+    const groups = await this.redundantGroups();
+    const channels: RebalanceChannelInput[] = [];
+    const switcherBySlug = new Map<string, string>();
+    for (const g of groups) {
+      const found = this.switcherForSlug(g.slug);
+      if (!found) continue; // never rebalance a channel the switcher doesn't know yet
+      switcherBySlug.set(g.slug, found.switcherId);
+      const health = new Map(found.channel.upstreams.map((u) => [u.id, u.healthy]));
+      const payload = JSON.parse(g.profilePayload) as PipelineParams;
+      channels.push({
+        slug: g.slug,
+        channelId: g.channelId,
+        expectedMbps: expectedChannelMbps(payload),
+        activePlacementId: found.channel.activeUpstreamId,
+        lastSwitchAt: found.channel.lastSwitch?.at ?? null,
+        upstreams: g.placements.map((p) => ({
+          placementId: p.placementId,
+          instanceId: p.instanceId,
+          nodeId: p.nodeId,
+          priority: p.priority,
+          // an upstream the switcher doesn't report is never a move target
+          healthy: health.get(p.placementId) ?? false,
+        })),
+      });
+    }
+
+    const nodes: RebalanceNodeInput[] = [];
+    for (const inst of this.config.instances) {
+      for (const n of inst.restreamer?.nodes ?? []) {
+        nodes.push({ instanceId: inst.id, nodeId: n.id, egressMbps: n.egressMbps ?? null });
+      }
+    }
+
+    const moves = planRebalance({ channels, nodes, now: nowDate });
+    for (const move of moves) {
+      const switcherId = switcherBySlug.get(move.slug)!;
+      const client = this.clients.get(switcherId);
+      if (!client) {
+        console.error(`restreamer: rebalance: no client for switcher ${switcherId}`);
+        continue;
+      }
+      try {
+        await client.switchChannel(move.slug, move.toPlacementId);
+        console.log(
+          `restreamer: rebalance switched "${move.slug}" to placement ${move.toPlacementId} via switcher ${switcherId}`,
+        );
+      } catch (err) {
+        console.error(`restreamer: rebalance switch of "${move.slug}" failed:`, err);
+      }
+    }
+  }
+}

@@ -27,7 +27,8 @@ export interface Route {
     | 'rules'
     | 'drift'
     | 'conflicts'
-    | 'uploads';
+    | 'uploads'
+    | 'restreamer';
   instanceId?: string;
   /** sub-view within a page (rules: 'deleted' tab) */
   sub?: 'deleted';
@@ -56,6 +57,8 @@ function parse(pathname: string, search: string): Route {
       return { page: 'conflicts', search };
     case 'uploads':
       return { page: 'uploads', search };
+    case 'restreamer':
+      return { page: 'restreamer', search };
     default:
       return { page: 'epg', search };
   }

@@ -25,6 +25,7 @@ import type {
 } from './tvh-types.js';
 import type { DriftItem, MasterRulePayload, RuleInstances, SyncState } from './master-rule.js';
 import type { UploadJob, UploadStatus } from './rclone-rc.js';
+import type { RestreamerNodeStatus, SwitcherNodeStatus } from './restreamer.js';
 
 export interface InstanceSummary {
   id: string;
@@ -237,4 +238,6 @@ export type SseEvent =
   | { type: 'epg'; data: { instanceId: string } }
   | { type: 'drift'; data: { items: DriftItem[] } }
   | { type: 'conflicts'; data: { instanceId: string; windows: ConflictWindow[] } }
-  | { type: 'upload-progress'; data: UploadJob };
+  | { type: 'upload-progress'; data: UploadJob }
+  | { type: 'restreamer'; data: RestreamerNodeStatus }
+  | { type: 'restreamer-switcher'; data: SwitcherNodeStatus };

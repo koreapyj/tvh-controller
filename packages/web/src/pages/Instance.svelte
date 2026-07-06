@@ -21,6 +21,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { latestWins } from '../lib/fetchGuard.js';
   import { ts } from '../lib/format.js';
   import { notify } from '../lib/notifications.js';
+  import { isRestreamSubscription, restreamSessionName } from '../lib/restreamFields.js';
   import { instances, recordingsTick, statusByInstance } from '../lib/stores.js';
 
   let { instanceId }: { instanceId: string } = $props();
@@ -118,7 +119,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="muted">No active inputs.</div>
   {/if}
 
-  <h2>Active subscriptions <span class="badge neutral">{subs.length}</span></h2>
+  {@const restreamCount = subs.filter(isRestreamSubscription).length}
+  <h2>
+    Active subscriptions <span class="badge neutral">{subs.length}</span>
+    {#if restreamCount > 0}<span class="badge info">{restreamCount} restream</span>{/if}
+  </h2>
   {#if subs.length}
     <table>
       <thead>
@@ -129,7 +134,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <tr>
             <td class="small">{s.title ?? ''}</td>
             <td class="small muted">{s.channel ?? s.service ?? ''}</td>
-            <td class="small muted">{s.client ?? s.hostname ?? s.username ?? ''}</td>
+            <td class="small muted">
+              {s.client ?? s.hostname ?? s.username ?? ''}
+              {#if isRestreamSubscription(s)}
+                {@const session = restreamSessionName(s)}
+                <span class="badge info" title={session ? `restream session ${session}` : 'restream'}>
+                  restream
+                </span>
+              {/if}
+            </td>
             <td class="small muted">{s.state ?? ''}</td>
             <td class="small muted" style="color:{(s.errors ?? 0) > 0 ? 'var(--bad)' : 'inherit'}">
               {s.errors ?? 0}

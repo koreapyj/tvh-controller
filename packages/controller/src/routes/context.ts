@@ -18,6 +18,9 @@
 
 import type { AppConfig } from '../config.js';
 import type { Db } from '../db/db.js';
+import type { RestreamerClient, SwitcherClient } from '../restreamer/client.js';
+import type { RestreamerPoller, SwitcherPoller } from '../restreamer/poller.js';
+import type { RestreamerService } from '../restreamer/service.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { SyncEngine } from '../sync/engine.js';
@@ -36,6 +39,14 @@ export interface AppContext {
   sync: SyncEngine | null;
   ledger: UploadLedger | null;
   dispatcher: UploadDispatcher | null;
+  /** null without a database — node status stays visible, mutations 503 */
+  restreamer: RestreamerService | null;
+  /** keyed by nodeKey(instanceId, nodeId); empty when no nodes are configured */
+  restreamerClients: Map<string, RestreamerClient>;
+  restreamerPollers: RestreamerPoller[];
+  /** keyed by switcherId; empty when no switchers are configured */
+  switcherClients: Map<string, SwitcherClient>;
+  switcherPollers: SwitcherPoller[];
 }
 
 // Re-exported so existing route handlers can keep importing httpError from

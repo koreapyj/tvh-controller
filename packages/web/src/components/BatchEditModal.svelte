@@ -92,9 +92,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             ? 'yes'
             : f.type === 'enum'
               ? (f.initial ?? String(f.options?.[0]?.value ?? ''))
-              : f.type === 'weekdays'
-                ? '1,2,3,4,5,6,7'
-                : '';
+              : f.type === 'strenum'
+                ? (f.initial ?? f.strOptions?.[0]?.value ?? '')
+                : f.type === 'weekdays'
+                  ? '1,2,3,4,5,6,7'
+                  : '';
       vals[f.key] = init;
       initialVals[f.key] = init;
     }

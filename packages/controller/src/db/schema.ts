@@ -88,9 +88,91 @@ export interface IgnoredOrphansTable {
   ignored_at: ColumnType<Date, string | undefined, never>;
 }
 
+/** named encoding profile; payload is a fully resolved PipelineParams */
+export interface RestreamProfilesTable {
+  id: string;
+  name: string;
+  /** PipelineParams JSON (wire contract) — pushed to daemons verbatim */
+  payload: string;
+  updated_at: ColumnType<Date, string, string>;
+}
+
+/** logical restream channel: one slug, one channel identity, one profile */
+export interface RestreamChannelsTable {
+  id: string;
+  /** output dir on every node + public URL segment */
+  slug: string;
+  channel_name: string;
+  /** STRING channel-number identity (e.g. "9.1", exact match); NULL = pin lowest-numbered */
+  channel_number: string | null;
+  /** one profile per logical channel — redundant encodes keep matching variant sets */
+  profile_id: string;
+  enabled: number;
+  comment: string | null;
+  updated_at: ColumnType<Date, string, string>;
+}
+
+/** one encode of a logical channel on one restreamer node (>1 per channel = redundant) */
+export interface RestreamPlacementsTable {
+  id: string;
+  channel_id: string;
+  instance_id: string;
+  node_id: string;
+  /** failover order — lower is preferred */
+  priority: number;
+  enabled: number;
+  /** tvheadend subscription weight override; NULL = daemon default */
+  weight: number | null;
+  /** manual program-number (service SID) override; NULL = derived channel→service→sid */
+  program_number: number | null;
+  updated_at: ColumnType<Date, string, string>;
+}
+
+/** last successfully pushed desired-doc hash per node (doc is atomic — one hash) */
+export interface RestreamNodeStateTable {
+  instance_id: string;
+  node_id: string;
+  pushed_hash: string;
+  pushed_at: ColumnType<Date, string, string>;
+}
+
+/** DB-managed master playlist, served at GET /playlists/<slug>.m3u */
+export interface RestreamPlaylistsTable {
+  id: string;
+  /** URL path segment */
+  slug: string;
+  title: string;
+  /** url-tvg for the generated M3U */
+  epg_url: string | null;
+  updated_at: ColumnType<Date, string, string>;
+}
+
+export interface RestreamPlaylistMembersTable {
+  playlist_id: string;
+  channel_id: string;
+}
+
+/**
+ * push state for switcher desired docs, parallel to restream_node_state.
+ * Active upstream selection is NOT stored here — the switcher's own state
+ * file is authoritative; the controller mirrors it via status poll.
+ */
+export interface RestreamSwitcherStateTable {
+  switcher_id: string;
+  pushed_hash: string;
+  pushed_at: ColumnType<Date, string, string>;
+}
+
 export interface Database {
   master_rules: MasterRulesTable;
   rule_bindings: RuleBindingsTable;
   uploads: UploadsTable;
   ignored_orphans: IgnoredOrphansTable;
+  restream_profiles: RestreamProfilesTable;
+  restream_channels: RestreamChannelsTable;
+  restream_placements: RestreamPlacementsTable;
+  restream_node_state: RestreamNodeStateTable;
+  restream_playlists: RestreamPlaylistsTable;
+  restream_playlist_members: RestreamPlaylistMembersTable;
+  restream_switcher_state: RestreamSwitcherStateTable;
 }

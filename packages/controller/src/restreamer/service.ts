@@ -1,0 +1,1682 @@
+/*
+ * tvh-controller - Centralized tvheadend controller
+ * Copyright (C) 2026 Yoonji Park
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+import { createHash, randomUUID } from 'node:crypto';
+import { Value } from '@sinclair/typebox/value';
+import {
+  PipelineParams,
+  RESTREAMER_API_VERSION,
+  chanNumberOrder,
+  type DesiredSession,
+  type DesiredState,
+  type RestreamChannel,
+  type RestreamChannelWithStatus,
+  type RestreamPlacement,
+  type RestreamPlaylist,
+  type RestreamProfile,
+  type RestreamerNodeStatus,
+  type SwitchReason,
+  type TvhChannel,
+} from '@tvhc/shared';
+import type { AppConfig, RestreamerNodeConfig } from '../config.js';
+import type { Db } from '../db/db.js';
+import type { EventBus } from '../state/events.js';
+import type { InstanceCache } from '../state/instanceCache.js';
+import type { InstancePoller } from '../tvh/poller.js';
+import { httpError } from '../util/httpError.js';
+import type { RestreamerClient } from './client.js';
+import type { RestreamerPollerHooks, SwitcherPollerHooks } from './poller.js';
+import {
+  SwitcherSync,
+  type ComputedSwitcherDoc,
+  type SwitcherNodeClient,
+  type SwitcherPushResult,
+} from './switcherSync.js';
+
+export type { ComputedSwitcherDoc, SwitcherNodeClient, SwitcherPushResult } from './switcherSync.js';
+
+/** the client surface the service actually uses (the fake node implements exactly this) */
+export type RestreamerNodeClient = Pick<RestreamerClient, 'putDesired' | 'getDesired'>;
+
+/** clients map key: one restreamer daemon node */
+export function nodeKey(instanceId: string, nodeId: string): string {
+  return `${instanceId}/${nodeId}`;
+}
+
+/** session-name / slug rule from the wire contract (also caps playlist slugs) */
+export const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+/**
+ * Default slug for a channel name: lowercase, every run of characters outside
+ * [a-z0-9-] collapsed to '-', edge dashes trimmed, capped at 64 chars. Never
+ * empty ('channel' fallback) so the SLUG_PATTERN always holds.
+ */
+export function deriveSlug(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+/, '')
+    .replace(/-+$/, '')
+    .slice(0, 64)
+    .replace(/-+$/, '');
+  return slug || 'channel';
+}
+
+/**
+ * Deterministic, key-ordered JSON — the doc-hash input. Unlike
+ * sync/normalize.ts#payloadHash (flat payloads, top-level sort only) the
+ * desired doc nests objects, so keys are sorted RECURSIVELY and undefined
+ * members dropped, exactly like JSON.stringify would.
+ */
+export function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map((x) => canonicalJson(x)).join(',')}]`;
+  if (v !== null && typeof v === 'object') {
+    const entries = Object.entries(v as Record<string, unknown>)
+      .filter(([, val]) => val !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([k, val]) => `${JSON.stringify(k)}:${canonicalJson(val)}`).join(',')}}`;
+  }
+  return JSON.stringify(v) ?? 'null';
+}
+
+/**
+ * Doc hash over an already-sorted array (node sessions or switcher channels).
+ * This IS the doc's `revision`: the daemon/switcher echoes it back as
+ * `desiredRevision`, so the stored pushed_hash doubles as the expected
+ * revision.
+ */
+export function sessionsHash(sessions: readonly unknown[]): string {
+  return createHash('sha256').update(canonicalJson(sessions)).digest('hex');
+}
+
+/**
+ * Validate + default-complete a profile payload against the vendored wire
+ * contract. Throws a 400-flavored error naming the first offending path.
+ */
+export function completePipelineParams(raw: unknown): PipelineParams {
+  const completed = Value.Default(PipelineParams, Value.Clone(raw));
+  if (!Value.Check(PipelineParams, completed)) {
+    const first = Value.Errors(PipelineParams, completed).First();
+    throw httpError(
+      400,
+      `invalid pipeline params${first ? ` at ${first.path || '/'}: ${first.message}` : ''}`,
+    );
+  }
+  return completed as PipelineParams;
+}
+
+/**
+ * Resolve a controller channel identity against one instance's channel grid.
+ * Identity is (name, number) with the number compared as an EXACT STRING
+ * ("9.1" never matches "9.10"); a null number picks the LOWEST-numbered
+ * same-name channel (numberless last, grid order breaks ties) — mirrors
+ * sync/resolve.ts#channelSetterValue.
+ */
+export function resolveTvhChannel(
+  channels: TvhChannel[],
+  name: string,
+  number: string | null,
+): TvhChannel | null {
+  if (number != null) {
+    return channels.find((c) => c.name === name && (c.number ?? null) === number) ?? null;
+  }
+  const matches = channels.filter((c) => c.name === name);
+  if (matches.length === 0) return null;
+  return matches.reduce((a, b) => (chanNumberOrder(b.number) < chanNumberOrder(a.number) ? b : a));
+}
+
+export interface PlacementInput {
+  instanceId: string;
+  nodeId: string;
+  /** failover order; default = current max + 1 */
+  priority?: number;
+  enabled?: boolean;
+  weight?: number | null;
+  programNumber?: number | null;
+}
+
+export interface CreateChannelInput {
+  channelName: string;
+  /** STRING identity ("9.1" ≠ "9.10"); absent/null = pin-lowest at write time */
+  channelNumber?: string | null;
+  profileId: string;
+  /** derived from channelName when absent */
+  slug?: string;
+  enabled?: boolean;
+  comment?: string | null;
+  playlistIds?: string[];
+  placements?: PlacementInput[];
+}
+
+export interface ChannelPatch {
+  channelName?: string;
+  /** explicit null = unpin (re-pinned to the lowest same-name number when resolvable) */
+  channelNumber?: string | null;
+  profileId?: string;
+  slug?: string;
+  enabled?: boolean;
+  comment?: string | null;
+  /** full replacement of playlist memberships */
+  playlistIds?: string[];
+}
+
+export interface PlacementPatch {
+  instanceId?: string;
+  nodeId?: string;
+  priority?: number;
+  enabled?: boolean;
+  weight?: number | null;
+  programNumber?: number | null;
+}
+
+export type ChannelBatchAction =
+  | 'edit'
+  | 'delete'
+  | 'enable'
+  | 'disable'
+  | 'add-playlist'
+  | 'remove-playlist';
+
+/** per-channel outcome of a batch operation (mirrors SyncEngine's RuleBatchResult) */
+export interface ChannelBatchResult {
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
+export interface BlockedPlacement {
+  placementId: string;
+  channelId: string;
+  slug: string;
+  reason: string;
+}
+
+export interface ComputedNodeDoc {
+  /** null when deferred */
+  doc: DesiredState | null;
+  blocked: BlockedPlacement[];
+  /**
+   * true = do NOT push: topology is not loaded yet (a refresh was triggered),
+   * or a blocked placement's session is in the currently-pushed doc — a
+   * full-doc replace would silently tear down a running stream on what may be
+   * a topology flap.
+   */
+  deferred: boolean;
+}
+
+export interface NodePushResult {
+  instanceId: string;
+  nodeId: string;
+  action: 'pushed' | 'skipped' | 'deferred' | 'error';
+  detail?: string;
+  blocked: BlockedPlacement[];
+}
+
+interface NodeRef {
+  instanceId: string;
+  nodeId: string;
+}
+
+function now(): string {
+  return new Date().toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/** never-hydrated / hydration-failed marker for the last-pushed-doc cache */
+const UNKNOWN = Symbol('unknown');
+
+/**
+ * Restreamer task allocation: owns the restream_* tables, computes each
+ * node's desired doc from placements × topology, and pushes it (hash-skip,
+ * 60s heal sweep). All mutations are serialized through the same
+ * promise-chain pattern as SyncEngine (public wrappers → private *Inner);
+ * every mutation ends by pushing the affected node(s) with errors logged, not
+ * thrown — a mutation must succeed while a node is down (the sweep heals).
+ */
+export class RestreamerService {
+  private opChain: Promise<unknown> = Promise.resolve();
+  /**
+   * Last doc each node is known to hold: set on successful push, hydrated
+   * lazily from the node (`getDesired`) when cold and the DB says something
+   * was pushed. Drives the blocked-defer decision.
+   */
+  private readonly lastPushedDocs = new Map<string, DesiredState | null>();
+  private sweepTimer: NodeJS.Timeout | null = null;
+  private rebalanceTimer: NodeJS.Timeout | null = null;
+  private readonly topologyDebounce = new Map<string, NodeJS.Timeout>();
+  /** switcher-side sync (desired doc, pushes, rebalance driver) — shares this op chain */
+  private readonly switcherSync: SwitcherSync;
+
+  constructor(
+    private readonly db: Db,
+    private readonly cache: InstanceCache,
+    private readonly pollers: Map<string, InstancePoller>,
+    private readonly bus: EventBus,
+    private readonly config: AppConfig,
+    /** keyed by nodeKey(instanceId, nodeId) */
+    private readonly clients: Map<string, RestreamerNodeClient>,
+    /** keyed by switcherId; empty = no switchers configured */
+    switcherClients: Map<string, SwitcherNodeClient> = new Map(),
+  ) {
+    this.switcherSync = new SwitcherSync(db, cache, bus, config, switcherClients);
+  }
+
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.opChain.then(fn, fn);
+    this.opChain = next.catch(() => {});
+    return next;
+  }
+
+  // ---------- config helpers ----------
+
+  private nodeConfig(instanceId: string, nodeId: string): RestreamerNodeConfig | null {
+    const inst = this.config.instances.find((i) => i.id === instanceId);
+    return inst?.restreamer?.nodes.find((n) => n.id === nodeId) ?? null;
+  }
+
+  private configuredNodes(): Array<NodeRef & { config: RestreamerNodeConfig }> {
+    const out: Array<NodeRef & { config: RestreamerNodeConfig }> = [];
+    for (const inst of this.config.instances) {
+      for (const node of inst.restreamer?.nodes ?? []) {
+        out.push({ instanceId: inst.id, nodeId: node.id, config: node });
+      }
+    }
+    return out;
+  }
+
+  // ---------- profile CRUD ----------
+
+  private rowToProfile(r: { id: string; name: string; payload: string; updated_at: Date }): RestreamProfile {
+    return {
+      id: r.id,
+      name: r.name,
+      payload: JSON.parse(r.payload) as PipelineParams,
+      updatedAt: new Date(r.updated_at).toISOString(),
+    };
+  }
+
+  async listProfiles(): Promise<RestreamProfile[]> {
+    const rows = await this.db.selectFrom('restream_profiles').selectAll().orderBy('name').execute();
+    return rows.map((r) => this.rowToProfile(r));
+  }
+
+  async getProfile(id: string): Promise<RestreamProfile | null> {
+    const r = await this.db
+      .selectFrom('restream_profiles')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst();
+    return r ? this.rowToProfile(r) : null;
+  }
+
+  createProfile(name: string, payload: unknown): Promise<RestreamProfile> {
+    return this.serialize(() => this.createProfileInner(name, payload));
+  }
+
+  private async createProfileInner(name: string, payload: unknown): Promise<RestreamProfile> {
+    if (!name.trim()) throw httpError(400, 'profile name must not be empty');
+    const completed = completePipelineParams(payload);
+    await this.assertProfileNameFree(name);
+    const id = randomUUID();
+    await this.db
+      .insertInto('restream_profiles')
+      .values({ id, name, payload: JSON.stringify(completed), updated_at: now() })
+      .execute();
+    return (await this.getProfile(id))!;
+  }
+
+  private async assertProfileNameFree(name: string, excludeId?: string): Promise<void> {
+    const clash = await this.db
+      .selectFrom('restream_profiles')
+      .select('id')
+      .where('name', '=', name)
+      .executeTakeFirst();
+    if (clash && clash.id !== excludeId) {
+      throw httpError(409, `a profile named "${name}" already exists`);
+    }
+  }
+
+  updateProfile(id: string, patch: { name?: string; payload?: unknown }): Promise<RestreamProfile> {
+    return this.serialize(() => this.updateProfileInner(id, patch));
+  }
+
+  private async updateProfileInner(
+    id: string,
+    patch: { name?: string; payload?: unknown },
+  ): Promise<RestreamProfile> {
+    const existing = await this.getProfile(id);
+    if (!existing) throw httpError(404, `profile ${id} not found`);
+    const name = patch.name ?? existing.name;
+    if (patch.name !== undefined) {
+      if (!name.trim()) throw httpError(400, 'profile name must not be empty');
+      await this.assertProfileNameFree(name, id);
+    }
+    const payload =
+      patch.payload !== undefined ? completePipelineParams(patch.payload) : existing.payload;
+    await this.db
+      .updateTable('restream_profiles')
+      .set({ name, payload: JSON.stringify(payload), updated_at: now() })
+      .where('id', '=', id)
+      .execute();
+    // re-push every node hosting a placement of a channel using this profile;
+    // the switcher doc depends on the payload too (hls.segmentSeconds)
+    if (patch.payload !== undefined) {
+      await this.pushAffectedByProfileInner(id).catch((err) =>
+        console.error('restreamer: profile re-push failed:', err),
+      );
+      await this.pushAllSwitchersSafe();
+    }
+    return (await this.getProfile(id))!;
+  }
+
+  deleteProfile(id: string): Promise<void> {
+    return this.serialize(() => this.deleteProfileInner(id));
+  }
+
+  private async deleteProfileInner(id: string): Promise<void> {
+    const existing = await this.getProfile(id);
+    if (!existing) throw httpError(404, `profile ${id} not found`);
+    // app-level check first — the FK RESTRICT is only the backstop
+    const refs = await this.db
+      .selectFrom('restream_channels')
+      .select('slug')
+      .where('profile_id', '=', id)
+      .execute();
+    if (refs.length) {
+      const names = refs
+        .slice(0, 5)
+        .map((r) => `"${r.slug}"`)
+        .join(', ');
+      throw httpError(
+        409,
+        `profile "${existing.name}" is used by ${refs.length} channel(s) (${names}${refs.length > 5 ? ', …' : ''}) — reassign them first`,
+      );
+    }
+    await this.db.deleteFrom('restream_profiles').where('id', '=', id).execute();
+  }
+
+  // ---------- channel CRUD ----------
+
+  private rowToChannel(
+    r: {
+      id: string;
+      slug: string;
+      channel_name: string;
+      channel_number: string | null;
+      profile_id: string;
+      enabled: number;
+      comment: string | null;
+      updated_at: Date;
+    },
+    playlistIds: string[],
+  ): RestreamChannel {
+    return {
+      id: r.id,
+      slug: r.slug,
+      channelName: r.channel_name,
+      channelNumber: r.channel_number,
+      profileId: r.profile_id,
+      enabled: !!r.enabled,
+      comment: r.comment,
+      playlistIds,
+      updatedAt: new Date(r.updated_at).toISOString(),
+    };
+  }
+
+  private rowToPlacement(r: {
+    id: string;
+    channel_id: string;
+    instance_id: string;
+    node_id: string;
+    priority: number;
+    enabled: number;
+    weight: number | null;
+    program_number: number | null;
+    updated_at: Date;
+  }): RestreamPlacement {
+    return {
+      id: r.id,
+      channelId: r.channel_id,
+      instanceId: r.instance_id,
+      nodeId: r.node_id,
+      priority: r.priority,
+      enabled: !!r.enabled,
+      weight: r.weight,
+      programNumber: r.program_number,
+      updatedAt: new Date(r.updated_at).toISOString(),
+    };
+  }
+
+  private async channelPlaylistIds(channelId: string): Promise<string[]> {
+    const rows = await this.db
+      .selectFrom('restream_playlist_members')
+      .select('playlist_id')
+      .where('channel_id', '=', channelId)
+      .execute();
+    return rows.map((r) => r.playlist_id);
+  }
+
+  async getChannel(id: string): Promise<RestreamChannel | null> {
+    const r = await this.db
+      .selectFrom('restream_channels')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst();
+    return r ? this.rowToChannel(r, await this.channelPlaylistIds(id)) : null;
+  }
+
+  /**
+   * Every logical channel with live status folded in: profile name,
+   * placements (blockedReason from the same resolution rules the desired doc
+   * uses + live session from the node's last poll), switcher-side active
+   * placement, and the viewer-facing playback URL.
+   */
+  async listChannels(): Promise<RestreamChannelWithStatus[]> {
+    const [channels, profiles, placements, members] = await Promise.all([
+      this.db.selectFrom('restream_channels').selectAll().orderBy('slug').execute(),
+      this.db.selectFrom('restream_profiles').selectAll().execute(),
+      this.db
+        .selectFrom('restream_placements')
+        .selectAll()
+        .orderBy('priority')
+        .orderBy('id')
+        .execute(),
+      this.db.selectFrom('restream_playlist_members').selectAll().execute(),
+    ]);
+    const profileNames = new Map(profiles.map((p) => [p.id, p.name]));
+
+    return channels.map((c) => {
+      const chanPlacements = placements.filter((p) => p.channel_id === c.id);
+      const playlistIds = members.filter((m) => m.channel_id === c.id).map((m) => m.playlist_id);
+      const withStatus = chanPlacements.map((p) => {
+        const resolution = this.resolvePlacement(
+          p.instance_id,
+          p.node_id,
+          c.channel_name,
+          c.channel_number,
+          p.program_number,
+        );
+        const nodeStatus = this.cachedNodeStatus(p.instance_id, p.node_id);
+        return {
+          ...this.rowToPlacement(p),
+          blockedReason: resolution.ok ? null : resolution.reason,
+          session: nodeStatus?.sessions.find((s) => s.name === c.slug) ?? null,
+        };
+      });
+      const { activePlacementId, lastSwitch } = this.switcherView(c.slug);
+      return {
+        ...this.rowToChannel(c, playlistIds),
+        profileName: profileNames.get(c.profile_id) ?? c.profile_id,
+        placements: withStatus,
+        activePlacementId,
+        lastSwitch,
+        playbackUrl: this.playbackUrl(
+          c.slug,
+          chanPlacements.filter((p) => !!p.enabled),
+        ),
+      };
+    });
+  }
+
+  private cachedNodeStatus(instanceId: string, nodeId: string): RestreamerNodeStatus | null {
+    if (!this.cache.has(instanceId)) return null;
+    return this.cache.get(instanceId).restreamers.find((r) => r.nodeId === nodeId) ?? null;
+  }
+
+  private switcherView(slug: string): {
+    activePlacementId: string | null;
+    lastSwitch: { at: string; from: string | null; to: string; reason: SwitchReason } | null;
+  } {
+    for (const sw of this.config.restreamer?.switchers ?? []) {
+      const status = this.cache.switchers.get(sw.id);
+      const chan = status?.channels.find((ch) => ch.slug === slug);
+      if (chan) return { activePlacementId: chan.activeUpstreamId, lastSwitch: chan.lastSwitch };
+    }
+    return { activePlacementId: null, lastSwitch: null };
+  }
+
+  /**
+   * Viewer-facing URL: one enabled placement → straight at that node's
+   * serveUrl; several (redundant channel) → the first configured switcher's
+   * public base; none serveable → null.
+   */
+  private playbackUrl(
+    slug: string,
+    enabledPlacements: Array<{ instance_id: string; node_id: string }>,
+  ): string | null {
+    if (enabledPlacements.length === 0) return null;
+    if (enabledPlacements.length === 1) {
+      const p = enabledPlacements[0]!;
+      const serveUrl = this.nodeConfig(p.instance_id, p.node_id)?.serveUrl;
+      return serveUrl ? `${serveUrl}/${slug}/playlist.m3u8` : null;
+    }
+    const sw = this.config.restreamer?.switchers[0];
+    return sw ? `${sw.publicUrl}/hls/${slug}/playlist.m3u8` : null;
+  }
+
+  createChannel(input: CreateChannelInput): Promise<RestreamChannel> {
+    return this.serialize(() => this.createChannelInner(input));
+  }
+
+  private async createChannelInner(input: CreateChannelInput): Promise<RestreamChannel> {
+    if (!input.channelName) throw httpError(400, 'channelName must not be empty');
+    const profile = await this.getProfile(input.profileId);
+    if (!profile) throw httpError(400, `profile ${input.profileId} not found`);
+
+    const placements = input.placements ?? [];
+    const placementKeys = new Set<string>();
+    for (const p of placements) {
+      this.assertNodeConfigured(p.instanceId, p.nodeId);
+      const key = nodeKey(p.instanceId, p.nodeId);
+      if (placementKeys.has(key)) {
+        throw httpError(409, `duplicate placement on node "${key}"`);
+      }
+      placementKeys.add(key);
+    }
+
+    // channel number identity: given → stored verbatim as a STRING; absent →
+    // write-time pin to the lowest-numbered same-name channel across the
+    // instances that will host placements (unresolvable stays null)
+    let channelNumber =
+      input.channelNumber == null ? null : String(input.channelNumber);
+    if (channelNumber == null) {
+      channelNumber = this.pinChannelNumber(
+        input.channelName,
+        placements.map((p) => p.instanceId),
+      );
+    }
+
+    const slug = input.slug
+      ? await this.validateExplicitSlug(input.slug)
+      : await this.uniqueChannelSlug(deriveSlug(input.channelName));
+
+    const playlistIds = [...new Set(input.playlistIds ?? [])];
+    await this.assertPlaylistsExist(playlistIds);
+
+    const id = randomUUID();
+    await this.db
+      .insertInto('restream_channels')
+      .values({
+        id,
+        slug,
+        channel_name: input.channelName,
+        channel_number: channelNumber,
+        profile_id: input.profileId,
+        enabled: input.enabled === false ? 0 : 1,
+        comment: input.comment ?? null,
+        updated_at: now(),
+      })
+      .execute();
+
+    let priority = 0;
+    for (const p of placements) {
+      priority = p.priority ?? priority + 1;
+      await this.db
+        .insertInto('restream_placements')
+        .values({
+          id: randomUUID(),
+          channel_id: id,
+          instance_id: p.instanceId,
+          node_id: p.nodeId,
+          priority,
+          enabled: p.enabled === false ? 0 : 1,
+          weight: p.weight ?? null,
+          program_number: p.programNumber ?? null,
+          updated_at: now(),
+        })
+        .execute();
+    }
+
+    for (const playlistId of playlistIds) {
+      await this.db
+        .insertInto('restream_playlist_members')
+        .values({ playlist_id: playlistId, channel_id: id })
+        .execute();
+    }
+
+    await this.pushAffectedByChannelSafe(id);
+    return (await this.getChannel(id))!;
+  }
+
+  updateChannel(id: string, patch: ChannelPatch): Promise<RestreamChannel> {
+    return this.serialize(() => this.updateChannelInner(id, patch));
+  }
+
+  private async updateChannelInner(id: string, patch: ChannelPatch): Promise<RestreamChannel> {
+    const existing = await this.db
+      .selectFrom('restream_channels')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst();
+    if (!existing) throw httpError(404, `restream channel ${id} not found`);
+
+    const nameSet = patch.channelName !== undefined;
+    const numberSet = patch.channelNumber !== undefined;
+    const channelName = nameSet ? patch.channelName! : existing.channel_name;
+    if (nameSet && !channelName) throw httpError(400, 'channelName must not be empty');
+
+    // channel identity is a (name, number) pair: a patch that sets the name
+    // WITHOUT an explicit number must never inherit the previous pin
+    let channelNumber: string | null;
+    if (numberSet) channelNumber = patch.channelNumber == null ? null : String(patch.channelNumber);
+    else if (nameSet) channelNumber = null;
+    else channelNumber = existing.channel_number;
+
+    // write-time pin-lowest across the instances hosting this channel
+    if (channelNumber == null && (nameSet || numberSet)) {
+      const placementRows = await this.db
+        .selectFrom('restream_placements')
+        .select('instance_id')
+        .where('channel_id', '=', id)
+        .execute();
+      channelNumber = this.pinChannelNumber(
+        channelName,
+        placementRows.map((p) => p.instance_id),
+      );
+    }
+
+    let slug = existing.slug;
+    if (patch.slug !== undefined && patch.slug !== existing.slug) {
+      slug = await this.validateExplicitSlug(patch.slug, id);
+    }
+
+    let profileId = existing.profile_id;
+    if (patch.profileId !== undefined && patch.profileId !== existing.profile_id) {
+      const profile = await this.getProfile(patch.profileId);
+      if (!profile) throw httpError(400, `profile ${patch.profileId} not found`);
+      profileId = patch.profileId;
+    }
+
+    await this.db
+      .updateTable('restream_channels')
+      .set({
+        channel_name: channelName,
+        channel_number: channelNumber,
+        slug,
+        profile_id: profileId,
+        enabled: patch.enabled === undefined ? existing.enabled : patch.enabled ? 1 : 0,
+        comment: patch.comment === undefined ? existing.comment : patch.comment,
+        updated_at: now(),
+      })
+      .where('id', '=', id)
+      .execute();
+
+    if (patch.playlistIds !== undefined) {
+      await this.setChannelPlaylistsInner(id, patch.playlistIds);
+    }
+
+    await this.pushAffectedByChannelSafe(id);
+    return (await this.getChannel(id))!;
+  }
+
+  deleteChannel(id: string): Promise<void> {
+    return this.serialize(() => this.deleteChannelInner(id));
+  }
+
+  private async deleteChannelInner(id: string): Promise<void> {
+    const existing = await this.getChannel(id);
+    if (!existing) throw httpError(404, `restream channel ${id} not found`);
+    // affected nodes must be captured BEFORE the cascade removes the placements
+    const nodes = await this.affectedNodesByChannel(id);
+    await this.db.deleteFrom('restream_channels').where('id', '=', id).execute();
+    await this.pushNodesSafe(nodes);
+  }
+
+  /**
+   * Batch channel operation with per-id outcomes: one failing channel never
+   * aborts the rest (mirrors SyncEngine's batch results).
+   */
+  batchChannels(
+    action: ChannelBatchAction,
+    ids: string[],
+    opts: { patch?: ChannelPatch; playlistId?: string } = {},
+  ): Promise<ChannelBatchResult[]> {
+    return this.serialize(async () => {
+      const out: ChannelBatchResult[] = [];
+      for (const id of ids) {
+        try {
+          await this.applyBatchAction(action, id, opts);
+          out.push({ id, ok: true });
+        } catch (err) {
+          out.push({ id, ok: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      return out;
+    });
+  }
+
+  private async applyBatchAction(
+    action: ChannelBatchAction,
+    id: string,
+    opts: { patch?: ChannelPatch; playlistId?: string },
+  ): Promise<void> {
+    switch (action) {
+      case 'edit': {
+        const patch = { ...(opts.patch ?? {}) };
+        delete patch.slug; // slugs stay per-channel unique — never batch-assigned
+        await this.updateChannelInner(id, patch);
+        break;
+      }
+      case 'delete':
+        await this.deleteChannelInner(id);
+        break;
+      case 'enable':
+        await this.updateChannelInner(id, { enabled: true });
+        break;
+      case 'disable':
+        await this.updateChannelInner(id, { enabled: false });
+        break;
+      case 'add-playlist': {
+        if (!opts.playlistId) throw httpError(400, 'playlistId is required');
+        await this.assertPlaylistsExist([opts.playlistId]);
+        const channel = await this.getChannel(id);
+        if (!channel) throw httpError(404, `restream channel ${id} not found`);
+        if (!channel.playlistIds.includes(opts.playlistId)) {
+          await this.db
+            .insertInto('restream_playlist_members')
+            .values({ playlist_id: opts.playlistId, channel_id: id })
+            .execute();
+        }
+        break;
+      }
+      case 'remove-playlist': {
+        if (!opts.playlistId) throw httpError(400, 'playlistId is required');
+        const channel = await this.getChannel(id);
+        if (!channel) throw httpError(404, `restream channel ${id} not found`);
+        await this.db
+          .deleteFrom('restream_playlist_members')
+          .where('playlist_id', '=', opts.playlistId)
+          .where('channel_id', '=', id)
+          .execute();
+        break;
+      }
+    }
+  }
+
+  // ---------- channel identity / slug helpers ----------
+
+  /**
+   * Write-time pin: lowest-numbered channel with this name (chanNumberOrder,
+   * ordering only — identity stays exact-string) across the instances that
+   * host placements of the channel. Null when nothing resolves — push-time
+   * resolution then falls back to lowest-at-compute per instance.
+   */
+  private pinChannelNumber(channelName: string, instanceIds: string[]): string | null {
+    let lowest: string | null = null;
+    for (const id of new Set(instanceIds)) {
+      if (!this.cache.has(id)) continue;
+      const topo = this.cache.get(id).topology;
+      if (!topo) continue;
+      for (const c of topo.channels) {
+        if (
+          c.name === channelName &&
+          c.number != null &&
+          (lowest == null || chanNumberOrder(c.number) < chanNumberOrder(lowest))
+        ) {
+          lowest = c.number;
+        }
+      }
+    }
+    return lowest;
+  }
+
+  private async takenChannelSlugs(excludeId?: string): Promise<Set<string>> {
+    const rows = await this.db.selectFrom('restream_channels').select(['id', 'slug']).execute();
+    return new Set(rows.filter((r) => r.id !== excludeId).map((r) => r.slug));
+  }
+
+  private async uniqueChannelSlug(base: string, excludeId?: string): Promise<string> {
+    const taken = await this.takenChannelSlugs(excludeId);
+    if (!taken.has(base)) return base;
+    for (let n = 2; ; n++) {
+      const suffix = `-${n}`;
+      const candidate = `${base.slice(0, 64 - suffix.length).replace(/-+$/, '')}${suffix}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+  }
+
+  private async validateExplicitSlug(slug: string, excludeId?: string): Promise<string> {
+    if (!SLUG_PATTERN.test(slug)) {
+      throw httpError(
+        400,
+        `invalid slug "${slug}" — must match ${SLUG_PATTERN.source} (lowercase alphanumerics and dashes, starting alphanumeric, max 64 chars)`,
+      );
+    }
+    const taken = await this.takenChannelSlugs(excludeId);
+    if (taken.has(slug)) throw httpError(409, `slug "${slug}" is already in use`);
+    return slug;
+  }
+
+  private assertNodeConfigured(instanceId: string, nodeId: string): void {
+    const inst = this.config.instances.find((i) => i.id === instanceId);
+    if (!inst) throw httpError(400, `unknown instance "${instanceId}"`);
+    if (!inst.restreamer?.nodes.some((n) => n.id === nodeId)) {
+      throw httpError(400, `instance "${instanceId}" has no restreamer node "${nodeId}"`);
+    }
+  }
+
+  // ---------- placement CRUD ----------
+
+  addPlacement(channelId: string, input: PlacementInput): Promise<RestreamPlacement> {
+    return this.serialize(() => this.addPlacementInner(channelId, input));
+  }
+
+  private async addPlacementInner(
+    channelId: string,
+    input: PlacementInput,
+  ): Promise<RestreamPlacement> {
+    const channel = await this.getChannel(channelId);
+    if (!channel) throw httpError(404, `restream channel ${channelId} not found`);
+    this.assertNodeConfigured(input.instanceId, input.nodeId);
+
+    const existing = await this.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .execute();
+    if (existing.some((p) => p.instance_id === input.instanceId && p.node_id === input.nodeId)) {
+      throw httpError(
+        409,
+        `channel "${channel.slug}" already has a placement on ${nodeKey(input.instanceId, input.nodeId)}`,
+      );
+    }
+    const priority =
+      input.priority ?? (existing.length ? Math.max(...existing.map((p) => p.priority)) + 1 : 1);
+
+    const id = randomUUID();
+    await this.db
+      .insertInto('restream_placements')
+      .values({
+        id,
+        channel_id: channelId,
+        instance_id: input.instanceId,
+        node_id: input.nodeId,
+        priority,
+        enabled: input.enabled === false ? 0 : 1,
+        weight: input.weight ?? null,
+        program_number: input.programNumber ?? null,
+        updated_at: now(),
+      })
+      .execute();
+
+    await this.pushNodesSafe([{ instanceId: input.instanceId, nodeId: input.nodeId }]);
+    const row = await this.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirstOrThrow();
+    return this.rowToPlacement(row);
+  }
+
+  updatePlacement(id: string, patch: PlacementPatch): Promise<RestreamPlacement> {
+    return this.serialize(() => this.updatePlacementInner(id, patch));
+  }
+
+  private async updatePlacementInner(id: string, patch: PlacementPatch): Promise<RestreamPlacement> {
+    const existing = await this.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst();
+    if (!existing) throw httpError(404, `placement ${id} not found`);
+
+    const instanceId = patch.instanceId ?? existing.instance_id;
+    const nodeId = patch.nodeId ?? existing.node_id;
+    const moved = instanceId !== existing.instance_id || nodeId !== existing.node_id;
+    if (moved) {
+      this.assertNodeConfigured(instanceId, nodeId);
+      const clash = await this.db
+        .selectFrom('restream_placements')
+        .select('id')
+        .where('channel_id', '=', existing.channel_id)
+        .where('instance_id', '=', instanceId)
+        .where('node_id', '=', nodeId)
+        .executeTakeFirst();
+      if (clash) {
+        throw httpError(409, `channel already has a placement on ${nodeKey(instanceId, nodeId)}`);
+      }
+    }
+
+    await this.db
+      .updateTable('restream_placements')
+      .set({
+        instance_id: instanceId,
+        node_id: nodeId,
+        priority: patch.priority ?? existing.priority,
+        enabled: patch.enabled === undefined ? existing.enabled : patch.enabled ? 1 : 0,
+        weight: patch.weight === undefined ? existing.weight : patch.weight,
+        program_number:
+          patch.programNumber === undefined ? existing.program_number : patch.programNumber,
+        updated_at: now(),
+      })
+      .where('id', '=', id)
+      .execute();
+
+    // a moved placement affects the OLD node (session leaves) and the NEW one
+    await this.pushNodesSafe([
+      { instanceId: existing.instance_id, nodeId: existing.node_id },
+      { instanceId, nodeId },
+    ]);
+    const row = await this.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirstOrThrow();
+    return this.rowToPlacement(row);
+  }
+
+  deletePlacement(id: string): Promise<void> {
+    return this.serialize(() => this.deletePlacementInner(id));
+  }
+
+  private async deletePlacementInner(id: string): Promise<void> {
+    const existing = await this.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst();
+    if (!existing) throw httpError(404, `placement ${id} not found`);
+    await this.db.deleteFrom('restream_placements').where('id', '=', id).execute();
+    await this.pushNodesSafe([{ instanceId: existing.instance_id, nodeId: existing.node_id }]);
+  }
+
+  /** rewrite failover order: orderedPlacementIds must be exactly the channel's placements */
+  reorderPlacements(channelId: string, orderedPlacementIds: string[]): Promise<void> {
+    return this.serialize(() => this.reorderPlacementsInner(channelId, orderedPlacementIds));
+  }
+
+  private async reorderPlacementsInner(
+    channelId: string,
+    orderedPlacementIds: string[],
+  ): Promise<void> {
+    const rows = await this.db
+      .selectFrom('restream_placements')
+      .select('id')
+      .where('channel_id', '=', channelId)
+      .execute();
+    const existing = new Set(rows.map((r) => r.id));
+    const unique = new Set(orderedPlacementIds);
+    if (
+      unique.size !== orderedPlacementIds.length ||
+      orderedPlacementIds.length !== rows.length ||
+      orderedPlacementIds.some((id) => !existing.has(id))
+    ) {
+      throw httpError(400, 'orderedPlacementIds must list each of the channel’s placements exactly once');
+    }
+    for (const [index, id] of orderedPlacementIds.entries()) {
+      await this.db
+        .updateTable('restream_placements')
+        .set({ priority: index + 1, updated_at: now() })
+        .where('id', '=', id)
+        .execute();
+    }
+    // priority is not part of the node doc (hash-skip makes this free), but the
+    // mutation-ends-with-push invariant keeps future doc fields covered
+    await this.pushAffectedByChannelSafe(channelId);
+  }
+
+  // ---------- playlist CRUD ----------
+
+  private rowToPlaylist(r: {
+    id: string;
+    slug: string;
+    title: string;
+    epg_url: string | null;
+    updated_at: Date;
+  }): RestreamPlaylist {
+    return {
+      id: r.id,
+      slug: r.slug,
+      title: r.title,
+      epgUrl: r.epg_url,
+      updatedAt: new Date(r.updated_at).toISOString(),
+    };
+  }
+
+  async listPlaylists(): Promise<RestreamPlaylist[]> {
+    const rows = await this.db.selectFrom('restream_playlists').selectAll().orderBy('slug').execute();
+    return rows.map((r) => this.rowToPlaylist(r));
+  }
+
+  async getPlaylist(id: string): Promise<RestreamPlaylist | null> {
+    const r = await this.db
+      .selectFrom('restream_playlists')
+      .selectAll()
+      .where('id', '=', id)
+      .executeTakeFirst();
+    return r ? this.rowToPlaylist(r) : null;
+  }
+
+  createPlaylist(input: { slug: string; title: string; epgUrl?: string | null }): Promise<RestreamPlaylist> {
+    return this.serialize(() => this.createPlaylistInner(input));
+  }
+
+  private async createPlaylistInner(input: {
+    slug: string;
+    title: string;
+    epgUrl?: string | null;
+  }): Promise<RestreamPlaylist> {
+    await this.validatePlaylistSlug(input.slug);
+    if (!input.title.trim()) throw httpError(400, 'playlist title must not be empty');
+    const id = randomUUID();
+    await this.db
+      .insertInto('restream_playlists')
+      .values({
+        id,
+        slug: input.slug,
+        title: input.title,
+        epg_url: input.epgUrl ?? null,
+        updated_at: now(),
+      })
+      .execute();
+    return (await this.getPlaylist(id))!;
+  }
+
+  updatePlaylist(
+    id: string,
+    patch: { slug?: string; title?: string; epgUrl?: string | null },
+  ): Promise<RestreamPlaylist> {
+    return this.serialize(() => this.updatePlaylistInner(id, patch));
+  }
+
+  private async updatePlaylistInner(
+    id: string,
+    patch: { slug?: string; title?: string; epgUrl?: string | null },
+  ): Promise<RestreamPlaylist> {
+    const existing = await this.getPlaylist(id);
+    if (!existing) throw httpError(404, `playlist ${id} not found`);
+    if (patch.slug !== undefined && patch.slug !== existing.slug) {
+      await this.validatePlaylistSlug(patch.slug, id);
+    }
+    if (patch.title !== undefined && !patch.title.trim()) {
+      throw httpError(400, 'playlist title must not be empty');
+    }
+    await this.db
+      .updateTable('restream_playlists')
+      .set({
+        slug: patch.slug ?? existing.slug,
+        title: patch.title ?? existing.title,
+        epg_url: patch.epgUrl === undefined ? existing.epgUrl : patch.epgUrl,
+        updated_at: now(),
+      })
+      .where('id', '=', id)
+      .execute();
+    return (await this.getPlaylist(id))!;
+  }
+
+  private async validatePlaylistSlug(slug: string, excludeId?: string): Promise<void> {
+    if (!SLUG_PATTERN.test(slug)) {
+      throw httpError(400, `invalid playlist slug "${slug}" — must match ${SLUG_PATTERN.source}`);
+    }
+    const clash = await this.db
+      .selectFrom('restream_playlists')
+      .select('id')
+      .where('slug', '=', slug)
+      .executeTakeFirst();
+    if (clash && clash.id !== excludeId) {
+      throw httpError(409, `a playlist with slug "${slug}" already exists`);
+    }
+  }
+
+  deletePlaylist(id: string): Promise<void> {
+    return this.serialize(async () => {
+      const existing = await this.getPlaylist(id);
+      if (!existing) throw httpError(404, `playlist ${id} not found`);
+      // memberships cascade via FK
+      await this.db.deleteFrom('restream_playlists').where('id', '=', id).execute();
+    });
+  }
+
+  /** replace a channel's playlist memberships */
+  setChannelPlaylists(channelId: string, playlistIds: string[]): Promise<void> {
+    return this.serialize(() => this.setChannelPlaylistsInner(channelId, playlistIds));
+  }
+
+  private async setChannelPlaylistsInner(channelId: string, playlistIds: string[]): Promise<void> {
+    const channel = await this.db
+      .selectFrom('restream_channels')
+      .select('id')
+      .where('id', '=', channelId)
+      .executeTakeFirst();
+    if (!channel) throw httpError(404, `restream channel ${channelId} not found`);
+    const unique = [...new Set(playlistIds)];
+    await this.assertPlaylistsExist(unique);
+    await this.db
+      .deleteFrom('restream_playlist_members')
+      .where('channel_id', '=', channelId)
+      .execute();
+    for (const playlistId of unique) {
+      await this.db
+        .insertInto('restream_playlist_members')
+        .values({ playlist_id: playlistId, channel_id: channelId })
+        .execute();
+    }
+  }
+
+  private async assertPlaylistsExist(playlistIds: string[]): Promise<void> {
+    if (!playlistIds.length) return;
+    const rows = await this.db
+      .selectFrom('restream_playlists')
+      .select('id')
+      .where('id', 'in', playlistIds)
+      .execute();
+    const found = new Set(rows.map((r) => r.id));
+    const missing = playlistIds.filter((id) => !found.has(id));
+    if (missing.length) throw httpError(400, `unknown playlist(s): ${missing.join(', ')}`);
+  }
+
+  // ---------- desired-doc computation ----------
+
+  /**
+   * Resolve one placement to (channel uuid, program number) against its
+   * instance's live topology. Failure reasons follow SyncEngine.validateNames
+   * wording; every reason is also what listChannels surfaces as blockedReason.
+   * An unknown instance/node on an EXISTING row (config shrank) is a reason,
+   * never a crash.
+   */
+  private resolvePlacement(
+    instanceId: string,
+    nodeId: string,
+    channelName: string,
+    channelNumber: string | null,
+    programOverride: number | null,
+  ): { ok: true; channelUuid: string; programNumber: number } | { ok: false; reason: string } {
+    const inst = this.config.instances.find((i) => i.id === instanceId);
+    if (!inst) return { ok: false, reason: `instance "${instanceId}" is not configured` };
+    if (!inst.restreamer?.nodes.some((n) => n.id === nodeId)) {
+      return {
+        ok: false,
+        reason: `restreamer node "${nodeId}" is not configured on instance ${instanceId}`,
+      };
+    }
+    const topo = this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
+    if (!topo) return { ok: false, reason: `topology not loaded for instance ${instanceId}` };
+
+    const channel = resolveTvhChannel(topo.channels, channelName, channelNumber);
+    if (!channel) {
+      return {
+        ok: false,
+        reason:
+          channelNumber != null
+            ? `channel "${channelName}" (#${channelNumber}) not found on instance ${instanceId}`
+            : `channel "${channelName}" not found on instance ${instanceId}`,
+      };
+    }
+    if (programOverride != null) {
+      return { ok: true, channelUuid: channel.uuid, programNumber: programOverride };
+    }
+    const svcUuids = new Set(channel.services ?? []);
+    const sids = topo.services
+      .filter((s) => svcUuids.has(s.uuid) && typeof s.sid === 'number')
+      .map((s) => s.sid as number);
+    if (!sids.length) {
+      return {
+        ok: false,
+        reason: `cannot derive program number for channel "${channelName}" on instance ${instanceId} — no linked service reports a SID; set a manual override`,
+      };
+    }
+    return { ok: true, channelUuid: channel.uuid, programNumber: Math.min(...sids) };
+  }
+
+  /**
+   * Desired doc for one node. Read-only (safe outside the op chain).
+   * - No topology yet → fire-and-forget a topology poll, return deferred.
+   * - Sessions = enabled placements of enabled channels on this node.
+   * - Blocked placements whose session is in the node's CURRENT doc defer the
+   *   whole push (a full replace must not tear down a running stream on a
+   *   topology flap); never-pushed blocked placements just stay out.
+   */
+  async computeNodeDoc(instanceId: string, nodeId: string): Promise<ComputedNodeDoc> {
+    const topo =
+      this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
+    if (!topo) {
+      const poller = this.pollers.get(instanceId);
+      if (poller) void poller.pollTopology().catch(() => {});
+      return { doc: null, blocked: [], deferred: true };
+    }
+
+    const rows = await this.db
+      .selectFrom('restream_placements as p')
+      .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
+      .innerJoin('restream_profiles as pr', 'pr.id', 'c.profile_id')
+      .select([
+        'p.id as placement_id',
+        'p.weight',
+        'p.program_number',
+        'c.id as channel_id',
+        'c.slug',
+        'c.channel_name',
+        'c.channel_number',
+        'pr.payload as profile_payload',
+      ])
+      .where('p.instance_id', '=', instanceId)
+      .where('p.node_id', '=', nodeId)
+      .where('p.enabled', '=', 1)
+      .where('c.enabled', '=', 1)
+      .execute();
+
+    const sessions: DesiredSession[] = [];
+    const blocked: BlockedPlacement[] = [];
+    for (const row of rows) {
+      const resolved = this.resolvePlacement(
+        instanceId,
+        nodeId,
+        row.channel_name,
+        row.channel_number,
+        row.program_number,
+      );
+      if (!resolved.ok) {
+        blocked.push({
+          placementId: row.placement_id,
+          channelId: row.channel_id,
+          slug: row.slug,
+          reason: resolved.reason,
+        });
+        continue;
+      }
+      // stored profiles are already validated; Default-complete again so a doc
+      // computed from an older row hashes identically to a fresh one
+      const pipeline = Value.Default(
+        PipelineParams,
+        JSON.parse(row.profile_payload),
+      ) as PipelineParams;
+      sessions.push({
+        name: row.slug,
+        enabled: true,
+        source: {
+          channelUuid: resolved.channelUuid,
+          ...(row.weight != null ? { weight: row.weight } : {}),
+        },
+        tsreadex: { programNumber: resolved.programNumber },
+        pipeline,
+      });
+    }
+    sessions.sort((a, b) => a.name.localeCompare(b.name));
+
+    if (blocked.length) {
+      const last = await this.lastPushedDoc(instanceId, nodeId);
+      if (last === UNKNOWN) {
+        // something was pushed but the node can't confirm what — do not risk
+        // tearing down a session we can no longer compute
+        return { doc: null, blocked, deferred: true };
+      }
+      const pushedSlugs = new Set((last?.sessions ?? []).map((s) => s.name));
+      if (blocked.some((b) => pushedSlugs.has(b.slug))) {
+        return { doc: null, blocked, deferred: true };
+      }
+    }
+
+    const doc: DesiredState = {
+      apiVersion: RESTREAMER_API_VERSION,
+      revision: sessionsHash(sessions),
+      sessions,
+    };
+    return { doc, blocked, deferred: false };
+  }
+
+  /**
+   * Last doc the node is known to hold. Cold cache + a stored pushed_hash →
+   * hydrate via getDesired(); UNKNOWN when the read-back fails (node down) so
+   * the caller can stay conservative.
+   */
+  private async lastPushedDoc(
+    instanceId: string,
+    nodeId: string,
+  ): Promise<DesiredState | null | typeof UNKNOWN> {
+    const key = nodeKey(instanceId, nodeId);
+    const cached = this.lastPushedDocs.get(key);
+    if (cached !== undefined) return cached;
+    const state = await this.nodeState(instanceId, nodeId);
+    if (!state) {
+      this.lastPushedDocs.set(key, null);
+      return null;
+    }
+    const client = this.clients.get(key);
+    if (!client) return UNKNOWN;
+    try {
+      const doc = await client.getDesired();
+      this.lastPushedDocs.set(key, doc);
+      return doc;
+    } catch {
+      return UNKNOWN; // not cached — retried on the next occasion
+    }
+  }
+
+  private nodeState(
+    instanceId: string,
+    nodeId: string,
+  ): Promise<{ pushed_hash: string } | undefined> {
+    return this.db
+      .selectFrom('restream_node_state')
+      .select('pushed_hash')
+      .where('instance_id', '=', instanceId)
+      .where('node_id', '=', nodeId)
+      .executeTakeFirst();
+  }
+
+  // ---------- push ----------
+
+  pushNode(instanceId: string, nodeId: string, force = false): Promise<NodePushResult> {
+    return this.serialize(() => this.pushNodeInner(instanceId, nodeId, force));
+  }
+
+  pushAll(): Promise<NodePushResult[]> {
+    return this.serialize(() => this.pushAllInner());
+  }
+
+  /** push every node hosting a placement of a channel that uses this profile */
+  pushAffectedByProfile(profileId: string): Promise<NodePushResult[]> {
+    return this.serialize(() => this.pushAffectedByProfileInner(profileId));
+  }
+
+  /** push every node hosting a placement of this channel */
+  pushAffectedByChannel(channelId: string): Promise<NodePushResult[]> {
+    return this.serialize(async () =>
+      this.pushNodesInner(await this.affectedNodesByChannel(channelId)),
+    );
+  }
+
+  private async pushNodeInner(
+    instanceId: string,
+    nodeId: string,
+    force = false,
+  ): Promise<NodePushResult> {
+    const base = { instanceId, nodeId };
+    try {
+      const computed = await this.computeNodeDoc(instanceId, nodeId);
+      if (computed.deferred || !computed.doc) {
+        // a blocked-deferral is a real pending change; a topology-deferral is
+        // simply "not yet known" and must not flash a pending badge
+        if (computed.blocked.length) {
+          this.updateNodeStatus(instanceId, nodeId, { pendingPush: true });
+        }
+        return {
+          ...base,
+          action: 'deferred',
+          detail: computed.blocked.length
+            ? computed.blocked.map((b) => b.reason).join('; ')
+            : 'topology not loaded',
+          blocked: computed.blocked,
+        };
+      }
+      const doc = computed.doc;
+      const state = await this.nodeState(instanceId, nodeId);
+      if (!force && state?.pushed_hash === doc.revision) {
+        this.updateNodeStatus(instanceId, nodeId, { pendingPush: false });
+        return { ...base, action: 'skipped', detail: 'already up to date', blocked: computed.blocked };
+      }
+      // never-pushed node with nothing to run: leave it alone — pushing an
+      // empty doc to an unmanaged node would tear down whatever it is doing
+      if (!state && doc.sessions.length === 0) {
+        return { ...base, action: 'skipped', detail: 'nothing to manage', blocked: computed.blocked };
+      }
+      const client = this.clients.get(nodeKey(instanceId, nodeId));
+      if (!client) {
+        return { ...base, action: 'error', detail: 'no client configured for node', blocked: computed.blocked };
+      }
+      await client.putDesired(doc);
+      await this.db
+        .insertInto('restream_node_state')
+        .values({
+          instance_id: instanceId,
+          node_id: nodeId,
+          pushed_hash: doc.revision,
+          pushed_at: now(),
+        })
+        .onDuplicateKeyUpdate({ pushed_hash: doc.revision, pushed_at: now() })
+        .execute();
+      this.lastPushedDocs.set(nodeKey(instanceId, nodeId), doc);
+      this.updateNodeStatus(instanceId, nodeId, {
+        pendingPush: false,
+        desiredRevision: doc.revision,
+      });
+      return { ...base, action: 'pushed', blocked: computed.blocked };
+    } catch (err) {
+      // failed push: the stored hash stays, the node stays pending — the 60s
+      // sweep (or the poller's revision-mismatch trigger) heals it later
+      const detail = err instanceof Error ? err.message : String(err);
+      this.updateNodeStatus(instanceId, nodeId, { pendingPush: true, error: detail });
+      return { ...base, action: 'error', detail, blocked: [] };
+    }
+  }
+
+  private async pushAllInner(): Promise<NodePushResult[]> {
+    const results: NodePushResult[] = [];
+    for (const node of this.configuredNodes()) {
+      results.push(await this.pushNodeInner(node.instanceId, node.nodeId));
+    }
+    return results;
+  }
+
+  private async pushAffectedByProfileInner(profileId: string): Promise<NodePushResult[]> {
+    const rows = await this.db
+      .selectFrom('restream_placements as p')
+      .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
+      .select(['p.instance_id', 'p.node_id'])
+      .distinct()
+      .where('c.profile_id', '=', profileId)
+      .execute();
+    return this.pushNodesInner(
+      rows.map((r) => ({ instanceId: r.instance_id, nodeId: r.node_id })),
+    );
+  }
+
+  private async affectedNodesByChannel(channelId: string): Promise<NodeRef[]> {
+    const rows = await this.db
+      .selectFrom('restream_placements')
+      .select(['instance_id', 'node_id'])
+      .distinct()
+      .where('channel_id', '=', channelId)
+      .execute();
+    return rows.map((r) => ({ instanceId: r.instance_id, nodeId: r.node_id }));
+  }
+
+  private async pushNodesInner(nodes: NodeRef[]): Promise<NodePushResult[]> {
+    const seen = new Set<string>();
+    const results: NodePushResult[] = [];
+    for (const n of nodes) {
+      const key = nodeKey(n.instanceId, n.nodeId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // rows pointing at nodes the config no longer knows are tolerated (blockedReason on read)
+      if (!this.nodeConfig(n.instanceId, n.nodeId)) continue;
+      results.push(await this.pushNodeInner(n.instanceId, n.nodeId));
+    }
+    return results;
+  }
+
+  /** mutation tail: push and log — the mutation itself must already have succeeded */
+  private async pushAffectedByChannelSafe(channelId: string): Promise<void> {
+    try {
+      await this.pushNodesInner(await this.affectedNodesByChannel(channelId));
+    } catch (err) {
+      console.error('restreamer: push after mutation failed:', err);
+    }
+    await this.pushAllSwitchersSafe();
+  }
+
+  private async pushNodesSafe(nodes: NodeRef[]): Promise<void> {
+    try {
+      await this.pushNodesInner(nodes);
+    } catch (err) {
+      console.error('restreamer: push after mutation failed:', err);
+    }
+    await this.pushAllSwitchersSafe();
+  }
+
+  /**
+   * Switcher tail of every channel/placement/profile mutation: any of them can
+   * change redundancy membership, upstream URLs, priorities or segmentSeconds,
+   * so simply push all switchers — the hash-skip makes the no-change case
+   * cheap, and failures are logged, never thrown (the sweep heals).
+   */
+  private async pushAllSwitchersSafe(): Promise<void> {
+    try {
+      await this.switcherSync.pushAllInner();
+    } catch (err) {
+      console.error('restreamer: switcher push after mutation failed:', err);
+    }
+  }
+
+  /** patch this node's cached status entry and publish an SSE `restreamer` event on change */
+  private updateNodeStatus(
+    instanceId: string,
+    nodeId: string,
+    patch: Partial<RestreamerNodeStatus>,
+  ): void {
+    if (!this.cache.has(instanceId)) return;
+    const snap = this.cache.get(instanceId);
+    const idx = snap.restreamers.findIndex((r) => r.nodeId === nodeId);
+    if (idx === -1) return; // poller hasn't seeded this node yet — its next tick reflects the state
+    const current = snap.restreamers[idx]!;
+    const next = { ...current, ...patch };
+    if (JSON.stringify(next) === JSON.stringify(current)) return;
+    snap.restreamers = snap.restreamers.map((r, x) => (x === idx ? next : r));
+    this.bus.publish({ type: 'restreamer', data: next });
+  }
+
+  // ---------- sweep + hooks ----------
+
+  /**
+   * 60s heal sweep: pushAll (nodes AND switchers) is cheap in steady state
+   * (hash-skip) and covers node/switcher-down-at-mutation, controller restart
+   * and late topology.
+   */
+  startSweep(): void {
+    if (this.sweepTimer) return;
+    this.sweepTimer = setInterval(() => {
+      void this.pushAll().catch(() => {});
+      void this.pushAllSwitchers().catch(() => {});
+    }, 60_000);
+    this.sweepTimer.unref?.();
+  }
+
+  stopSweep(): void {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    this.sweepTimer = null;
+    for (const t of this.topologyDebounce.values()) clearTimeout(t);
+    this.topologyDebounce.clear();
+  }
+
+  /**
+   * Slow rebalance cadence: a separate 300s interval (chosen over "every 5th
+   * sweep tick" so the heal frequency and the policy frequency stay
+   * independently tunable and the sweep stays a pure push loop). Policy
+   * stickiness/hysteresis live in rebalance.ts; a tick with nothing to move is
+   * a no-op.
+   */
+  startRebalance(): void {
+    if (this.rebalanceTimer) return;
+    this.rebalanceTimer = setInterval(() => {
+      void this.rebalanceTick().catch(() => {});
+    }, 300_000);
+    this.rebalanceTimer.unref?.();
+  }
+
+  stopRebalance(): void {
+    if (this.rebalanceTimer) clearInterval(this.rebalanceTimer);
+    this.rebalanceTimer = null;
+  }
+
+  /** topology changed on an instance: re-push its nodes, debounced 2s */
+  onTopologyChanged(instanceId: string): void {
+    const existing = this.topologyDebounce.get(instanceId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.topologyDebounce.delete(instanceId);
+      void this.serialize(() =>
+        this.pushNodesInner(
+          this.configuredNodes()
+            .filter((n) => n.instanceId === instanceId)
+            .map((n) => ({ instanceId: n.instanceId, nodeId: n.nodeId })),
+        ),
+      ).catch(() => {});
+    }, 2000);
+    timer.unref?.();
+    this.topologyDebounce.set(instanceId, timer);
+  }
+
+  /**
+   * True when the controller's computed doc differs from what it believes is
+   * pushed. A topology-deferral reads as NOT pending (unknown yet); a
+   * blocked-deferral is pending (there is a change we refuse to push).
+   */
+  async getPendingPush(instanceId: string, nodeId: string): Promise<boolean> {
+    const computed = await this.computeNodeDoc(instanceId, nodeId);
+    if (computed.deferred || !computed.doc) return computed.blocked.length > 0;
+    const state = await this.nodeState(instanceId, nodeId);
+    if (!state) return computed.doc.sessions.length > 0;
+    return state.pushed_hash !== computed.doc.revision;
+  }
+
+  /**
+   * Revision the node is expected to report. The doc's `revision` IS the doc
+   * hash the controller computes and stores, so `restream_node_state.
+   * pushed_hash` and the expected revision are the same string by construction.
+   */
+  async getExpectedRevision(instanceId: string, nodeId: string): Promise<string | null> {
+    const state = await this.nodeState(instanceId, nodeId);
+    return state?.pushed_hash ?? null;
+  }
+
+  /** RestreamerPollerHooks implementation backed by this service (B2's poller consumes it) */
+  pollerHooks(): RestreamerPollerHooks {
+    return {
+      getPendingPush: (instanceId, nodeId) => this.getPendingPush(instanceId, nodeId),
+      getExpectedRevision: (instanceId, nodeId) => this.getExpectedRevision(instanceId, nodeId),
+      // a node that lost its state file (or drifted) gets re-pushed immediately,
+      // force bypassing the hash-skip; serialized via the public wrapper
+      onRevisionMismatch: (instanceId, nodeId) => {
+        void this.pushNode(instanceId, nodeId, true).catch(() => {});
+      },
+    };
+  }
+
+  // ---------- switcher desired doc + push (B5, delegated to SwitcherSync) ----------
+
+  /** global switcher desired doc (read-only, safe outside the op chain) */
+  computeSwitcherDoc(): Promise<ComputedSwitcherDoc> {
+    return this.switcherSync.computeDoc();
+  }
+
+  pushSwitcher(switcherId: string, force = false): Promise<SwitcherPushResult> {
+    return this.serialize(() => this.switcherSync.pushInner(switcherId, force));
+  }
+
+  pushAllSwitchers(): Promise<SwitcherPushResult[]> {
+    return this.serialize(() => this.switcherSync.pushAllInner());
+  }
+
+  /** SwitcherPollerHooks implementation backed by this service (B4's pollers consume it) */
+  switcherPollerHooks(): SwitcherPollerHooks {
+    return {
+      getPendingPush: (switcherId) => this.switcherSync.getPendingPush(switcherId),
+      getExpectedRevision: (switcherId) => this.switcherSync.getExpectedRevision(switcherId),
+      // a switcher that lost its state file (PVC loss) gets re-pushed
+      // immediately, force bypassing the hash-skip; serialized via the wrapper
+      onRevisionMismatch: (switcherId) => {
+        void this.pushSwitcher(switcherId, true).catch(() => {});
+      },
+    };
+  }
+
+  /** one rebalance evaluation, serialized like every other op (see startRebalance) */
+  rebalanceTick(now = new Date()): Promise<void> {
+    return this.serialize(() => this.switcherSync.rebalanceTickInner(now));
+  }
+}

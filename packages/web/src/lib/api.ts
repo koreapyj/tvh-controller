@@ -38,7 +38,61 @@ import type {
   UnifiedGroup,
   UploadJob,
   UploadStatus,
+  LogLine,
+  PipelineParams,
+  RestreamChannelWithStatus,
+  RestreamPlacement,
+  RestreamPlaylist,
+  RestreamProfile,
+  RestreamerNodeStatus,
+  SwitcherNodeStatus,
 } from '@tvhc/shared';
+
+/** placement create body (restream channel editor rows) */
+export interface RestreamPlacementInput {
+  instanceId: string;
+  nodeId: string;
+  /** failover order; server default = current max + 1 */
+  priority?: number;
+  enabled?: boolean;
+  /** tvheadend subscription weight override; null = daemon default */
+  weight?: number | null;
+  /** manual program-number (service SID) override; null = derived */
+  programNumber?: number | null;
+}
+
+/** restream channel create body */
+export interface RestreamChannelInput {
+  channelName: string;
+  /** STRING identity ("9.1" ≠ "9.10"); absent/null = pin the lowest-numbered channel at write time */
+  channelNumber?: string | null;
+  profileId: string;
+  /** derived from channelName when absent */
+  slug?: string;
+  enabled?: boolean;
+  comment?: string | null;
+  playlistIds?: string[];
+  placements?: RestreamPlacementInput[];
+}
+
+/** restream channel update / batch-edit patch (placements have their own endpoints) */
+export type RestreamChannelPatch = Partial<Omit<RestreamChannelInput, 'placements'>>;
+
+export type RestreamPlacementPatch = Partial<Omit<RestreamPlacementInput, 'instanceId' | 'nodeId'>>;
+
+export type RestreamChannelBatchAction =
+  | 'edit'
+  | 'delete'
+  | 'enable'
+  | 'disable'
+  | 'add-playlist'
+  | 'remove-playlist';
+
+export interface RestreamPlaylistInput {
+  slug: string;
+  title: string;
+  epgUrl?: string | null;
+}
 
 /** create/update body: plain rules carry payload, linked clones parentId+overlay */
 export interface RuleInput {
@@ -154,4 +208,74 @@ export const api = {
     ),
   retryUpload: (id: string) => http<{ ok: boolean }>('POST', `/api/uploads/${id}/retry`),
   cancelUpload: (id: string) => http<{ ok: boolean }>('POST', `/api/uploads/${id}/cancel`),
+
+  restreamerNodes: () =>
+    http<{ nodes: RestreamerNodeStatus[]; switchers: SwitcherNodeStatus[] }>(
+      'GET',
+      '/api/restreamer/nodes',
+    ),
+  pushRestreamerNode: (instanceId: string, nodeId: string) =>
+    http<unknown>('POST', `/api/restreamer/nodes/${instanceId}/${nodeId}/push`),
+  restartRestreamSession: (instanceId: string, nodeId: string, name: string) =>
+    http<{ ok: boolean }>(
+      'POST',
+      `/api/restreamer/nodes/${instanceId}/${nodeId}/sessions/${name}/restart`,
+    ),
+  restreamSessionLog: (instanceId: string, nodeId: string, name: string, lines?: number) =>
+    http<LogLine[]>(
+      'GET',
+      `/api/restreamer/nodes/${instanceId}/${nodeId}/sessions/${name}/log${lines !== undefined ? `?lines=${lines}` : ''}`,
+    ),
+
+  restreamProfiles: () => http<RestreamProfile[]>('GET', '/api/restreamer/profiles'),
+  createRestreamProfile: (name: string, payload: PipelineParams) =>
+    http<RestreamProfile>('POST', '/api/restreamer/profiles', { name, payload }),
+  updateRestreamProfile: (id: string, patch: { name?: string; payload?: PipelineParams }) =>
+    http<RestreamProfile>('PUT', `/api/restreamer/profiles/${id}`, patch),
+  deleteRestreamProfile: (id: string) =>
+    http<{ ok: boolean }>('DELETE', `/api/restreamer/profiles/${id}`),
+
+  restreamChannels: () => http<RestreamChannelWithStatus[]>('GET', '/api/restreamer/channels'),
+  createRestreamChannel: (input: RestreamChannelInput) =>
+    http<RestreamChannelWithStatus>('POST', '/api/restreamer/channels', input),
+  restreamChannel: (id: string) =>
+    http<RestreamChannelWithStatus>('GET', `/api/restreamer/channels/${id}`),
+  updateRestreamChannel: (id: string, patch: RestreamChannelPatch) =>
+    http<RestreamChannelWithStatus>('PUT', `/api/restreamer/channels/${id}`, patch),
+  deleteRestreamChannel: (id: string) =>
+    http<{ ok: boolean }>('DELETE', `/api/restreamer/channels/${id}`),
+  batchRestreamChannels: (
+    action: RestreamChannelBatchAction,
+    ids: string[],
+    opts?: { patch?: RestreamChannelPatch; playlistId?: string },
+  ) =>
+    http<Array<{ id: string; ok: boolean; error?: string }>>('POST', '/api/restreamer/channels/batch', {
+      action,
+      ids,
+      ...(opts?.patch ? { patch: opts.patch } : {}),
+      ...(opts?.playlistId ? { playlistId: opts.playlistId } : {}),
+    }),
+  setRestreamChannelPlaylists: (id: string, playlistIds: string[]) =>
+    http<{ ok: boolean }>('POST', `/api/restreamer/channels/${id}/playlists`, { playlistIds }),
+  switchRestreamChannel: (id: string, placementId: string) =>
+    http<{ ok: boolean }>('POST', `/api/restreamer/channels/${id}/switch`, { placementId }),
+
+  addRestreamPlacement: (channelId: string, input: RestreamPlacementInput) =>
+    http<RestreamPlacement>('POST', `/api/restreamer/channels/${channelId}/placements`, input),
+  updateRestreamPlacement: (id: string, patch: RestreamPlacementPatch) =>
+    http<RestreamPlacement>('PUT', `/api/restreamer/placements/${id}`, patch),
+  deleteRestreamPlacement: (id: string) =>
+    http<{ ok: boolean }>('DELETE', `/api/restreamer/placements/${id}`),
+  reorderRestreamPlacements: (channelId: string, orderedPlacementIds: string[]) =>
+    http<{ ok: boolean }>('POST', `/api/restreamer/channels/${channelId}/placements/reorder`, {
+      orderedPlacementIds,
+    }),
+
+  restreamPlaylists: () => http<RestreamPlaylist[]>('GET', '/api/restreamer/playlists'),
+  createRestreamPlaylist: (input: RestreamPlaylistInput) =>
+    http<RestreamPlaylist>('POST', '/api/restreamer/playlists', input),
+  updateRestreamPlaylist: (id: string, patch: Partial<RestreamPlaylistInput>) =>
+    http<RestreamPlaylist>('PUT', `/api/restreamer/playlists/${id}`, patch),
+  deleteRestreamPlaylist: (id: string) =>
+    http<{ ok: boolean }>('DELETE', `/api/restreamer/playlists/${id}`),
 };

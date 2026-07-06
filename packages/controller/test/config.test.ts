@@ -132,4 +132,113 @@ pollIntervals:
     expect(cfg.pollIntervals.dvr).toBe(5000);
     expect(cfg.pollIntervals.autorec).toBe(60_000); // default, untouched
   });
+
+  it('parses and normalizes restreamer node and switcher blocks', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+    restreamer:
+      nodes:
+        - id: node1
+          url: http://a.local:5580/
+          serveUrl: https://tv1.example.com/
+          egressMbps: 500
+        - id: node2
+          url: http://b.local:5580
+restreamer:
+  switchers:
+    - id: main
+      url: http://switcher.internal:5581/
+      publicUrl: https://tv.example.com/
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.instances[0]?.restreamer?.nodes).toEqual([
+      {
+        id: 'node1',
+        url: 'http://a.local:5580',
+        serveUrl: 'https://tv1.example.com',
+        egressMbps: 500,
+      },
+      { id: 'node2', url: 'http://b.local:5580', serveUrl: undefined, egressMbps: undefined },
+    ]);
+    expect(cfg.restreamer?.switchers).toEqual([
+      { id: 'main', url: 'http://switcher.internal:5581', publicUrl: 'https://tv.example.com' },
+    ]);
+  });
+
+  it('leaves restreamer undefined when the blocks are absent', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.instances[0]?.restreamer).toBeUndefined();
+    expect(cfg.restreamer).toBeUndefined();
+  });
+
+  it('rejects duplicate restreamer node ids within an instance', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+    restreamer:
+      nodes:
+        - id: node1
+          url: http://a.local:5580
+        - id: node1
+          url: http://b.local:5580
+`);
+    expect(() => loadConfig(path)).toThrow(/duplicate restreamer node id "node1"/);
+  });
+
+  it('rejects duplicate switcher ids', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+restreamer:
+  switchers:
+    - id: main
+      url: http://s1.internal:5581
+      publicUrl: https://tv.example.com
+    - id: main
+      url: http://s2.internal:5581
+      publicUrl: https://tv2.example.com
+`);
+    expect(() => loadConfig(path)).toThrow(/duplicate restreamer switcher id "main"/);
+  });
+
+  it('rejects a restreamer node without an id or url', () => {
+    const noUrl = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+    restreamer:
+      nodes:
+        - id: node1
+`);
+    expect(() => loadConfig(noUrl)).toThrow(/restreamer node "node1" has no url/);
+  });
+
+  it('defaults pollIntervals.restreamer to 15000', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+`);
+    expect(loadConfig(path).pollIntervals.restreamer).toBe(15_000);
+  });
+
+  it('honors a pollIntervals.restreamer override', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+pollIntervals:
+  restreamer: 5000
+`);
+    expect(loadConfig(path).pollIntervals.restreamer).toBe(5000);
+  });
 });

@@ -120,15 +120,24 @@ pnpm --filter @tvhc/controller dev         # API + UI on :8080
 pnpm --filter @tvhc/web dev                # optional: Vite dev server, proxies /api
 ```
 
-Without real instances, run two mock tvheadends and point the controller at
-them:
+Without real instances, run two mock tvheadends (plus optional mock
+restreamer nodes for the Restreamer page) and point the controller at them:
 
 ```sh
 node scripts/mock-tvh.mjs 19981 &
 node scripts/mock-tvh.mjs 19982 &
+node scripts/mock-restreamer.mjs --port 15801 --name zone1-node1 &
+node scripts/mock-restreamer.mjs --port 15802 --name zone2-node1 &
 TVHC_CONFIG=./config.mock.yaml node packages/controller/dist/main.js
 node scripts/sse-probe.mjs http://localhost:8090/api/events 10   # watch live events
 ```
+
+The mock restreamer speaks the daemon wire contract v1 and serves
+fake-but-advancing HLS playlists at the paths a real node's nginx would
+(`/<slug>/playlist.m3u8`, `/<slug>/<variant>/stream.m3u8`), with
+`POST /__freeze` / `POST /__unfreeze` hooks to demo switcher failover.
+Restreamer desired-state pushes need a `database:` in the config; without one
+the node overview stays status-only.
 
 Authentication is optional everywhere: leave out `username`/`password` when
 tvheadend allows anonymous access (the anonymous user needs admin rights —

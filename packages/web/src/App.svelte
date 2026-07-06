@@ -31,6 +31,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import Drift from './pages/Drift.svelte';
   import Conflicts from './pages/Conflicts.svelte';
   import Uploads from './pages/Uploads.svelte';
+  import Restreamer from './pages/Restreamer.svelte';
 
   // channels need instance topology, which may lag right after a controller
   // restart — retry until available, then surface a banner instead of
@@ -92,6 +93,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       href="/instances"
       class:active={$route.page === 'instances' || $route.page === 'instance'}>Instances</a
     >
+    <a href="/restreamer" class:active={$route.page === 'restreamer'}>Restreamer</a>
     <a href="/recordings" class:active={$route.page === 'recordings'}>Recordings</a>
     <a href="/rules" class:active={$route.page === 'rules'}>Autorec Rules</a>
     <a href="/drift" class:active={$route.page === 'drift'}>Drift</a>
@@ -120,6 +122,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       <Conflicts />
     {:else if $route.page === 'uploads'}
       <Uploads />
+    {:else if $route.page === 'restreamer'}
+      <Restreamer />
     {/if}
   </main>
 </div>

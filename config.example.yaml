@@ -22,6 +22,15 @@ instances:
       # rewrite tvheadend's recording path to the path rclone rcd sees
       # (identical when both run directly on the host):
       # recordingPathPrefix: { from: /recordings, to: /recordings }
+    # restreamer daemon nodes at this location (omit to disable restreaming here):
+    # restreamer:
+    #   nodes:
+    #     - id: node1
+    #       url: http://192.168.1.10:5580
+    #       # public HLS base for viewer-facing links (omit if not directly serveable):
+    #       serveUrl: https://tv1.example.com
+    #       # expected serving bandwidth budget in Mbps (used by the rebalancer):
+    #       egressMbps: 500
   - id: zone2
     name: Zone 2
     url: http://192.168.2.10:9981
@@ -44,6 +53,15 @@ rclone:
 # is auto-detected via the co-located rclone rcd, or set per instance:
 #   serverOffset: "+00:00"
 
+# Standalone HLS switcher service(s) for redundant restream channels
+# (multi-placement failover). Omit when no channel is placed on more than
+# one instance. publicUrl is the viewer-facing base used in M3U playlists.
+# restreamer:
+#   switchers:
+#     - id: main
+#       url: http://switcher.internal:5581
+#       publicUrl: https://tv.example.com
+
 # optional overrides (milliseconds / ratio)
-# pollIntervals: { dvr: 15000, autorec: 60000, topology: 600000 }
+# pollIntervals: { dvr: 15000, autorec: 60000, topology: 600000, restreamer: 15000 }
 # overlapThreshold: 0.7

@@ -28,9 +28,13 @@ import { registerEpgRoutes } from './routes/epg.js';
 import { registerEventRoutes } from './routes/events.js';
 import { registerInstanceRoutes } from './routes/instances.js';
 import { registerRecordingsRoutes } from './routes/recordings.js';
+import { registerRestreamerRoutes } from './routes/restreamer.js';
 import { registerRuleRoutes } from './routes/rules.js';
 import { registerUnifiedRoutes } from './routes/unified.js';
 import { registerUploadRoutes } from './routes/uploads.js';
+import { RestreamerClient, SwitcherClient } from './restreamer/client.js';
+import { RestreamerPoller, SwitcherPoller } from './restreamer/poller.js';
+import { RestreamerService, nodeKey } from './restreamer/service.js';
 import type { AppContext } from './routes/context.js';
 import { EventBus } from './state/events.js';
 import { InstanceCache } from './state/instanceCache.js';
@@ -76,6 +80,87 @@ async function main(): Promise<void> {
     }
   }
 
+  // restreamer clients exist regardless of DB (status-only mode keeps the
+  // node overview working); the service — and thus pushes — needs the DB
+  const restreamerClients = new Map<string, RestreamerClient>();
+  for (const inst of config.instances) {
+    for (const node of inst.restreamer?.nodes ?? []) {
+      restreamerClients.set(nodeKey(inst.id, node.id), new RestreamerClient(node));
+    }
+  }
+  const switcherClients = new Map<string, SwitcherClient>();
+  for (const sw of config.restreamer?.switchers ?? []) {
+    switcherClients.set(sw.id, new SwitcherClient(sw));
+  }
+
+  const restreamer = db
+    ? new RestreamerService(db, cache, pollers, bus, config, restreamerClients, switcherClients)
+    : null;
+  if (restreamer) {
+    // chain into the topology-change callback set above (fires after every
+    // pollTopology, next to ConflictService.recompute) — the service
+    // debounces and hash-skips, so extra invocations are cheap
+    for (const inst of config.instances) {
+      const poller = pollers.get(inst.id)!;
+      const prev = poller.onCapacityInputsChanged;
+      poller.onCapacityInputsChanged = () => {
+        prev?.();
+        restreamer.onTopologyChanged(inst.id);
+      };
+    }
+  }
+
+  const restreamerHooks = restreamer?.pollerHooks() ?? {};
+  const restreamerPollers: RestreamerPoller[] = [];
+  for (const inst of config.instances) {
+    for (const node of inst.restreamer?.nodes ?? []) {
+      // seed a reachable:false placeholder so /api/restreamer/nodes and the
+      // service's status patches see every configured node before its first poll
+      const snap = cache.get(inst.id);
+      snap.restreamers = [
+        ...snap.restreamers,
+        {
+          instanceId: inst.id,
+          nodeId: node.id,
+          url: node.url,
+          serveUrl: node.serveUrl ?? null,
+          reachable: false,
+          error: null,
+          lastPollAt: null,
+          version: null,
+          uptimeSec: null,
+          apiVersionSupported: true,
+          desiredRevision: null,
+          pendingPush: false,
+          sessions: [],
+        },
+      ];
+      restreamerPollers.push(
+        new RestreamerPoller(
+          inst.id,
+          node,
+          restreamerClients.get(nodeKey(inst.id, node.id))!,
+          cache,
+          bus,
+          config.pollIntervals.restreamer,
+          restreamerHooks,
+        ),
+      );
+    }
+  }
+  const switcherHooks = restreamer?.switcherPollerHooks() ?? {};
+  const switcherPollers = (config.restreamer?.switchers ?? []).map(
+    (sw) =>
+      new SwitcherPoller(
+        sw,
+        switcherClients.get(sw.id)!,
+        cache,
+        bus,
+        config.pollIntervals.restreamer,
+        switcherHooks,
+      ),
+  );
+
   const ledger = db ? new UploadLedger(db, config.overlapThreshold) : null;
   const dispatcher = ledger ? new UploadDispatcher(config, ledger, bus) : null;
   const autoUploader =
@@ -83,7 +168,21 @@ async function main(): Promise<void> {
       ? new AutoUploader(config, cache, ledger, dispatcher, bus)
       : null;
 
-  const ctx: AppContext = { config, db, cache, bus, pollers, sync, ledger, dispatcher };
+  const ctx: AppContext = {
+    config,
+    db,
+    cache,
+    bus,
+    pollers,
+    sync,
+    ledger,
+    dispatcher,
+    restreamer,
+    restreamerClients,
+    restreamerPollers,
+    switcherClients,
+    switcherPollers,
+  };
 
   // request logging is disabled: the dashboard polls several endpoints every
   // few seconds, which would drown real errors in noise
@@ -94,6 +193,7 @@ async function main(): Promise<void> {
   registerRecordingsRoutes(app, ctx);
   registerRuleRoutes(app, ctx);
   registerUploadRoutes(app, ctx);
+  registerRestreamerRoutes(app, ctx);
   registerEventRoutes(app, ctx);
   app.get('/healthz', async () => ({ ok: true }));
 
@@ -116,6 +216,10 @@ async function main(): Promise<void> {
   }
 
   for (const [, poller] of pollers) poller.start();
+  for (const poller of restreamerPollers) poller.start();
+  for (const poller of switcherPollers) poller.start();
+  restreamer?.startSweep();
+  restreamer?.startRebalance();
   if (dispatcher) await dispatcher.resume();
   autoUploader?.start();
 
@@ -128,6 +232,10 @@ async function main(): Promise<void> {
     try {
       autoUploader?.stop();
       for (const [, poller] of pollers) poller.stop();
+      for (const poller of restreamerPollers) poller.stop();
+      for (const poller of switcherPollers) poller.stop();
+      restreamer?.stopSweep();
+      restreamer?.stopRebalance();
       // give in-flight upload loops a bounded chance to checkpoint before the
       // database goes away; resume() recovers anything still unfinished
       await dispatcher?.stop();

@@ -1,15 +1,33 @@
 # Test config against scripts/mock-tvh.mjs (no auth, no database):
 #   node scripts/mock-tvh.mjs 19981 &
 #   node scripts/mock-tvh.mjs 19982 &
+#   node scripts/mock-restreamer.mjs --port 15801 --name zone1-node1 &
+#   node scripts/mock-restreamer.mjs --port 15802 --name zone2-node1 &
 #   TVHC_CONFIG=./config.mock.yaml node packages/controller/dist/main.js
+# (restreamer pushes need a database; without one the node overview still works)
 port: 8090
 instances:
   - id: zone1
     name: Zone 1 (mock)
     url: http://localhost:19981
+    restreamer:
+      nodes:
+        - id: node1
+          url: http://127.0.0.1:15801
+          serveUrl: http://127.0.0.1:15801
   - id: zone2
     name: Zone 2 (mock)
     url: http://localhost:19982
+    restreamer:
+      nodes:
+        - id: node1
+          url: http://127.0.0.1:15802
+          serveUrl: http://127.0.0.1:15802
 rclone:
   remote: "gdrive:tvh-archive"
-pollIntervals: { dvr: 5000, autorec: 10000, topology: 30000 }
+pollIntervals: { dvr: 5000, autorec: 10000, topology: 30000, restreamer: 5000 }
+restreamer:
+  switchers:
+    - id: sw1
+      url: http://127.0.0.1:15900
+      publicUrl: http://127.0.0.1:15900

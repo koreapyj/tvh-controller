@@ -28,7 +28,21 @@ export interface EnumOption {
   label: string;
 }
 
-export type FieldType = 'bool' | 'int' | 'str' | 'channel' | 'enum' | 'time' | 'weekdays';
+/** enum whose payload values are opaque strings (e.g. restream profile ids) */
+export interface StrEnumOption {
+  value: string;
+  label: string;
+}
+
+export type FieldType =
+  | 'bool'
+  | 'int'
+  | 'str'
+  | 'channel'
+  | 'enum'
+  | 'strenum'
+  | 'time'
+  | 'weekdays';
 
 export interface FieldSpec {
   /** keyof MasterRulePayload (or a tvheadend idnode field for recordings) */
@@ -37,6 +51,8 @@ export interface FieldSpec {
   type: FieldType;
   /** required for 'enum' */
   options?: EnumOption[];
+  /** required for 'strenum' */
+  strOptions?: StrEnumOption[];
   /** batch-mode initial control value (enum: the payload default) */
   initial?: string;
   placeholder?: string;
@@ -240,7 +256,8 @@ export function parseFieldValue(spec: FieldSpec, raw: string): ParseResult {
       return { ok: true, value: days };
     }
     default:
-      // 'str' and 'channel' (channel is resolved by the shells)
+      // 'str', 'strenum' and 'channel' pass the string through (channel is
+      // resolved by the shells; strenum values are opaque string ids)
       return { ok: true, value: raw };
   }
 }

@@ -73,6 +73,9 @@ importers:
         specifier: workspace:*
         version: link:../shared
     devDependencies:
+      '@sinclair/typebox':
+        specifier: ^0.34.13
+        version: 0.34.49
       '@sveltejs/vite-plugin-svelte':
         specifier: ^5.0.3
         version: 5.1.1(svelte@5.56.3)(vite@6.4.3(@types/node@25.9.2)(tsx@4.22.4)(yaml@2.9.0))

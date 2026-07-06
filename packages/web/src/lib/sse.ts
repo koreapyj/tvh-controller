@@ -20,11 +20,15 @@ import type {
   ConflictWindow,
   DriftItem,
   InstanceSummary,
+  RestreamerNodeStatus,
+  SwitcherNodeStatus,
   TvhInputStatus,
   TvhSubscription,
   UploadJob,
 } from '@tvhc/shared';
 import {
+  applyRestreamerNode,
+  applyRestreamerSwitcher,
   conflictsByInstance,
   driftItems,
   epgTick,
@@ -88,5 +92,13 @@ export function connectSse(): void {
 
   source.addEventListener('upload-progress', (e) => {
     uploadEvent.set(JSON.parse(e.data) as UploadJob);
+  });
+
+  source.addEventListener('restreamer', (e) => {
+    applyRestreamerNode(JSON.parse(e.data) as RestreamerNodeStatus);
+  });
+
+  source.addEventListener('restreamer-switcher', (e) => {
+    applyRestreamerSwitcher(JSON.parse(e.data) as SwitcherNodeStatus);
   });
 }

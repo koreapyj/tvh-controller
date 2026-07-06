@@ -22,3 +22,5 @@ export * from './content-identity.js';
 export * from './channel-identity.js';
 export * from './rclone-rc.js';
 export * from './controller-api.js';
+export * from './restreamer-contract.js';
+export * from './restreamer.js';

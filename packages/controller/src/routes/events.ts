@@ -21,8 +21,8 @@ import type { AppContext } from './context.js';
 
 /**
  * SSE endpoint. On connect, replays the current snapshot (instance status,
- * live inputs/subscriptions, conflicts) so a fresh client is consistent,
- * then streams bus events.
+ * live inputs/subscriptions, conflicts, restreamer node/switcher statuses)
+ * so a fresh client is consistent, then streams bus events.
  */
 export function registerEventRoutes(app: FastifyInstance, ctx: AppContext): void {
   app.get('/api/events', (req, reply) => {
@@ -65,7 +65,9 @@ export function registerEventRoutes(app: FastifyInstance, ctx: AppContext): void
           subscriptions: snap.subscriptions,
         });
         send('conflicts', { instanceId: snap.summary.id, windows: snap.conflicts });
+        for (const node of snap.restreamers) send('restreamer', node);
       }
+      for (const sw of ctx.cache.switchers.values()) send('restreamer-switcher', sw);
 
       unsubscribe = ctx.bus.subscribe((event) => send(event.type, event.data));
       keepalive = setInterval(() => {

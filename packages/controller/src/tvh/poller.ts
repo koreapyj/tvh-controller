@@ -391,10 +391,13 @@ export class InstancePoller {
 
     // defensive: normalize channel numbers to strings at the single ingestion
     // choke point — older tvheadend variants (and our mock) may still emit
-    // numerics even though real tvheadend reports them as strings (e.g. "9.1")
+    // numerics even though real tvheadend reports them as strings (e.g. "9.1").
+    // The raw icon_public_url grid field is mapped to iconPublicUrl here for
+    // downstream consumers (restream playlists).
     const normalizedChannels = channels.map((c) => ({
       ...c,
       number: c.number == null ? undefined : String(c.number),
+      iconPublicUrl: c.iconPublicUrl ?? c.icon_public_url,
     }));
 
     const topology: TopologySnapshot = {

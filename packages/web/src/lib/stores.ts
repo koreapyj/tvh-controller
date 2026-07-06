@@ -22,6 +22,8 @@ import type {
   ConflictWindow,
   DriftItem,
   InstanceSummary,
+  RestreamerNodeStatus,
+  SwitcherNodeStatus,
   TvhInputStatus,
   TvhSubscription,
   UploadJob,
@@ -48,3 +50,32 @@ export const epgTick = writable<number>(0);
 /** last upload progress event — Uploads page merges it in */
 export const uploadEvent = writable<UploadJob | null>(null);
 export const sseConnected = writable(false);
+
+/** restreamer node statuses keyed `instanceId/nodeId` — SSE-fed, seeded from /api/restreamer/nodes */
+export const restreamerNodes = writable<Record<string, RestreamerNodeStatus>>({});
+/** switcher statuses keyed by switcherId — SSE-fed, seeded alongside the nodes */
+export const restreamerSwitchers = writable<Record<string, SwitcherNodeStatus>>({});
+
+/** store key for one restreamer node (mirrors the controller's nodeKey) */
+export function restreamerNodeKey(n: Pick<RestreamerNodeStatus, 'instanceId' | 'nodeId'>): string {
+  return `${n.instanceId}/${n.nodeId}`;
+}
+
+/** merge one SSE `restreamer` event into the node map (whole-status replace per node) */
+export function applyRestreamerNode(node: RestreamerNodeStatus): void {
+  restreamerNodes.update((m) => ({ ...m, [restreamerNodeKey(node)]: node }));
+}
+
+/** merge one SSE `restreamer-switcher` event into the switcher map */
+export function applyRestreamerSwitcher(sw: SwitcherNodeStatus): void {
+  restreamerSwitchers.update((m) => ({ ...m, [sw.switcherId]: sw }));
+}
+
+/** full reseed from a GET /api/restreamer/nodes response (page load) */
+export function seedRestreamers(
+  nodes: RestreamerNodeStatus[],
+  switchers: SwitcherNodeStatus[],
+): void {
+  restreamerNodes.set(Object.fromEntries(nodes.map((n) => [restreamerNodeKey(n), n])));
+  restreamerSwitchers.set(Object.fromEntries(switchers.map((s) => [s.switcherId, s])));
+}
