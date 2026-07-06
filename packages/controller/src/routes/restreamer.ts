@@ -23,6 +23,7 @@ import type { AppConfig } from '../config.js';
 import {
   AvailabilityError,
   nodeKey,
+  resolveCatalogEntry,
   resolveTvhChannel,
   type ChannelBatchAction,
   type ChannelPatch,
@@ -98,23 +99,11 @@ function parsePlacementInput(raw: unknown): PlacementInput {
   return input;
 }
 
-/** 'tvh' | 'external', 400 on anything else */
-function parseSourceType(v: unknown, field: string): 'tvh' | 'external' {
-  if (v !== 'tvh' && v !== 'external') {
-    throw httpError(400, `${field} must be "tvh" or "external"`);
-  }
-  return v;
-}
-
 function parseChannelPatch(raw: unknown): ChannelPatch {
   const b = asObject(raw, 'request body');
   const patch: ChannelPatch = {};
   if (b.channelName !== undefined) patch.channelName = requireString(b.channelName, 'channelName');
   if (b.channelNumber !== undefined) patch.channelNumber = parseChannelNumber(b.channelNumber, 'channelNumber');
-  if (b.sourceType !== undefined) patch.sourceType = parseSourceType(b.sourceType, 'sourceType');
-  if (b.sourceKey !== undefined) {
-    patch.sourceKey = b.sourceKey == null ? null : requireString(b.sourceKey, 'sourceKey');
-  }
   if (b.profileId !== undefined) patch.profileId = requireString(b.profileId, 'profileId');
   if (b.slug !== undefined) patch.slug = requireString(b.slug, 'slug');
   if (b.enabled !== undefined) patch.enabled = !!b.enabled;
@@ -221,46 +210,48 @@ interface EntryIdentity {
 }
 
 /**
- * tvg-id / tvg-chno / tvg-logo come from the controller channel resolved
- * against a live topology — first enabled placement (priority order) whose
- * instance resolves wins. Same (name, exact-string number | pin-lowest)
- * identity rules as the desired-doc computation.
- *
- * External channels resolve against the first enabled placement whose node's
- * cached sources catalog has the entry: tvg-id = the sourceKey, tvg-chno =
- * the catalog `chno`, tvg-logo = the catalog `logo` VERBATIM (external logos
- * are already public URLs — never routed through the controller proxy).
+ * tvg-id / tvg-chno / tvg-logo come from the first enabled placement (priority
+ * order) whose zone resolves the channel's (name, number) identity — same
+ * tvh-first-then-catalog rule as the desired-doc computation, per placement:
+ * - tvh hit: tvg-id = the tvh uuid, tvg-chno = the pin or the resolved
+ *   channel's own number, tvg-logo = the controller's proxied imagecache URL.
+ * - catalog hit (only on a tvh miss for that placement): tvg-id = the catalog
+ *   entry id, tvg-chno = the pin or the entry's `chno`, tvg-logo = the catalog
+ *   `logo` VERBATIM (external logos are already public URLs — never routed
+ *   through the controller proxy).
+ * No placement resolves → identity nulls (channelNumber only, if pinned).
  */
 function resolveEntryIdentity(
   ctx: AppContext,
   channel: RestreamChannelWithStatus,
   baseUrl: string,
 ): EntryIdentity {
-  if (channel.sourceType === 'external') {
-    for (const p of channel.placements) {
-      if (!p.enabled || !ctx.cache.has(p.instanceId)) continue;
-      const sources = ctx.cache
-        .get(p.instanceId)
-        .restreamers.find((r) => r.nodeId === p.nodeId)?.sources;
-      const entry = sources?.find((e) => e.id === channel.sourceKey);
-      if (entry) {
-        return { uuid: channel.sourceKey, number: entry.chno ?? null, logo: entry.logo ?? null };
-      }
-    }
-    return { uuid: channel.sourceKey, number: null, logo: null };
-  }
   for (const p of channel.placements) {
     if (!p.enabled || !ctx.cache.has(p.instanceId)) continue;
     const topo = ctx.cache.get(p.instanceId).topology;
-    if (!topo) continue;
-    const resolved = resolveTvhChannel(topo.channels, channel.channelName, channel.channelNumber);
-    if (!resolved) continue;
-    const icon = resolved.iconPublicUrl ?? resolved.icon_public_url ?? null;
-    return {
-      uuid: resolved.uuid,
-      number: channel.channelNumber ?? resolved.number ?? null,
-      logo: icon ? proxiedLogoUrl(icon, p.instanceId, baseUrl) : null,
-    };
+    if (topo) {
+      const resolved = resolveTvhChannel(topo.channels, channel.channelName, channel.channelNumber);
+      if (resolved) {
+        const icon = resolved.iconPublicUrl ?? resolved.icon_public_url ?? null;
+        return {
+          uuid: resolved.uuid,
+          number: channel.channelNumber ?? resolved.number ?? null,
+          logo: icon ? proxiedLogoUrl(icon, p.instanceId, baseUrl) : null,
+        };
+      }
+    }
+    const sources = ctx.cache.get(p.instanceId).restreamers.find((r) => r.nodeId === p.nodeId)
+      ?.sources;
+    if (sources) {
+      const entry = resolveCatalogEntry(sources, channel.channelName, channel.channelNumber);
+      if (entry) {
+        return {
+          uuid: entry.id,
+          number: channel.channelNumber ?? entry.chno,
+          logo: entry.logo ?? null,
+        };
+      }
+    }
   }
   return { uuid: null, number: channel.channelNumber, logo: null };
 }
@@ -401,10 +392,6 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
       profileId: requireString(b.profileId, 'profileId'),
     };
     if (b.channelNumber !== undefined) input.channelNumber = parseChannelNumber(b.channelNumber, 'channelNumber');
-    if (b.sourceType !== undefined) input.sourceType = parseSourceType(b.sourceType, 'sourceType');
-    if (b.sourceKey !== undefined) {
-      input.sourceKey = b.sourceKey == null ? null : requireString(b.sourceKey, 'sourceKey');
-    }
     if (b.slug !== undefined) input.slug = requireString(b.slug, 'slug');
     if (b.enabled !== undefined) input.enabled = !!b.enabled;
     if (b.comment !== undefined) input.comment = b.comment == null ? null : String(b.comment);

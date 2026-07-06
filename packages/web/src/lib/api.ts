@@ -68,10 +68,6 @@ export interface RestreamChannelInput {
   channelName: string;
   /** STRING identity ("9.1" ≠ "9.10"); absent/null = pin the lowest-numbered channel at write time */
   channelNumber?: string | null;
-  /** 'tvh' (default) = tvheadend channel; 'external' = a node's sources.m3u catalog entry */
-  sourceType?: 'tvh' | 'external';
-  /** catalog entry id — required when sourceType is 'external', cleared for 'tvh' */
-  sourceKey?: string | null;
   profileId: string;
   /** derived from channelName when absent */
   slug?: string;

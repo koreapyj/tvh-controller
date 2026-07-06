@@ -31,6 +31,7 @@ import {
   type RestreamProfile,
   type RestreamerNodeStatus,
   type SessionSource,
+  type SourceCatalogEntry,
   type SwitchReason,
   type SwitcherChannelStatus,
   type TvhChannel,
@@ -143,6 +144,26 @@ export function resolveTvhChannel(
   return matches.reduce((a, b) => (chanNumberOrder(b.number) < chanNumberOrder(a.number) ? b : a));
 }
 
+/**
+ * Resolve a channel identity against one node's polled sources.m3u catalog —
+ * the SAME identity rules as resolveTvhChannel (exact-string pinned match,
+ * lowest-numbered same-name entry when unpinned), keyed by `chno` instead of
+ * tvheadend's `number`. `chno` is a required field of the wire contract, so
+ * every entry always counts as numbered.
+ */
+export function resolveCatalogEntry(
+  entries: SourceCatalogEntry[],
+  name: string,
+  number: string | null,
+): SourceCatalogEntry | null {
+  if (number != null) {
+    return entries.find((e) => e.name === name && e.chno === number) ?? null;
+  }
+  const matches = entries.filter((e) => e.name === name);
+  if (matches.length === 0) return null;
+  return matches.reduce((a, b) => (chanNumberOrder(b.chno) < chanNumberOrder(a.chno) ? b : a));
+}
+
 export interface PlacementInput {
   instanceId: string;
   nodeId: string;
@@ -159,10 +180,6 @@ export interface CreateChannelInput {
   channelName: string;
   /** STRING identity ("9.1" ≠ "9.10"); absent/null = pin-lowest at write time */
   channelNumber?: string | null;
-  /** 'tvh' (default) = tvheadend channel; 'external' = node sources.m3u catalog entry */
-  sourceType?: 'tvh' | 'external';
-  /** catalog entry id — required (non-empty) when sourceType is 'external' */
-  sourceKey?: string | null;
   profileId: string;
   /** derived from channelName when absent */
   slug?: string;
@@ -178,9 +195,6 @@ export interface ChannelPatch {
   channelName?: string;
   /** explicit null = unpin (re-pinned to the lowest same-name number when resolvable) */
   channelNumber?: string | null;
-  /** switching to 'external' requires a sourceKey (patch or existing); to 'tvh' clears it */
-  sourceType?: 'tvh' | 'external';
-  sourceKey?: string | null;
   profileId?: string;
   slug?: string;
   enabled?: boolean;
@@ -202,11 +216,12 @@ export interface PlacementPatch {
   force?: boolean;
 }
 
-/** the source identity of a channel — everything placement resolution needs */
-export interface ChannelSourceRef {
-  sourceType: 'tvh' | 'external';
-  /** catalog entry id for external channels; null for tvh */
-  sourceKey: string | null;
+/**
+ * A channel is source-agnostic: just (name, number). Each placement resolves
+ * this identity independently in its own zone — tvheadend topology first,
+ * then the node's local sources.m3u catalog by the same identity rules.
+ */
+export interface ChannelIdentity {
   channelName: string;
   channelNumber: string | null;
 }
@@ -286,16 +301,9 @@ function now(): string {
   return new Date().toISOString().slice(0, 19).replace('T', ' ');
 }
 
-/** DB channel columns → the source identity resolvePlacement consumes */
-function rowSourceRef(r: {
-  channel_name: string;
-  channel_number: string | null;
-  source_type: string;
-  source_key: string | null;
-}): ChannelSourceRef {
+/** DB channel columns → the identity resolvePlacement consumes */
+function rowIdentity(r: { channel_name: string; channel_number: string | null }): ChannelIdentity {
   return {
-    sourceType: (r.source_type as 'tvh' | 'external') ?? 'tvh',
-    sourceKey: r.source_key ?? null,
     channelName: r.channel_name,
     channelNumber: r.channel_number,
   };
@@ -484,8 +492,6 @@ export class RestreamerService {
       slug: string;
       channel_name: string;
       channel_number: string | null;
-      source_type: string;
-      source_key: string | null;
       profile_id: string;
       enabled: number;
       comment: string | null;
@@ -498,8 +504,6 @@ export class RestreamerService {
       slug: r.slug,
       channelName: r.channel_name,
       channelNumber: r.channel_number,
-      sourceType: (r.source_type as 'tvh' | 'external') ?? 'tvh',
-      sourceKey: r.source_key ?? null,
       profileId: r.profile_id,
       enabled: !!r.enabled,
       comment: r.comment,
@@ -577,13 +581,14 @@ export class RestreamerService {
         const resolution = this.resolvePlacement(
           p.instance_id,
           p.node_id,
-          rowSourceRef(c),
+          rowIdentity(c),
           p.program_number,
         );
         const nodeStatus = this.cachedNodeStatus(p.instance_id, p.node_id);
         return {
           ...this.rowToPlacement(p),
           blockedReason: resolution.ok ? null : resolution.reason,
+          resolvedVia: resolution.ok ? resolution.via : null,
           session: nodeStatus?.sessions.find((s) => s.name === c.slug) ?? null,
         };
       });
@@ -651,12 +656,6 @@ export class RestreamerService {
     const profile = await this.getProfile(input.profileId);
     if (!profile) throw httpError(400, `profile ${input.profileId} not found`);
 
-    const sourceType = input.sourceType ?? 'tvh';
-    const sourceKey = sourceType === 'external' ? (input.sourceKey ?? null) : null;
-    if (sourceType === 'external' && !sourceKey?.trim()) {
-      throw httpError(400, 'sourceKey is required for an external channel');
-    }
-
     const placements = input.placements ?? [];
     const placementKeys = new Set<string>();
     for (const p of placements) {
@@ -668,18 +667,15 @@ export class RestreamerService {
       placementKeys.add(key);
     }
 
-    // channel number identity (tvh only — external numbers come live from the
-    // catalog): given → stored verbatim as a STRING; absent → write-time pin
-    // to the lowest-numbered same-name channel across the instances that will
-    // host placements (unresolvable stays null)
-    let channelNumber =
-      sourceType === 'external' || input.channelNumber == null
-        ? null
-        : String(input.channelNumber);
-    if (sourceType === 'tvh' && channelNumber == null) {
+    // channel number identity: given → stored verbatim as a STRING; absent →
+    // write-time pin to the lowest-numbered same-name channel/catalog entry
+    // across the instances+nodes that will host placements (unresolvable
+    // stays null)
+    let channelNumber = input.channelNumber == null ? null : String(input.channelNumber);
+    if (channelNumber == null) {
       channelNumber = this.pinChannelNumber(
         input.channelName,
-        placements.map((p) => p.instanceId),
+        placements.map((p) => ({ instanceId: p.instanceId, nodeId: p.nodeId })),
       );
     }
 
@@ -692,7 +688,7 @@ export class RestreamerService {
           nodeId: p.nodeId,
           programOverride: p.programNumber ?? null,
         })),
-        { sourceType, sourceKey, channelName: input.channelName, channelNumber },
+        { channelName: input.channelName, channelNumber },
         'create',
       );
     }
@@ -712,8 +708,6 @@ export class RestreamerService {
         slug,
         channel_name: input.channelName,
         channel_number: channelNumber,
-        source_type: sourceType,
-        source_key: sourceKey,
         profile_id: input.profileId,
         enabled: input.enabled === false ? 0 : 1,
         comment: input.comment ?? null,
@@ -768,20 +762,6 @@ export class RestreamerService {
     const channelName = nameSet ? patch.channelName! : existing.channel_name;
     if (nameSet && !channelName) throw httpError(400, 'channelName must not be empty');
 
-    const typeSet = patch.sourceType !== undefined;
-    const sourceType = typeSet ? patch.sourceType! : ((existing.source_type as 'tvh' | 'external') ?? 'tvh');
-    const switchedToTvh = sourceType === 'tvh' && existing.source_type === 'external';
-    let sourceKey: string | null;
-    if (sourceType === 'external') {
-      sourceKey = patch.sourceKey !== undefined ? patch.sourceKey : (existing.source_key ?? null);
-      if (!sourceKey?.trim()) {
-        throw httpError(400, 'sourceKey is required for an external channel');
-      }
-    } else {
-      // tvh channels never carry a catalog key — switching back clears it
-      sourceKey = null;
-    }
-
     const placementRows = await this.db
       .selectFrom('restream_placements')
       .select(['instance_id', 'node_id', 'program_number'])
@@ -789,30 +769,24 @@ export class RestreamerService {
       .execute();
 
     // channel identity is a (name, number) pair: a patch that sets the name
-    // WITHOUT an explicit number must never inherit the previous pin. External
-    // channels store no number at all (chno comes live from the catalog).
+    // WITHOUT an explicit number must never inherit the previous pin.
     let channelNumber: string | null;
-    if (sourceType === 'external') channelNumber = null;
-    else if (numberSet) channelNumber = patch.channelNumber == null ? null : String(patch.channelNumber);
+    if (numberSet) channelNumber = patch.channelNumber == null ? null : String(patch.channelNumber);
     else if (nameSet) channelNumber = null;
     else channelNumber = existing.channel_number;
 
-    // write-time pin-lowest across the instances hosting this channel (tvh
-    // only; a switch back from external re-pins too)
-    if (sourceType === 'tvh' && channelNumber == null && (nameSet || numberSet || switchedToTvh)) {
+    // write-time pin-lowest across the instances+nodes hosting this channel
+    if (channelNumber == null && (nameSet || numberSet)) {
       channelNumber = this.pinChannelNumber(
         channelName,
-        placementRows.map((p) => p.instance_id),
+        placementRows.map((p) => ({ instanceId: p.instance_id, nodeId: p.node_id })),
       );
     }
 
     // an identity change must re-validate EVERY existing placement against
     // the new identity (409 lists all failures); non-identity patches never check
     const identityChanged =
-      channelName !== existing.channel_name ||
-      channelNumber !== existing.channel_number ||
-      sourceType !== ((existing.source_type as 'tvh' | 'external') ?? 'tvh') ||
-      sourceKey !== (existing.source_key ?? null);
+      channelName !== existing.channel_name || channelNumber !== existing.channel_number;
     if (identityChanged && !patch.force) {
       this.assertPlacementsAvailable(
         placementRows.map((p) => ({
@@ -820,7 +794,7 @@ export class RestreamerService {
           nodeId: p.node_id,
           programOverride: p.program_number,
         })),
-        { sourceType, sourceKey, channelName, channelNumber },
+        { channelName, channelNumber },
         'update',
       );
     }
@@ -842,8 +816,6 @@ export class RestreamerService {
       .set({
         channel_name: channelName,
         channel_number: channelNumber,
-        source_type: sourceType,
-        source_key: sourceKey,
         slug,
         profile_id: profileId,
         enabled: patch.enabled === undefined ? existing.enabled : patch.enabled ? 1 : 0,
@@ -948,27 +920,43 @@ export class RestreamerService {
   // ---------- channel identity / slug helpers ----------
 
   /**
-   * Write-time pin: lowest-numbered channel with this name (chanNumberOrder,
-   * ordering only — identity stays exact-string) across the instances that
-   * host placements of the channel. Null when nothing resolves — push-time
-   * resolution then falls back to lowest-at-compute per instance.
+   * Write-time pin: lowest-numbered channel/catalog-entry with this name
+   * (chanNumberOrder, ordering only — identity stays exact-string) across the
+   * UNION of the placements' instance topologies AND their nodes' sources
+   * catalogs. Null when nothing resolves anywhere — push-time resolution then
+   * falls back to lowest-at-compute per placement.
    */
-  private pinChannelNumber(channelName: string, instanceIds: string[]): string | null {
+  private pinChannelNumber(
+    channelName: string,
+    placements: Array<{ instanceId: string; nodeId: string }>,
+  ): string | null {
     let lowest: string | null = null;
-    for (const id of new Set(instanceIds)) {
+    const consider = (candidate: string): void => {
+      if (lowest == null || chanNumberOrder(candidate) < chanNumberOrder(lowest)) lowest = candidate;
+    };
+
+    const instanceIds = new Set(placements.map((p) => p.instanceId));
+    for (const id of instanceIds) {
       if (!this.cache.has(id)) continue;
       const topo = this.cache.get(id).topology;
       if (!topo) continue;
       for (const c of topo.channels) {
-        if (
-          c.name === channelName &&
-          c.number != null &&
-          (lowest == null || chanNumberOrder(c.number) < chanNumberOrder(lowest))
-        ) {
-          lowest = c.number;
-        }
+        if (c.name === channelName && c.number != null) consider(c.number);
       }
     }
+
+    const seenNodes = new Set<string>();
+    for (const p of placements) {
+      const key = nodeKey(p.instanceId, p.nodeId);
+      if (seenNodes.has(key)) continue;
+      seenNodes.add(key);
+      const sources = this.cachedNodeStatus(p.instanceId, p.nodeId)?.sources;
+      if (!sources) continue;
+      for (const e of sources) {
+        if (e.name === channelName) consider(e.chno);
+      }
+    }
+
     return lowest;
   }
 
@@ -1043,12 +1031,7 @@ export class RestreamerService {
             programOverride: input.programNumber ?? null,
           },
         ],
-        {
-          sourceType: channel.sourceType,
-          sourceKey: channel.sourceKey,
-          channelName: channel.channelName,
-          channelNumber: channel.channelNumber,
-        },
+        { channelName: channel.channelName, channelNumber: channel.channelNumber },
         'add',
       );
     }
@@ -1113,7 +1096,7 @@ export class RestreamerService {
       if (!patch.force) {
         const chanRow = await this.db
           .selectFrom('restream_channels')
-          .select(['channel_name', 'channel_number', 'source_type', 'source_key'])
+          .select(['channel_name', 'channel_number'])
           .where('id', '=', existing.channel_id)
           .executeTakeFirstOrThrow();
         this.assertPlacementsAvailable(
@@ -1125,7 +1108,7 @@ export class RestreamerService {
                 patch.programNumber === undefined ? existing.program_number : patch.programNumber,
             },
           ],
-          rowSourceRef(chanRow),
+          rowIdentity(chanRow),
           'move',
         );
       }
@@ -1362,13 +1345,17 @@ export class RestreamerService {
   // ---------- desired-doc computation ----------
 
   /**
-   * Resolve one placement to a session source + program number.
-   * - tvh: (channel uuid, program number) against the instance's live
-   *   topology. Failure reasons follow SyncEngine.validateNames wording; the
-   *   program number is ALWAYS a number (override or lowest linked-service SID).
-   * - external: the node's polled sources catalog, keyed by `sourceKey` — a
-   *   `{url}` source; programNumber = placement override, else undefined (the
-   *   daemon PAT-probes).
+   * Resolve one placement to a session source + program number. Each
+   * placement resolves the (name, number) identity independently in its own
+   * zone: tvheadend topology FIRST, then — only on a tvh miss — the node's
+   * polled sources.m3u catalog by the SAME identity rules (exact-string pin,
+   * lowest-numbered same-name entry when unpinned).
+   * - tvh hit: (channel uuid, program number) — override wins, else the
+   *   lowest linked-service SID; underivable + no override blocks WITHOUT
+   *   trying the catalog (the identity did resolve — the tvh session just
+   *   cannot be built).
+   * - catalog hit (only on a tvh miss): a `{url}` source; programNumber =
+   *   placement override, else undefined (the daemon PAT-probes).
    * Every reason is also what listChannels surfaces as blockedReason. An
    * unknown instance/node on an EXISTING row (config shrank) is a reason,
    * never a crash.
@@ -1376,10 +1363,10 @@ export class RestreamerService {
   private resolvePlacement(
     instanceId: string,
     nodeId: string,
-    ch: ChannelSourceRef,
+    ch: ChannelIdentity,
     programOverride: number | null,
   ):
-    | { ok: true; source: SessionSource; programNumber: number | undefined }
+    | { ok: true; source: SessionSource; programNumber: number | undefined; via: 'tvh' | 'catalog' }
     | { ok: false; reason: string } {
     const inst = this.config.instances.find((i) => i.id === instanceId);
     if (!inst) return { ok: false, reason: `instance "${instanceId}" is not configured` };
@@ -1390,78 +1377,83 @@ export class RestreamerService {
       };
     }
 
-    if (ch.sourceType === 'external') {
-      const key = nodeKey(instanceId, nodeId);
-      const status = this.cachedNodeStatus(instanceId, nodeId);
-      const sources = status?.sources ?? null;
-      if (sources === null) {
-        return { ok: false, reason: `sources catalog not loaded for node ${key}` };
-      }
-      if (status!.sourcesHash === null && sources.length === 0) {
-        return {
-          ok: false,
-          reason: `node ${key} has no sources catalog configured (sourcesM3u)`,
-        };
-      }
-      const entry = sources.find((e) => e.id === ch.sourceKey);
-      if (!entry) {
-        return {
-          ok: false,
-          reason: `external source "${ch.sourceKey}" is not in node ${key}'s catalog`,
-        };
-      }
-      return { ok: true, source: { url: entry.url }, programNumber: programOverride ?? undefined };
-    }
-
     const topo = this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
     if (!topo) return { ok: false, reason: `topology not loaded for instance ${instanceId}` };
 
     const channel = resolveTvhChannel(topo.channels, ch.channelName, ch.channelNumber);
-    if (!channel) {
+    if (channel) {
+      if (programOverride != null) {
+        return {
+          ok: true,
+          source: { channelUuid: channel.uuid },
+          programNumber: programOverride,
+          via: 'tvh',
+        };
+      }
+      const svcUuids = new Set(channel.services ?? []);
+      const sids = topo.services
+        .filter((s) => svcUuids.has(s.uuid) && typeof s.sid === 'number')
+        .map((s) => s.sid as number);
+      if (!sids.length) {
+        return {
+          ok: false,
+          reason: `cannot derive program number for channel "${ch.channelName}" on instance ${instanceId} — no linked service reports a SID; set a manual override`,
+        };
+      }
       return {
-        ok: false,
-        reason:
-          ch.channelNumber != null
-            ? `channel "${ch.channelName}" (#${ch.channelNumber}) not found on instance ${instanceId}`
-            : `channel "${ch.channelName}" not found on instance ${instanceId}`,
+        ok: true,
+        source: { channelUuid: channel.uuid },
+        programNumber: Math.min(...sids),
+        via: 'tvh',
       };
     }
-    if (programOverride != null) {
-      return { ok: true, source: { channelUuid: channel.uuid }, programNumber: programOverride };
-    }
-    const svcUuids = new Set(channel.services ?? []);
-    const sids = topo.services
-      .filter((s) => svcUuids.has(s.uuid) && typeof s.sid === 'number')
-      .map((s) => s.sid as number);
-    if (!sids.length) {
+
+    // tvh miss — fall back to the node's sources catalog by the same identity
+    const key = nodeKey(instanceId, nodeId);
+    const suffix = ch.channelNumber != null ? ` (#${ch.channelNumber})` : '';
+    const sources = this.cachedNodeStatus(instanceId, nodeId)?.sources ?? null;
+    if (sources === null) {
       return {
         ok: false,
-        reason: `cannot derive program number for channel "${ch.channelName}" on instance ${instanceId} — no linked service reports a SID; set a manual override`,
+        reason: `channel "${ch.channelName}"${suffix} not found on instance ${instanceId}; node ${key}'s sources catalog not loaded`,
       };
     }
-    return { ok: true, source: { channelUuid: channel.uuid }, programNumber: Math.min(...sids) };
+    const entry = resolveCatalogEntry(sources, ch.channelName, ch.channelNumber);
+    if (!entry) {
+      return {
+        ok: false,
+        reason: `channel "${ch.channelName}"${suffix} not found on instance ${instanceId} nor in node ${key}'s sources catalog`,
+      };
+    }
+    return {
+      ok: true,
+      source: { url: entry.url },
+      programNumber: programOverride ?? undefined,
+      via: 'catalog',
+    };
   }
 
   /**
    * Write-time availability of one placement target for a channel identity:
-   * - 'ok'      — resolves right now (session would run).
-   * - 'unknown' — cannot be judged yet (tvh: topology not loaded; external:
-   *   node catalog never fetched) → allow the write, lazy blocking covers it.
-   * - {reason}  — the target is KNOWN not to serve this identity (resolve
-   *   miss, catalog miss, or a tvh SID underivable without an override).
+   * - 'ok'      — resolves right now (session would run), via tvh or catalog.
+   * - 'unknown' — cannot be judged yet: topology not loaded, or a tvh miss
+   *   whose node catalog was never fetched → allow the write, lazy blocking
+   *   covers it.
+   * - {reason}  — BOTH sides are known and it still misses (resolve miss on
+   *   both, or a tvh hit with a SID underivable without an override).
    */
   private placementAvailability(
     instanceId: string,
     nodeId: string,
-    ch: ChannelSourceRef,
+    ch: ChannelIdentity,
     programOverride: number | null,
   ): 'ok' | 'unknown' | { reason: string } {
-    if (ch.sourceType === 'external') {
+    const topo = this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
+    if (!topo) return 'unknown';
+    const tvhHit = resolveTvhChannel(topo.channels, ch.channelName, ch.channelNumber) != null;
+    if (!tvhHit) {
       const sources = this.cachedNodeStatus(instanceId, nodeId)?.sources ?? null;
       if (sources === null) return 'unknown';
-    } else {
-      const topo = this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
-      if (!topo) return 'unknown';
     }
     const resolved = this.resolvePlacement(instanceId, nodeId, ch, programOverride);
     return resolved.ok ? 'ok' : { reason: resolved.reason };
@@ -1474,7 +1466,7 @@ export class RestreamerService {
    */
   private assertPlacementsAvailable(
     targets: Array<{ instanceId: string; nodeId: string; programOverride: number | null }>,
-    ch: ChannelSourceRef,
+    ch: ChannelIdentity,
     verb: string,
   ): void {
     const unavailable: UnavailablePlacement[] = [];
@@ -1521,8 +1513,6 @@ export class RestreamerService {
         'c.slug',
         'c.channel_name',
         'c.channel_number',
-        'c.source_type',
-        'c.source_key',
         'pr.payload as profile_payload',
       ])
       .where('p.instance_id', '=', instanceId)
@@ -1537,7 +1527,7 @@ export class RestreamerService {
       const resolved = this.resolvePlacement(
         instanceId,
         nodeId,
-        rowSourceRef(row),
+        rowIdentity(row),
         row.program_number,
       );
       if (!resolved.ok) {

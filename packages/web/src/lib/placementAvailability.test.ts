@@ -18,7 +18,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { ChannelOption, RestreamerNodeStatus, SourceCatalogEntry } from '@tvhc/shared';
-import { externalAvailability, tvhAvailability } from './placementAvailability.js';
+import { placementAvailability } from './placementAvailability.js';
 
 function channel(name: string, number: string | null, instances: string[]): ChannelOption {
   return { name, number, instances, eitOffsetMinutes: null };
@@ -32,48 +32,14 @@ const options: ChannelOption[] = [
   channel('NoNumber', null, ['seoul']),
 ];
 
-describe('tvhAvailability', () => {
-  it('is unknown when the option list has not loaded (empty)', () => {
-    expect(tvhAvailability('KBS1', '9', 'seoul', [])).toBe('unknown');
-  });
-
-  it('is ok for a pinned (name, number) pair present on the instance', () => {
-    expect(tvhAvailability('KBS1', '9', 'seoul', options)).toBe('ok');
-    expect(tvhAvailability('KBS1', '9', 'busan', options)).toBe('ok');
-  });
-
-  it('pinned numbers are exact STRING identity — "9.1" never matches "9.10"', () => {
-    expect(tvhAvailability('SubChan', '9.1', 'tokyo', options)).toBe('ok');
-    expect(tvhAvailability('SubChan', '9.1', 'osaka', options)).toBe('unavailable');
-    expect(tvhAvailability('SubChan', '9.10', 'osaka', options)).toBe('ok');
-    expect(tvhAvailability('SubChan', '9.10', 'tokyo', options)).toBe('unavailable');
-  });
-
-  it('is unavailable when the pinned number does not exist under that name', () => {
-    expect(tvhAvailability('KBS1', '10', 'seoul', options)).toBe('unavailable');
-  });
-
-  it('filters by instance: same pair on another instance is unavailable', () => {
-    expect(tvhAvailability('KBS1', '51', 'seoul', options)).toBe('ok');
-    expect(tvhAvailability('KBS1', '51', 'busan', options)).toBe('unavailable');
-  });
-
-  it('null number (unpinned) matches ANY same-name channel on the instance', () => {
-    expect(tvhAvailability('KBS1', null, 'seoul', options)).toBe('ok');
-    expect(tvhAvailability('KBS1', null, 'busan', options)).toBe('ok');
-    expect(tvhAvailability('NoNumber', null, 'seoul', options)).toBe('ok');
-  });
-
-  it('null number is unavailable when the name is absent from the instance', () => {
-    expect(tvhAvailability('KBS1', null, 'tokyo', options)).toBe('unavailable');
-    expect(tvhAvailability('Missing', null, 'seoul', options)).toBe('unavailable');
-  });
-});
-
-function node(sources: SourceCatalogEntry[] | null): RestreamerNodeStatus {
+function node(
+  nodeId: string,
+  sources: SourceCatalogEntry[] | null,
+  instanceId = 'seoul',
+): RestreamerNodeStatus {
   return {
-    instanceId: 'seoul',
-    nodeId: 'node1',
+    instanceId,
+    nodeId,
     url: 'http://node1:8080',
     serveUrl: null,
     reachable: true,
@@ -90,30 +56,84 @@ function node(sources: SourceCatalogEntry[] | null): RestreamerNodeStatus {
   };
 }
 
-describe('externalAvailability', () => {
-  const entries: SourceCatalogEntry[] = [
-    { id: 'louise', name: 'Louise', url: 'https://louise.example/stream' },
-    { id: 'radio-2', name: 'Radio 2', url: 'https://radio.example/2', chno: '99' },
-  ];
+const catalogEntries: SourceCatalogEntry[] = [
+  { id: 'louise', name: 'Louise', url: 'https://louise.example/stream', chno: '1' },
+  { id: 'radio-2', name: 'Radio 2', url: 'https://radio.example/2', chno: '99' },
+  { id: 'subchan-tokyo', name: 'SubChan', url: 'https://sub.example/tokyo', chno: '9.1' },
+];
 
-  it('is unknown when the node status is missing (not polled / unknown node)', () => {
-    expect(externalAvailability('louise', undefined)).toBe('unknown');
+describe('placementAvailability', () => {
+  it('is unknown when the tvh option list has not loaded (empty), regardless of the catalog', () => {
+    expect(
+      placementAvailability('KBS1', '9', 'seoul', 'node1', [], node('node1', catalogEntries)),
+    ).toBe('unknown');
   });
 
-  it('is unknown when the catalog was never fetched (sources null)', () => {
-    expect(externalAvailability('louise', node(null))).toBe('unknown');
+  it('is ok on a tvh hit — pinned (name, number) present on the instance', () => {
+    expect(
+      placementAvailability('KBS1', '9', 'seoul', 'node1', options, undefined),
+    ).toBe('ok');
   });
 
-  it('is ok when the entry is in the node catalog', () => {
-    expect(externalAvailability('louise', node(entries))).toBe('ok');
-    expect(externalAvailability('radio-2', node(entries))).toBe('ok');
+  it('is ok on a tvh hit for the unpinned form (any same-name channel on the instance)', () => {
+    expect(
+      placementAvailability('KBS1', null, 'seoul', 'node1', options, undefined),
+    ).toBe('ok');
   });
 
-  it('is unavailable when a KNOWN catalog lacks the entry', () => {
-    expect(externalAvailability('missing', node(entries))).toBe('unavailable');
+  it('falls back to the catalog on a tvh known-miss and finds a hit', () => {
+    // "Louise" is absent from every tvh instance, but the node's catalog has it.
+    expect(
+      placementAvailability('Louise', '1', 'seoul', 'node1', options, node('node1', catalogEntries)),
+    ).toBe('ok');
   });
 
-  it('is unavailable against a known-empty catalog ([])', () => {
-    expect(externalAvailability('louise', node([]))).toBe('unavailable');
+  it('pinned chno is exact STRING identity on the catalog side too — "9.1" never matches "9.10"', () => {
+    // tvh has SubChan 9.1 on tokyo and 9.10 on osaka; querying busan (tvh miss)
+    // falls to the catalog, which only carries the 9.1 entry.
+    expect(
+      placementAvailability(
+        'SubChan',
+        '9.1',
+        'busan',
+        'node1',
+        options,
+        node('node1', catalogEntries, 'busan'),
+      ),
+    ).toBe('ok');
+    expect(
+      placementAvailability(
+        'SubChan',
+        '9.10',
+        'busan',
+        'node1',
+        options,
+        node('node1', catalogEntries, 'busan'),
+      ),
+    ).toBe('unavailable');
+  });
+
+  it('is unavailable when both tvh and a known catalog miss', () => {
+    expect(
+      placementAvailability('Missing', null, 'seoul', 'node1', options, node('node1', catalogEntries)),
+    ).toBe('unavailable');
+    expect(
+      placementAvailability('Missing', null, 'seoul', 'node1', options, node('node1', [])),
+    ).toBe('unavailable');
+  });
+
+  it('is unknown when the tvh side misses and the catalog was never fetched or the node is unknown', () => {
+    expect(
+      placementAvailability('Louise', '1', 'seoul', 'node1', options, node('node1', null)),
+    ).toBe('unknown');
+    expect(
+      placementAvailability('Louise', '1', 'seoul', 'node1', options, undefined),
+    ).toBe('unknown');
+  });
+
+  it('ignores a node status keyed to a different nodeId (wrong lookup) as unknown', () => {
+    expect(
+      placementAvailability('Louise', '1', 'seoul', 'node1', options, node('node2', catalogEntries)),
+    ).toBe('unknown');
   });
 });

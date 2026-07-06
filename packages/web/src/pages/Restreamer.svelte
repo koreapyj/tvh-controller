@@ -522,18 +522,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           />
         </td>
         <td class="m-inline">
-          {#if c.sourceType === 'external'}
-            <span class="badge info" title="external source: {c.sourceKey}">ext</span>
-            {c.channelName}
-          {:else}
-            {#if c.channelNumber == null}
-              {@const n = lowestNumberFor(c.channelName, $channelOptions)}
-              {#if n !== null}
-                <span class="muted" title="not pinned — targets the lowest-numbered channel with this name">{n}　</span>
-              {/if}
+          {#if c.channelNumber == null}
+            {@const n = lowestNumberFor(c.channelName, $channelOptions)}
+            {#if n !== null}
+              <span class="muted" title="not pinned — targets the lowest-numbered channel with this name">{n}　</span>
             {/if}
-            {chanLabel(c.channelName, c.channelNumber)}
           {/if}
+          {chanLabel(c.channelName, c.channelNumber)}
           {#if c.comment}<div class="muted small">{c.comment}</div>{/if}
         </td>
         <td class="small m-inline">
@@ -570,7 +565,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               title={placementTitle(c, p)}
               onclick={() => forceSwitch(c, p.id, `${$instName(p.instanceId)} / ${p.nodeId}`)}
             >
-              {p.nodeId}{#if p.blockedReason}&nbsp;⚠{/if}
+              {p.nodeId}{#if p.resolvedVia === 'catalog'}<span class="muted" title="resolved from the node's sources catalog">&nbsp;ext</span>{/if}{#if p.blockedReason}&nbsp;⚠{/if}
             </button>
             {#if c.activePlacementId === p.id && c.placements.length > 1}
               <span class="badge ok" title="the switcher currently serves this placement">active</span>

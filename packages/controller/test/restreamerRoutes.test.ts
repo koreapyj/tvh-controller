@@ -332,6 +332,9 @@ describe('restreamer channel routes', () => {
     const channel = created.json() as RestreamChannel;
     expect(channel.slug).toBe('at-x');
     expect(channel.channelNumber).toBe('9.1');
+    // the sourceType/sourceKey model is gone — the DTO no longer carries them
+    expect(channel).not.toHaveProperty('sourceType');
+    expect(channel).not.toHaveProperty('sourceKey');
 
     const list = await app.inject({ method: 'GET', url: '/api/restreamer/channels' });
     expect(list.statusCode).toBe(200);
@@ -339,6 +342,7 @@ describe('restreamer channel routes', () => {
     expect(withStatus!.profileName).toBe('default');
     expect(withStatus!.placements).toHaveLength(1);
     expect(withStatus!.placements[0]!.blockedReason).toBeNull();
+    expect(withStatus!.placements[0]!.resolvedVia).toBe('tvh');
     expect(withStatus!.placements[0]!.session?.state).toBe('running');
     // a switcher is configured -> even a single-placement channel is fronted by it
     expect(withStatus!.playbackUrl).toBe('http://sw.example/hls/at-x/playlist.m3u8');
@@ -421,7 +425,7 @@ describe('restreamer channel routes', () => {
 
 // ---------- write-time availability + external source parsing ----------
 
-describe('write-time availability and external sources (routes)', () => {
+describe('write-time availability and catalog-resolved identity (routes)', () => {
   const CAM: SourceCatalogEntry = {
     id: 'cam1',
     name: 'Cam 1',
@@ -431,8 +435,9 @@ describe('write-time availability and external sources (routes)', () => {
   };
 
   it('create 409s with {error, unavailable:[{instanceId,nodeId,reason}]}; force creates', async () => {
-    const { app } = await harness();
+    const { app, cache } = await harness();
     const profile = await createProfile(app);
+    seedNodeStatus(cache, 'zone2', 'n1', [], []); // known-empty catalog — no fallback either
     const payload = {
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -447,7 +452,8 @@ describe('write-time availability and external sources (routes)', () => {
         {
           instanceId: 'zone2',
           nodeId: 'n1',
-          reason: 'channel "AT-X" (#9.1) not found on instance zone2',
+          reason:
+            'channel "AT-X" (#9.1) not found on instance zone2 nor in node zone2/n1\'s sources catalog',
         },
       ],
     });
@@ -461,8 +467,9 @@ describe('write-time availability and external sources (routes)', () => {
   });
 
   it('PUT channel identity change 409s with the shape; force passes', async () => {
-    const { app } = await harness();
+    const { app, cache } = await harness();
     const profile = await createProfile(app);
+    seedNodeStatus(cache, 'zone1', 'n1', [], []); // known-empty catalog — no fallback either
     const created = await app.inject({
       method: 'POST',
       url: '/api/restreamer/channels',
@@ -484,7 +491,11 @@ describe('write-time availability and external sources (routes)', () => {
     expect(denied.json()).toEqual({
       error: expect.stringContaining('— pass force to update anyway'),
       unavailable: [
-        { instanceId: 'zone1', nodeId: 'n1', reason: 'channel "Ghost" not found on instance zone1' },
+        {
+          instanceId: 'zone1',
+          nodeId: 'n1',
+          reason: 'channel "Ghost" not found on instance zone1 nor in node zone1/n1\'s sources catalog',
+        },
       ],
     });
 
@@ -498,8 +509,9 @@ describe('write-time availability and external sources (routes)', () => {
   });
 
   it('placement add and move 409 with the shape; force passes', async () => {
-    const { app } = await harness();
+    const { app, cache } = await harness();
     const profile = await createProfile(app);
+    seedNodeStatus(cache, 'zone2', 'n1', [], []); // known-empty catalog — no fallback either
     const created = await app.inject({
       method: 'POST',
       url: '/api/restreamer/channels',
@@ -544,60 +556,10 @@ describe('write-time availability and external sources (routes)', () => {
     expect(moveForced.statusCode).toBe(200);
   });
 
-  it('rejects an invalid sourceType enum (400) on create and update', async () => {
-    const { app } = await harness();
-    const profile = await createProfile(app);
-    const bad = await app.inject({
-      method: 'POST',
-      url: '/api/restreamer/channels',
-      payload: { channelName: 'X', profileId: profile.id, sourceType: 'weird' },
-    });
-    expect(bad.statusCode).toBe(400);
-
-    const created = await app.inject({
-      method: 'POST',
-      url: '/api/restreamer/channels',
-      payload: { channelName: 'AT-X', channelNumber: '9.1', profileId: profile.id },
-    });
-    const channel = created.json() as RestreamChannel;
-    const badPatch = await app.inject({
-      method: 'PUT',
-      url: `/api/restreamer/channels/${channel.id}`,
-      payload: { sourceType: 'weird' },
-    });
-    expect(badPatch.statusCode).toBe(400);
-  });
-
-  it('parses sourceType/sourceKey on create; external without a key is a 400', async () => {
-    const { app } = await harness();
-    const profile = await createProfile(app);
-    const missingKey = await app.inject({
-      method: 'POST',
-      url: '/api/restreamer/channels',
-      payload: { channelName: 'Cam', profileId: profile.id, sourceType: 'external' },
-    });
-    expect(missingKey.statusCode).toBe(400);
-
-    const created = await app.inject({
-      method: 'POST',
-      url: '/api/restreamer/channels',
-      payload: {
-        channelName: 'Cam 1',
-        profileId: profile.id,
-        sourceType: 'external',
-        sourceKey: 'cam1',
-      },
-    });
-    expect(created.statusCode).toBe(201);
-    const channel = created.json() as RestreamChannel;
-    expect(channel.sourceType).toBe('external');
-    expect(channel.sourceKey).toBe('cam1');
-    expect(channel.channelNumber).toBeNull();
-  });
-
   it('batch edit forwards force through the patch', async () => {
-    const { app } = await harness();
+    const { app, cache } = await harness();
     const profile = await createProfile(app);
+    seedNodeStatus(cache, 'zone1', 'n1', [], []); // known-empty catalog — no fallback either
     const created = await app.inject({
       method: 'POST',
       url: '/api/restreamer/channels',
@@ -627,11 +589,11 @@ describe('write-time availability and external sources (routes)', () => {
     expect((forced.json() as Array<{ ok: boolean }>)[0]!.ok).toBe(true);
   });
 
-  it('renders external channels in the M3U from the node catalog, sorted among tvh channels by chno', async () => {
+  it('renders catalog-resolved channels in the M3U among tvh channels, sorted by chno', async () => {
     const h = await harness();
     const profile = await createProfile(h.app);
     const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'TV' });
-    // the catalog must be in the cache BEFORE the external create (write-time
+    // the catalog must be in the cache BEFORE the "Cam 1" create (write-time
     // availability checks it) — sessions running so the entries render
     seedNodeStatus(
       h.cache,
@@ -653,20 +615,18 @@ describe('write-time availability and external sources (routes)', () => {
       playlistIds: [playlist.id],
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
+    // "Cam 1" is absent from zone1's tvh topology — resolves via the node catalog
     await post({
       channelName: 'Cam 1',
+      channelNumber: '5', // matches CAM's chno exactly
       profileId: profile.id,
-      sourceType: 'external',
-      sourceKey: 'cam1',
       playlistIds: [playlist.id],
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
-    // catalog entry missing everywhere → identity falls back to the bare key
+    // resolves nowhere (neither tvh nor the catalog) → identity falls back to nulls
     await post({
       channelName: 'Cam 9',
       profileId: profile.id,
-      sourceType: 'external',
-      sourceKey: 'cam9',
       playlistIds: [playlist.id],
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
       force: true,
@@ -679,8 +639,8 @@ describe('write-time availability and external sources (routes)', () => {
     });
     expect(res.statusCode).toBe(200);
     // chno sort: cam1 ("5") < AT-X ("9.1") < cam9 (numberless last); the
-    // external logo is the catalog value VERBATIM (never proxied), tvg-id is
-    // the sourceKey, tvg-chno the catalog chno
+    // catalog-resolved logo is the entry value VERBATIM (never proxied),
+    // tvg-id is the catalog entry id, tvg-chno the catalog chno
     expect(res.body).toBe(
       [
         '#EXTM3U',
@@ -690,7 +650,7 @@ describe('write-time availability and external sources (routes)', () => {
         'http://sw.example/hls/cam-1/playlist.m3u8',
         '#EXTINF:-1 tvg-id="ch-atx-91" tvg-chno="9.1" x-url="at-x" tvg-logo="http://ctrl.example/logos/zone1/imagecache/32736",AT-X',
         'http://sw.example/hls/at-x/playlist.m3u8',
-        '#EXTINF:-1 tvg-id="cam9" x-url="cam-9",Cam 9',
+        '#EXTINF:-1 x-url="cam-9",Cam 9',
         'http://sw.example/hls/cam-9/playlist.m3u8',
         '',
       ].join('\n'),

@@ -105,10 +105,6 @@ export interface RestreamChannelsTable {
   channel_name: string;
   /** STRING channel-number identity (e.g. "9.1", exact match); NULL = pin lowest-numbered */
   channel_number: string | null;
-  /** 'tvh' (tvheadend channel, name+number identity) | 'external' (node-local sources.m3u entry) */
-  source_type: Generated<string>;
-  /** catalog entry id (tvg-id) for external channels; NULL for tvh channels */
-  source_key: string | null;
   /** one profile per logical channel — redundant encodes keep matching variant sets */
   profile_id: string;
   enabled: number;

@@ -69,13 +69,6 @@ export interface RestreamChannel {
    * null = the LOWEST-numbered channel with that name on each instance.
    */
   channelNumber: string | null;
-  /**
-   * 'tvh' = tvheadend channel (name+number identity); 'external' = entry of a
-   * restreamer node's local sources.m3u catalog (keyed by `sourceKey`)
-   */
-  sourceType: 'tvh' | 'external';
-  /** catalog entry id (`tvg-id`) for external channels; null for tvh channels */
-  sourceKey: string | null;
   profileId: string;
   enabled: boolean;
   comment: string | null;
@@ -90,6 +83,12 @@ export interface RestreamChannelWithStatus extends RestreamChannel {
     RestreamPlacement & {
       /** why this placement is excluded from the node's desired doc; null = ok */
       blockedReason: string | null;
+      /**
+       * which source resolved this placement's channel identity right now:
+       * 'tvh' = tvheadend topology, 'catalog' = the node's sources.m3u catalog,
+       * null = blocked/unknown (see blockedReason)
+       */
+      resolvedVia: 'tvh' | 'catalog' | null;
       /** live session status from the node's last poll; null = unknown/absent */
       session: SessionStatus | null;
     }

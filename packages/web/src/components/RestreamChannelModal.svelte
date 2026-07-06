@@ -22,7 +22,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     type RestreamChannelWithStatus,
     type RestreamPlaylist,
     type RestreamProfile,
-    type SourceCatalogEntry,
   } from '@tvhc/shared';
   import {
     api,
@@ -33,15 +32,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { lowestNumberFor, parseChannelInput } from '../lib/channelPick.js';
   import { errText } from '../lib/fetchGuard.js';
   import { notify } from '../lib/notifications.js';
-  import { externalAvailability, tvhAvailability } from '../lib/placementAvailability.js';
+  import { placementAvailability } from '../lib/placementAvailability.js';
   import { deriveSlug, SLUG_PATTERN } from '../lib/restreamFields.js';
-  import { channelOptions, instName, restreamerNodes } from '../lib/stores.js';
+  import { channelOptions, instName, restreamerNodeKey, restreamerNodes } from '../lib/stores.js';
 
   // Logical restream channel editor. Channel identity follows the controller
   // rules: the number is a STRING pinned alongside the name; blank = null =
   // the LOWEST-numbered channel with that name on each placement's instance.
-  // External channels target a node-local sources.m3u catalog entry instead
-  // (keyed by sourceKey, no number pin).
+  // Each placement resolves this identity independently — tvheadend topology
+  // first, then (automatically, no separate UI concept) a node's local
+  // sources.m3u catalog by the same (name, number) rules.
   // Placements: local rows on create (submitted with the channel), live API
   // operations on edit (each add/reorder/patch/remove hits its endpoint).
 
@@ -66,8 +66,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   let channelInput = $state(channel ? channel.channelName : '');
   let numberVal = $state(channel?.channelNumber ?? '');
-  let sourceType: 'tvh' | 'external' = $state(channel?.sourceType ?? 'tvh');
-  let sourceKeyVal = $state(channel?.sourceKey ?? '');
   let slugVal = $state(channel?.slug ?? '');
   let profileId = $state(channel?.profileId ?? profiles[0]?.id ?? '');
   let comment = $state(channel?.comment ?? '');
@@ -80,56 +78,70 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   // ---------- channel identity ----------
 
-  const pick = $derived(parseChannelInput(channelInput.trim(), $channelOptions));
-  /** picking a "N　Name" option from the datalist also fills the number pin */
+  /** one node's catalog entry not already covered by a tvh (name, chno) pair */
+  interface CatalogPick {
+    name: string;
+    number: string;
+    /** datalist option text: chanLabel + a catalog-only marker */
+    label: string;
+  }
+
+  /**
+   * catalog entries merged into the picker, deduped by (name, chno) against
+   * both the tvh channel list and each other (several nodes may carry the
+   * same entry). Numbers matter now — catalog matching is identity-based —
+   * so picking one of these also pins the number (see onChannelInput).
+   */
+  const catalogOnlyOptions = $derived.by((): CatalogPick[] => {
+    const tvhKeys = new Set($channelOptions.map((c) => chanKey(c.name, c.number)));
+    const seen = new Set<string>();
+    const out: CatalogPick[] = [];
+    for (const node of Object.values($restreamerNodes)) {
+      for (const e of node.sources ?? []) {
+        const key = chanKey(e.name, e.chno);
+        if (tvhKeys.has(key) || seen.has(key)) continue;
+        seen.add(key);
+        out.push({ name: e.name, number: e.chno, label: `${chanLabel(e.name, e.chno)} (catalog)` });
+      }
+    }
+    return out.sort((a, b) => a.label.localeCompare(b.label));
+  });
+
+  /** parse the picker input against tvh options first, then catalog-only entries */
+  function parsePick(raw: string): { name: string; number: string | null } {
+    const catalogHit = catalogOnlyOptions.find((c) => c.label === raw);
+    if (catalogHit) return { name: catalogHit.name, number: catalogHit.number };
+    return parseChannelInput(raw, $channelOptions);
+  }
+
+  const pick = $derived(parsePick(channelInput.trim()));
+  /** picking a "N　Name" (or catalog) option from the datalist also fills the number pin */
   function onChannelInput(): void {
-    const p = parseChannelInput(channelInput.trim(), $channelOptions);
+    const p = parsePick(channelInput.trim());
     if (p.number !== null) numberVal = p.number;
   }
   const lowest = $derived(pick.name ? lowestNumberFor(pick.name, $channelOptions) : null);
   const knownChannel = $derived($channelOptions.some((c) => c.name === pick.name));
 
-  /** display name under the current source type (external names are taken verbatim) */
-  const effName = $derived(sourceType === 'external' ? channelInput.trim() : pick.name);
+  const effName = $derived(pick.name);
   const slugPreview = $derived(effName ? deriveSlug(effName) : '');
 
-  // ---------- external source catalog ----------
-
-  /** union of every node's catalog entries, deduped by id (sorted node key order, first wins) */
-  const sourceEntries = $derived.by(() => {
-    const m = new Map<string, SourceCatalogEntry>();
-    for (const key of Object.keys($restreamerNodes).sort()) {
-      for (const e of $restreamerNodes[key]!.sources ?? []) {
-        if (!m.has(e.id)) m.set(e.id, e);
-      }
-    }
-    return [...m.values()];
-  });
-
-  function sourceLabel(e: SourceCatalogEntry): string {
-    return `${e.id} — ${e.name}`;
-  }
-
-  /**
-   * Picking an "id — name" datalist option resolves the input to the bare id
-   * and prefills the display name from the catalog entry. Free text stays
-   * as-is — the sourceKey may reference an entry no node carries yet.
-   */
-  function onSourceInput(): void {
-    const entry = sourceEntries.find((e) => sourceLabel(e) === sourceKeyVal.trim());
-    if (!entry) return;
-    sourceKeyVal = entry.id;
-    channelInput = entry.name;
-  }
-
   // ---------- write-time availability (mirrors the controller's 409 rule) ----------
+  // Mirrors both resolution paths the controller uses at write time: tvheadend
+  // topology (channelOptions) first, then — only on a tvh known-miss — the
+  // target node's sources.m3u catalog.
 
   /** availability of the CURRENT form identity on one placement's node */
   function availability(instanceId: string, nodeId: string): 'ok' | 'unavailable' | 'unknown' {
-    if (sourceType === 'external') {
-      return externalAvailability(sourceKeyVal.trim(), $restreamerNodes[`${instanceId}/${nodeId}`]);
-    }
-    return tvhAvailability(effName, numberVal.trim() || null, instanceId, $channelOptions);
+    const node = $restreamerNodes[restreamerNodeKey({ instanceId, nodeId })];
+    return placementAvailability(
+      effName,
+      numberVal.trim() || null,
+      instanceId,
+      nodeId,
+      $channelOptions,
+      node,
+    );
   }
 
   /** 409 `unavailable` payload → per-node reasons (fallback when the badges were stale) */
@@ -291,15 +303,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     formError = '';
     const name = effName;
     if (!name) {
-      formError =
-        sourceType === 'external'
-          ? 'name is required — picking a source prefills it'
-          : 'channel is required — pick one from the list';
-      return;
-    }
-    const sourceKey = sourceKeyVal.trim();
-    if (sourceType === 'external' && !sourceKey) {
-      formError = 'source is required — pick a catalog entry or type its id';
+      formError = 'channel is required — pick one from the list';
       return;
     }
     if (!profileId) {
@@ -315,16 +319,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     try {
       if (current) {
         const patch: RestreamChannelPatch = {};
-        if (sourceType !== current.sourceType) patch.sourceType = sourceType;
-        if (sourceType === 'external') {
-          // no number pin for external channels (the server forces null);
-          // switching to 'tvh' clears sourceKey server-side
-          if (sourceKey !== (current.sourceKey ?? '')) patch.sourceKey = sourceKey;
-          if (name !== current.channelName) patch.channelName = name;
-        } else if (
-          name !== current.channelName ||
-          (numberVal.trim() || null) !== current.channelNumber
-        ) {
+        if (name !== current.channelName || (numberVal.trim() || null) !== current.channelNumber) {
           // name+number always travel as a pair: a name-only patch would NULL
           // the pin server-side (string identity rules)
           patch.channelName = name;
@@ -364,9 +359,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         }
         await api.createRestreamChannel({
           channelName: name,
-          ...(sourceType === 'external'
-            ? { sourceType: 'external' as const, sourceKey }
-            : { channelNumber: numberVal.trim() || null }),
+          channelNumber: numberVal.trim() || null,
           profileId,
           ...(slug ? { slug } : {}),
           enabled,
@@ -412,79 +405,42 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {#if formError}<div class="error-banner">{formError}</div>{/if}
 
     <div style="display:flex;flex-direction:column;gap:8px">
-      <div style="display:flex;gap:10px;align-items:center">
-        <span class="small muted" style="width:150px;flex:none">Source type</span>
-        <label style="display:flex;gap:6px;align-items:center;margin:0">
-          <input type="radio" name="rc-source-type" value="tvh" bind:group={sourceType} />
-          tvheadend channel
-        </label>
-        <label style="display:flex;gap:6px;align-items:center;margin:0">
-          <input type="radio" name="rc-source-type" value="external" bind:group={sourceType} />
-          external source
-        </label>
+      <div style="display:flex;gap:10px;align-items:flex-start">
+        <label for="rc-channel" style="margin:0;width:150px;flex:none;padding-top:6px">Channel</label>
+        <div style="flex:1">
+          <input
+            id="rc-channel"
+            style="width:100%"
+            bind:value={channelInput}
+            oninput={onChannelInput}
+            list="rc-channel-options"
+            placeholder="channel name"
+          />
+          <datalist id="rc-channel-options">
+            {#each $channelOptions as c (chanKey(c.name, c.number))}
+              <option value={chanLabel(c.name, c.number)}></option>
+            {/each}
+            {#each catalogOnlyOptions as c (chanKey(c.name, c.number))}
+              <option value={c.label}></option>
+            {/each}
+          </datalist>
+          {#if pick.name && !knownChannel}
+            <div class="small" style="color:var(--warn)">
+              channel "{pick.name}" is not on any tvheadend instance right now — it may still resolve
+              via a node's sources.m3u catalog, or placements stay blocked until it appears
+            </div>
+          {/if}
+        </div>
       </div>
 
-      {#if sourceType === 'external'}
-        <div style="display:flex;gap:10px;align-items:flex-start">
-          <label for="rc-source" style="margin:0;width:150px;flex:none;padding-top:6px">Source</label>
-          <div style="flex:1">
-            <input
-              id="rc-source"
-              style="width:100%"
-              bind:value={sourceKeyVal}
-              oninput={onSourceInput}
-              list="rc-source-options"
-              placeholder="catalog entry id (tvg-id)"
-            />
-            <datalist id="rc-source-options">
-              {#each sourceEntries as e (e.id)}
-                <option value={sourceLabel(e)}></option>
-              {/each}
-            </datalist>
-            <div class="muted small">
-              entries of the nodes' local sources.m3u catalogs; free text is kept as the source key
-            </div>
-          </div>
-        </div>
-
-        <div style="display:flex;gap:10px;align-items:center">
-          <label for="rc-channel" style="margin:0;width:150px;flex:none">Name</label>
-          <input id="rc-channel" style="flex:1" bind:value={channelInput} placeholder="display name" />
-        </div>
-      {:else}
-        <div style="display:flex;gap:10px;align-items:flex-start">
-          <label for="rc-channel" style="margin:0;width:150px;flex:none;padding-top:6px">Channel</label>
-          <div style="flex:1">
-            <input
-              id="rc-channel"
-              style="width:100%"
-              bind:value={channelInput}
-              oninput={onChannelInput}
-              list="rc-channel-options"
-              placeholder="channel name"
-            />
-            <datalist id="rc-channel-options">
-              {#each $channelOptions as c (chanKey(c.name, c.number))}
-                <option value={chanLabel(c.name, c.number)}></option>
-              {/each}
-            </datalist>
-            {#if pick.name && !knownChannel}
-              <div class="small" style="color:var(--warn)">
-                channel "{pick.name}" is not on any instance right now — placements stay blocked until it appears
-              </div>
-            {/if}
-          </div>
-        </div>
-
-        <div style="display:flex;gap:10px;align-items:center">
-          <label for="rc-number" style="margin:0;width:150px;flex:none">Number pin</label>
-          <input id="rc-number" style="width:110px;flex:none" bind:value={numberVal} placeholder="(lowest)" />
-          <span class="muted small">
-            exact string match ("9.1" ≠ "9.10"); blank = the lowest-numbered "{pick.name || '…'}"
-            on each instance{#if numberVal.trim() === '' && lowest !== null}&nbsp;(currently {lowest}){/if}
-          </span>
-        </div>
-      {/if}
+      <div style="display:flex;gap:10px;align-items:center">
+        <label for="rc-number" style="margin:0;width:150px;flex:none">Number pin</label>
+        <input id="rc-number" style="width:110px;flex:none" bind:value={numberVal} placeholder="(lowest)" />
+        <span class="muted small">
+          exact string match ("9.1" ≠ "9.10"); blank = the lowest-numbered "{pick.name || '…'}"
+          on each instance{#if numberVal.trim() === '' && lowest !== null}&nbsp;(currently {lowest}){/if}
+        </span>
+      </div>
 
       <div style="display:flex;gap:10px;align-items:center">
         <label for="rc-slug" style="margin:0;width:150px;flex:none">Slug</label>

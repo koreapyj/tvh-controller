@@ -153,28 +153,26 @@ describe('migration 008_restreamer', () => {
     ).rejects.toThrow(/FOREIGN KEY/i);
   });
 
-  describe('009_external_sources', () => {
-    it('defaults source_type to tvh with a null source_key', async () => {
+  describe('010_drop_external_source_columns', () => {
+    it('a plain channel row no longer carries source_type/source_key', async () => {
       await seed();
       const channel = await t.db
         .selectFrom('restream_channels')
         .selectAll()
         .executeTakeFirstOrThrow();
-      expect(channel.source_type).toBe('tvh');
-      expect(channel.source_key).toBeNull();
+      expect(channel).not.toHaveProperty('source_type');
+      expect(channel).not.toHaveProperty('source_key');
     });
 
-    it('stores and reads back an external-source channel row', async () => {
+    it('inserting a channel row works with just (channel_name, channel_number)', async () => {
       await seed();
       await t.db
         .insertInto('restream_channels')
         .values({
-          id: 'chan-ext',
-          slug: 'louise',
-          channel_name: 'Louise',
-          channel_number: null,
-          source_type: 'external',
-          source_key: 'louise-1',
+          id: 'chan-2',
+          slug: 'bs11',
+          channel_name: 'BS11',
+          channel_number: '11',
           profile_id: 'prof-1',
           enabled: 1,
           comment: null,
@@ -184,13 +182,9 @@ describe('migration 008_restreamer', () => {
       const row = await t.db
         .selectFrom('restream_channels')
         .selectAll()
-        .where('id', '=', 'chan-ext')
+        .where('id', '=', 'chan-2')
         .executeTakeFirstOrThrow();
-      expect(row).toMatchObject({
-        source_type: 'external',
-        source_key: 'louise-1',
-        channel_number: null,
-      });
+      expect(row).toMatchObject({ channel_name: 'BS11', channel_number: '11' });
     });
   });
 

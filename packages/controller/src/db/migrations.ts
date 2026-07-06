@@ -308,6 +308,28 @@ migrations['009_external_sources'] = {
   },
 };
 
+migrations['010_drop_external_source_columns'] = {
+  // unified channel identity (REVISION 2): a channel is source-agnostic
+  // (channel_name, channel_number) + profile; each placement resolves
+  // independently — tvheadend topology first, then the node's local sources.m3u
+  // catalog by the SAME (name, chno) identity rules. The separate 'external'
+  // source type is no longer needed.
+  async up(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('restream_channels').dropColumn('source_key').execute();
+    await db.schema.alterTable('restream_channels').dropColumn('source_type').execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .alterTable('restream_channels')
+      .addColumn('source_type', 'varchar(16)', (c) => c.notNull().defaultTo('tvh'))
+      .execute();
+    await db.schema
+      .alterTable('restream_channels')
+      .addColumn('source_key', 'varchar(255)')
+      .execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

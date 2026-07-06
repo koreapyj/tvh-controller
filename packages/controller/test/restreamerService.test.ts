@@ -406,6 +406,7 @@ describe('channel identity (string numbers)', () => {
     // zone2 only has AT-X "9.10" — "9.1" must NOT fall back to it
     const h = await setup();
     const p = await seed(h);
+    setNodeSources(h.cache, 'zone2', 'n1', [], 'known-empty'); // no catalog fallback either
     await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -416,7 +417,9 @@ describe('channel identity (string numbers)', () => {
     const computed = await h.service.computeNodeDoc('zone2', 'n1');
     expect(computed.doc!.sessions).toHaveLength(0);
     expect(computed.blocked).toHaveLength(1);
-    expect(computed.blocked[0]!.reason).toBe('channel "AT-X" (#9.1) not found on instance zone2');
+    expect(computed.blocked[0]!.reason).toBe(
+      'channel "AT-X" (#9.1) not found on instance zone2 nor in node zone2/n1\'s sources catalog',
+    );
     await h.destroy();
   });
 
@@ -493,10 +496,13 @@ describe('channel identity (string numbers)', () => {
   it('an unresolvable unpinned name blocks with a readable reason', async () => {
     const h = await setup();
     const p = await seed(h);
+    setNodeSources(h.cache, 'zone1', 'n1', [], 'known-empty'); // no catalog fallback either
     const chanId = await insertChannelRow(h.db, { slug: 'ghost', name: 'Ghost', number: null, profileId: p.id });
     await insertPlacementRow(h.db, { channelId: chanId, instanceId: 'zone1', nodeId: 'n1' });
     const computed = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(computed.blocked[0]!.reason).toBe('channel "Ghost" not found on instance zone1');
+    expect(computed.blocked[0]!.reason).toBe(
+      'channel "Ghost" not found on instance zone1 nor in node zone1/n1\'s sources catalog',
+    );
     await h.destroy();
   });
 });
@@ -694,6 +700,7 @@ describe('blocked and defer semantics', () => {
   it('a previously-pushed placement that becomes blocked defers the whole node push', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone1', 'n1', [], 'known-empty'); // no catalog fallback either
     const chan = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -709,7 +716,9 @@ describe('blocked and defer semantics', () => {
     await h.service.updateChannel(chan.id, { channelName: 'Ghost', force: true });
     const result = await h.service.pushNode('zone1', 'n1');
     expect(result.action).toBe('deferred');
-    expect(result.blocked[0]!.reason).toBe('channel "Ghost" not found on instance zone1');
+    expect(result.blocked[0]!.reason).toBe(
+      'channel "Ghost" not found on instance zone1 nor in node zone1/n1\'s sources catalog',
+    );
     // the running session was NOT torn down
     expect(node.puts().length).toBe(putsBefore);
     expect(node.desired!.sessions.map((s) => s.name)).toEqual(['at-x']);
@@ -1141,6 +1150,7 @@ describe('listChannels status', () => {
   it('joins live sessions by slug and the switcher’s active placement', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone2', 'n1', [], 'known-empty'); // no catalog fallback either
     const chan = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -1180,7 +1190,9 @@ describe('listChannels status', () => {
     expect(zone1Placement.blockedReason).toBeNull();
     expect(zone2Placement.session).toBeNull();
     // zone2 has no AT-X 9.1 — surfaced per placement, not per channel
-    expect(zone2Placement.blockedReason).toBe('channel "AT-X" (#9.1) not found on instance zone2');
+    expect(zone2Placement.blockedReason).toBe(
+      'channel "AT-X" (#9.1) not found on instance zone2 nor in node zone2/n1\'s sources catalog',
+    );
     expect(listed!.activePlacementId).toBe(placementId);
     expect(listed!.lastSwitch?.reason).toBe('push');
     expect(listed!.profileName).toBe('p');
@@ -1268,19 +1280,19 @@ describe('onTopologyChanged', () => {
   });
 });
 
-// ---------- external sources ----------
+// ---------- catalog resolution (tvh-miss fallback) ----------
 
-const CAM: SourceCatalogEntry = { id: 'cam1', name: 'Cam 1', url: 'http://cam.example/1.m3u8' };
+const CAM: SourceCatalogEntry = { id: 'cam1', name: 'Cam 1', url: 'http://cam.example/1.m3u8', chno: '1' };
 
-describe('external sources', () => {
-  it('doc emits a {url} source with EMPTY tsreadex (daemon PAT-probes); weight never merged', async () => {
+describe('catalog resolution (tvh-miss fallback)', () => {
+  it('a catalog-resolved placement emits a {url} source with EMPTY tsreadex (daemon PAT-probes); weight never merged', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
+    // "Cam 1" does not exist in zone1's tvh topology — only the catalog has it
     await h.service.createChannel({
       channelName: 'Cam 1',
-      sourceType: 'external',
-      sourceKey: 'cam1',
+      channelNumber: '1',
       profileId: p.id,
       // weight is a tvheadend subscription concept — must NOT reach a UrlSource
       placements: [{ instanceId: 'zone1', nodeId: 'n1', weight: 300 }],
@@ -1293,14 +1305,13 @@ describe('external sources', () => {
     await h.destroy();
   });
 
-  it('a placement programNumber override is emitted for an external source', async () => {
+  it('a placement programNumber override is emitted for a catalog-resolved source', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
     await h.service.createChannel({
       channelName: 'Cam 1',
-      sourceType: 'external',
-      sourceKey: 'cam1',
+      channelNumber: '1',
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1', programNumber: 210 }],
     });
@@ -1309,14 +1320,148 @@ describe('external sources', () => {
     await h.destroy();
   });
 
-  it('a key missing from a KNOWN catalog blocks with the exact reason', async () => {
+  it('a pinned catalog chno matches exactly — never a different chno for the same name', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const relay1: SourceCatalogEntry = {
+      id: 'relay-1',
+      name: 'Relay',
+      url: 'http://relay.example/1.m3u8',
+      chno: '20.1',
+    };
+    const relay10: SourceCatalogEntry = {
+      id: 'relay-10',
+      name: 'Relay',
+      url: 'http://relay.example/10.m3u8',
+      chno: '20.10',
+    };
+    setNodeSources(h.cache, 'zone1', 'n1', [relay1, relay10], 'h1');
+    await h.service.createChannel({
+      channelName: 'Relay',
+      channelNumber: '20.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(doc!.sessions[0]!.source).toEqual({ url: 'http://relay.example/1.m3u8' });
+    await h.destroy();
+  });
+
+  it('an unpinned name resolves the LOWEST chno among same-name catalog entries', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const relayHi: SourceCatalogEntry = {
+      id: 'relay-hi',
+      name: 'Relay',
+      url: 'http://relay.example/hi.m3u8',
+      chno: '20.2',
+    };
+    const relayLo: SourceCatalogEntry = {
+      id: 'relay-lo',
+      name: 'Relay',
+      url: 'http://relay.example/lo.m3u8',
+      chno: '20.1',
+    };
+    // listed hi-before-lo on purpose — lowest wins by VALUE, not catalog order
+    setNodeSources(h.cache, 'zone1', 'n1', [relayHi, relayLo], 'h1');
+    const chan = await h.service.createChannel({
+      channelName: 'Relay',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    expect(chan.channelNumber).toBe('20.1'); // write-time pin-lowest across the catalog
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(doc!.sessions[0]!.source).toEqual({ url: 'http://relay.example/lo.m3u8' });
+    await h.destroy();
+  });
+
+  it('tvh takes priority over a same-identity catalog entry on the same zone', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const shadow: SourceCatalogEntry = {
+      id: 'shadow',
+      name: 'AT-X',
+      url: 'http://shadow.example/atx.m3u8',
+      chno: '9.1',
+    };
+    setNodeSources(h.cache, 'zone1', 'n1', [shadow], 'h1');
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const [listed] = await h.service.listChannels();
+    expect(listed!.placements[0]!.resolvedVia).toBe('tvh');
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(doc!.sessions[0]!.source).toMatchObject({ channelUuid: 'ch-atx-91' });
+    await h.destroy();
+  });
+
+  it('a cross-source channel resolves via tvh on one zone and via catalog on another', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    // zone2's tvh only has AT-X "9.10" (not "9.1") — its node catalog fills the gap
+    const relayAtx: SourceCatalogEntry = {
+      id: 'atx-relay',
+      name: 'AT-X',
+      url: 'http://relay.example/atx.m3u8',
+      chno: '9.1',
+    };
+    setNodeSources(h.cache, 'zone2', 'n1', [relayAtx], 'h1');
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone2', nodeId: 'n1' },
+      ],
+    });
+    const zone1Doc = await h.service.computeNodeDoc('zone1', 'n1');
+    const zone2Doc = await h.service.computeNodeDoc('zone2', 'n1');
+    expect(zone1Doc.blocked).toEqual([]);
+    expect(zone2Doc.blocked).toEqual([]);
+    expect(zone1Doc.doc!.sessions[0]!.source).toMatchObject({ channelUuid: 'ch-atx-91' });
+    expect(zone2Doc.doc!.sessions[0]!.source).toEqual({ url: 'http://relay.example/atx.m3u8' });
+
+    const [listed] = await h.service.listChannels();
+    const zone1Placement = listed!.placements.find((x) => x.instanceId === 'zone1')!;
+    const zone2Placement = listed!.placements.find((x) => x.instanceId === 'zone2')!;
+    expect(zone1Placement.resolvedVia).toBe('tvh');
+    expect(zone2Placement.resolvedVia).toBe('catalog');
+    await h.destroy();
+  });
+
+  it('write-time pin-lowest considers BOTH topology and node catalogs (union)', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    // zone1 tvh has Dup 5.1/5.2; the SAME node's catalog additionally
+    // advertises a lower Dup "4.5" — the pin must consider the catalog too
+    const dupRelay: SourceCatalogEntry = {
+      id: 'dup-relay',
+      name: 'Dup',
+      url: 'http://relay.example/dup.m3u8',
+      chno: '4.5',
+    };
+    setNodeSources(h.cache, 'zone1', 'n1', [dupRelay], 'h1');
+    const chan = await h.service.createChannel({
+      channelName: 'Dup',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    expect(chan.channelNumber).toBe('4.5'); // catalog's 4.5 beats tvh's 5.1
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(doc!.sessions[0]!.source).toEqual({ url: 'http://relay.example/dup.m3u8' });
+    await h.destroy();
+  });
+
+  it('a name+number matching neither tvh nor a KNOWN catalog blocks with the combined reason', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
     await h.service.createChannel({
       channelName: 'Cam 9',
-      sourceType: 'external',
-      sourceKey: 'cam9',
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
       force: true, // the compute-time blockedReason is under test
@@ -1324,26 +1469,24 @@ describe('external sources', () => {
     const computed = await h.service.computeNodeDoc('zone1', 'n1');
     expect(computed.doc!.sessions).toHaveLength(0);
     expect(computed.blocked[0]!.reason).toBe(
-      'external source "cam9" is not in node zone1/n1\'s catalog',
+      'channel "Cam 9" not found on instance zone1 nor in node zone1/n1\'s sources catalog',
     );
     await h.destroy();
   });
 
-  it('a node without a sources catalog (sourcesM3u unset) blocks with the config hint', async () => {
+  it('a known-empty catalog blocks with the same combined reason', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
-    setNodeSources(h.cache, 'zone1', 'n1', [], null); // known: no catalog configured
+    setNodeSources(h.cache, 'zone1', 'n1', [], null); // known: no catalog configured / empty
     await h.service.createChannel({
       channelName: 'Cam 1',
-      sourceType: 'external',
-      sourceKey: 'cam1',
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
       force: true,
     });
     const computed = await h.service.computeNodeDoc('zone1', 'n1');
     expect(computed.blocked[0]!.reason).toBe(
-      'node zone1/n1 has no sources catalog configured (sourcesM3u)',
+      'channel "Cam 1" not found on instance zone1 nor in node zone1/n1\'s sources catalog',
     );
     await h.destroy();
   });
@@ -1354,15 +1497,14 @@ describe('external sources', () => {
     // no node status at all: availability is unknown → create passes WITHOUT force
     await h.service.createChannel({
       channelName: 'Cam 1',
-      sourceType: 'external',
-      sourceKey: 'cam1',
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
     const [listed] = await h.service.listChannels();
     expect(listed!.placements[0]!.blockedReason).toBe(
-      'sources catalog not loaded for node zone1/n1',
+      'channel "Cam 1" not found on instance zone1; node zone1/n1\'s sources catalog not loaded',
     );
+    expect(listed!.placements[0]!.resolvedVia).toBeNull();
     await h.destroy();
   });
 
@@ -1372,8 +1514,7 @@ describe('external sources', () => {
     setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
     await h.service.createChannel({
       channelName: 'Cam 1',
-      sourceType: 'external',
-      sourceKey: 'cam1',
+      channelNumber: '1',
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
@@ -1387,7 +1528,7 @@ describe('external sources', () => {
     const result = await h.service.pushNode('zone1', 'n1');
     expect(result.action).toBe('deferred');
     expect(result.blocked[0]!.reason).toBe(
-      'external source "cam1" is not in node zone1/n1\'s catalog',
+      'channel "Cam 1" (#1) not found on instance zone1 nor in node zone1/n1\'s sources catalog',
     );
     expect(node.puts().length).toBe(putsBefore);
     expect(node.desired!.sessions.map((s) => s.name)).toEqual(['cam-1']);
@@ -1400,8 +1541,7 @@ describe('external sources', () => {
     // catalog unknown at write time → allowed, blocked at compute time
     await h.service.createChannel({
       channelName: 'Cam 1',
-      sourceType: 'external',
-      sourceKey: 'cam1',
+      channelNumber: '1',
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
@@ -1432,108 +1572,13 @@ describe('external sources', () => {
   });
 });
 
-// ---------- external channel CRUD ----------
-
-describe('external channel CRUD', () => {
-  it('external create requires a sourceKey (400); tvh creates never store one', async () => {
-    const h = await setup();
-    const p = await h.service.createProfile('p', profilePayload());
-    await expect(
-      h.service.createChannel({ channelName: 'Cam', sourceType: 'external', profileId: p.id }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-    await expect(
-      h.service.createChannel({
-        channelName: 'Cam',
-        sourceType: 'external',
-        sourceKey: '  ',
-        profileId: p.id,
-      }),
-    ).rejects.toMatchObject({ statusCode: 400 });
-
-    const tvh = await h.service.createChannel({
-      channelName: 'AT-X',
-      channelNumber: '9.1',
-      profileId: p.id,
-      sourceKey: 'ignored-for-tvh',
-    });
-    expect(tvh.sourceType).toBe('tvh');
-    expect(tvh.sourceKey).toBeNull();
-    await h.destroy();
-  });
-
-  it('external create forces channelNumber null and skips the pin', async () => {
-    const h = await setup();
-    const p = await h.service.createProfile('p', profilePayload());
-    setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
-    const chan = await h.service.createChannel({
-      channelName: 'AT-X', // a name that WOULD pin to 9.1 for a tvh channel
-      channelNumber: '9.1',
-      sourceType: 'external',
-      sourceKey: 'cam1',
-      profileId: p.id,
-      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
-    });
-    expect(chan.sourceType).toBe('external');
-    expect(chan.sourceKey).toBe('cam1');
-    expect(chan.channelNumber).toBeNull();
-    await h.destroy();
-  });
-
-  it('switching tvh → external validates the key (patch or existing) and nulls the number', async () => {
-    const h = await setup();
-    const p = await h.service.createProfile('p', profilePayload());
-    setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
-    const chan = await h.service.createChannel({
-      channelName: 'AT-X',
-      channelNumber: '9.1',
-      profileId: p.id,
-      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
-    });
-    await expect(
-      h.service.updateChannel(chan.id, { sourceType: 'external' }),
-    ).rejects.toMatchObject({ statusCode: 400 }); // no key anywhere
-
-    const updated = await h.service.updateChannel(chan.id, {
-      sourceType: 'external',
-      sourceKey: 'cam1',
-    });
-    expect(updated.sourceType).toBe('external');
-    expect(updated.sourceKey).toBe('cam1');
-    expect(updated.channelNumber).toBeNull();
-
-    // a later patch that omits sourceKey inherits the existing one
-    const commented = await h.service.updateChannel(chan.id, { comment: 'hi' });
-    expect(commented.sourceKey).toBe('cam1');
-    await h.destroy();
-  });
-
-  it('switching external → tvh clears the key and re-pins the number', async () => {
-    const h = await setup();
-    const p = await h.service.createProfile('p', profilePayload());
-    setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
-    const chan = await h.service.createChannel({
-      channelName: 'AT-X',
-      sourceType: 'external',
-      sourceKey: 'cam1',
-      profileId: p.id,
-      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
-    });
-    const updated = await h.service.updateChannel(chan.id, { sourceType: 'tvh' });
-    expect(updated.sourceType).toBe('tvh');
-    expect(updated.sourceKey).toBeNull();
-    expect(updated.channelNumber).toBe('9.1'); // re-pinned to zone1's lowest AT-X
-    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(doc!.sessions[0]!.source).toMatchObject({ channelUuid: 'ch-atx-91' });
-    await h.destroy();
-  });
-});
-
 // ---------- write-time availability ----------
 
 describe('write-time availability', () => {
   it('create 409s listing exactly the failing node; nothing is written', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone2', 'n1', [], 'known-empty'); // no catalog fallback either
     await expect(
       h.service.createChannel({
         channelName: 'AT-X',
@@ -1551,7 +1596,7 @@ describe('write-time availability', () => {
         {
           instanceId: 'zone2',
           nodeId: 'n1',
-          reason: 'channel "AT-X" (#9.1) not found on instance zone2',
+          reason: 'channel "AT-X" (#9.1) not found on instance zone2 nor in node zone2/n1\'s sources catalog',
         },
       ],
     });
@@ -1578,6 +1623,7 @@ describe('write-time availability', () => {
   it('force creates the row anyway (pre-provisioning) — blocked at compute time', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone2', 'n1', [], 'known-empty'); // no catalog fallback either
     const chan = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -1588,7 +1634,7 @@ describe('write-time availability', () => {
     expect(chan.id).toBeTruthy();
     const [listed] = await h.service.listChannels();
     expect(listed!.placements[0]!.blockedReason).toBe(
-      'channel "AT-X" (#9.1) not found on instance zone2',
+      'channel "AT-X" (#9.1) not found on instance zone2 nor in node zone2/n1\'s sources catalog',
     );
     await h.destroy();
   });
@@ -1596,6 +1642,7 @@ describe('write-time availability', () => {
   it('an identity patch re-validates ALL existing placements; non-identity patches never check', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone1', 'n1', [], 'known-empty'); // no catalog fallback either
     const chan = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -1611,7 +1658,7 @@ describe('write-time availability', () => {
         {
           instanceId: 'zone1',
           nodeId: 'n1',
-          reason: 'channel "Ghost" not found on instance zone1',
+          reason: 'channel "Ghost" not found on instance zone1 nor in node zone1/n1\'s sources catalog',
         },
       ],
     });
@@ -1635,6 +1682,7 @@ describe('write-time availability', () => {
   it('addPlacement to a zone lacking the channel 409s; force bypasses', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone2', 'n1', [], 'known-empty'); // no catalog fallback either
     const chan = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -1660,6 +1708,7 @@ describe('write-time availability', () => {
   it('moving a placement re-checks availability on the TARGET node; force bypasses', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone2', 'n1', [], 'known-empty'); // no catalog fallback either
     await h.service.createChannel({
       channelName: 'BS11',
       channelNumber: '11',
@@ -1676,7 +1725,8 @@ describe('write-time availability', () => {
         {
           instanceId: 'zone2',
           nodeId: 'n1',
-          reason: 'channel "BS11" (#11) not found on instance zone2',
+          reason:
+            'channel "BS11" (#11) not found on instance zone2 nor in node zone2/n1\'s sources catalog',
         },
       ],
     });
@@ -1688,15 +1738,13 @@ describe('write-time availability', () => {
     await h.destroy();
   });
 
-  it('external create: key missing from a KNOWN catalog 409s; an UNKNOWN catalog is allowed', async () => {
+  it('a channel resolving via neither tvh nor a KNOWN catalog 409s; an UNKNOWN catalog is allowed', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
     await expect(
       h.service.createChannel({
         channelName: 'Nope',
-        sourceType: 'external',
-        sourceKey: 'nope',
         profileId: p.id,
         placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
       }),
@@ -1706,7 +1754,7 @@ describe('write-time availability', () => {
         {
           instanceId: 'zone1',
           nodeId: 'n1',
-          reason: 'external source "nope" is not in node zone1/n1\'s catalog',
+          reason: 'channel "Nope" not found on instance zone1 nor in node zone1/n1\'s sources catalog',
         },
       ],
     });
@@ -1714,8 +1762,6 @@ describe('write-time availability', () => {
     // zone2/n1 has no polled status at all → catalog unknown → allowed
     const chan = await h.service.createChannel({
       channelName: 'Nope',
-      sourceType: 'external',
-      sourceKey: 'nope',
       profileId: p.id,
       placements: [{ instanceId: 'zone2', nodeId: 'n1' }],
     });
@@ -1758,6 +1804,7 @@ describe('write-time availability', () => {
   it('batch edit forwards force through the patch', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone1', 'n1', [], 'known-empty'); // no catalog fallback either
     const chan = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',

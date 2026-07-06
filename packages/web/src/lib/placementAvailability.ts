@@ -18,48 +18,52 @@
 
 // Pure client-side mirror of the controller's write-time placement
 // availability (restreamer/service.ts#placementAvailability), judged from the
-// data the UI already holds: the merged channel options for tvh channels and
-// the polled node statuses for external sources. 'unknown' = cannot be judged
-// yet — the controller allows such writes (lazy blocking covers them), so the
-// UI shows a muted badge instead of a warning. No Svelte imports.
+// data the UI already holds: the merged tvh channel options and the target
+// node's polled sources.m3u catalog. Each placement resolves its channel
+// identity the same way the server does — tvheadend topology first, then
+// (only on a tvh known-miss) the node's catalog by the same (name, number)
+// identity rules. 'unknown' = cannot be judged yet — the controller allows
+// such writes (lazy blocking covers them), so the UI shows a muted badge
+// instead of a warning. No Svelte imports.
 
 import type { ChannelOption, RestreamerNodeStatus } from '@tvhc/shared';
 
 export type Availability = 'ok' | 'unavailable' | 'unknown';
 
 /**
- * Availability of a tvh channel identity on one instance. Channel identity is
- * name + NUMBER where the number is exact STRING equality ("9.1" ≠ "9.10");
- * a null number is the unpinned form — any same-name channel on the instance
- * qualifies (the controller pins the lowest-numbered one at write time).
- * Empty `options` = the channel list has not loaded → 'unknown'.
+ * Availability of one placement's channel identity (name + STRING number,
+ * "9.1" ≠ "9.10"; null number = unpinned — any same-name match qualifies, the
+ * controller pins the lowest-numbered one at write time).
+ *
+ * tvh side: `options` empty (channel list never loaded) → 'unknown'; a
+ * pinned/unpinned match on `instanceId` → 'ok'.
+ *
+ * Only on a tvh known-miss (options loaded, no match) does the node's
+ * sources.m3u catalog get consulted: `node` missing or its `sources` never
+ * fetched (null) → 'unknown'; a pinned/unpinned match by (name, chno) → 'ok';
+ * a known catalog ([] included) without a match → 'unavailable'.
  */
-export function tvhAvailability(
+export function placementAvailability(
   name: string,
   number: string | null,
   instanceId: string,
+  nodeId: string,
   options: ChannelOption[],
+  node: RestreamerNodeStatus | undefined,
 ): Availability {
   if (options.length === 0) return 'unknown';
-  const match = options.some(
+  const tvhHit = options.some(
     (c) =>
       c.name === name &&
       (number === null || c.number === number) &&
       c.instances.includes(instanceId),
   );
-  return match ? 'ok' : 'unavailable';
-}
+  if (tvhHit) return 'ok';
 
-/**
- * Availability of an external catalog entry on one restreamer node. Node
- * status missing or `sources` null = the catalog was never fetched (old
- * daemon / not polled yet) → 'unknown'; a known catalog ([] included) that
- * lacks the entry → 'unavailable'.
- */
-export function externalAvailability(
-  sourceKey: string,
-  node: RestreamerNodeStatus | undefined,
-): Availability {
-  if (!node || node.sources === null) return 'unknown';
-  return node.sources.some((e) => e.id === sourceKey) ? 'ok' : 'unavailable';
+  // tvh known-miss — fall back to the target node's local catalog.
+  if (!node || node.nodeId !== nodeId || node.sources === null) return 'unknown';
+  const catalogHit = node.sources.some(
+    (e) => e.name === name && (number === null || e.chno === number),
+  );
+  return catalogHit ? 'ok' : 'unavailable';
 }

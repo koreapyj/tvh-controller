@@ -227,7 +227,7 @@ describe('RestreamerPoller', () => {
   });
 
   describe('sources catalog', () => {
-    const ENTRY = { id: 'louise-1', name: 'Louise', url: 'https://louise.example/stream?id=1' };
+    const ENTRY = { id: 'louise-1', name: 'Louise', url: 'https://louise.example/stream?id=1', chno: '1' };
 
     it('absent sourcesHash (old daemon) -> known-empty catalog, no sources fetch', async () => {
       const { cache, status, sources, poller } = setup();

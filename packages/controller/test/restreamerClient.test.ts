@@ -88,7 +88,7 @@ describe('RestreamerClient endpoints', () => {
       apiVersion: 1,
       catalogHash: 'h1',
       updatedAt: '2026-07-06T00:00:00Z',
-      entries: [{ id: 'louise-1', name: 'Louise', url: 'https://louise.example/stream?id=1' }],
+      entries: [{ id: 'louise-1', name: 'Louise', url: 'https://louise.example/stream?id=1', chno: '1' }],
     };
     const { fetchImpl, calls } = fakeFetch(json(catalog));
     const client = new RestreamerClient(NODE, fetchImpl);
