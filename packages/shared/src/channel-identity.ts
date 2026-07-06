@@ -51,3 +51,25 @@ export function chanNumberOrder(number: string | number | null | undefined): num
   const n = Number.parseFloat(String(number));
   return Number.isNaN(n) ? Infinity : n;
 }
+
+/**
+ * Stable, tvh-independent channel id for XMLTV / M3U tvg-id: derived from the
+ * same (name, number) identity as chanKey(), so it survives tvh restarts and
+ * uuid churn and stays identical between the M3U and XMLTV exports. Not
+ * cryptographic - FNV-1a run twice with different seeds, collision-implausible
+ * at channel-list scale. Pure JS: this file is bundled into the browser.
+ */
+export function channelStableId(name: string, number: string | number | null | undefined): string {
+  const key = chanKey(name, number);
+  const fnv1a = (seed: bigint): string => {
+    let h = seed;
+    const prime = 0x100000001b3n;
+    const mask = 0xffffffffffffffffn;
+    for (let i = 0; i < key.length; i++) {
+      h ^= BigInt(key.charCodeAt(i));
+      h = (h * prime) & mask;
+    }
+    return h.toString(16).padStart(16, '0');
+  };
+  return `ch-${fnv1a(0xcbf29ce484222325n)}${fnv1a(0x9e3779b97f4a7c15n)}`;
+}

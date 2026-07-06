@@ -6,13 +6,15 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
-import type {
-  RestreamChannel,
-  RestreamChannelWithStatus,
-  RestreamPlaylist,
-  RestreamProfile,
-  SessionStatus,
-  SourceCatalogEntry,
+import {
+  channelStableId,
+  type RestreamChannel,
+  type RestreamChannelWithStatus,
+  type RestreamPlaylist,
+  type RestreamProfile,
+  type SessionStatus,
+  type SourceCatalogEntry,
+  type TvhEpgEvent,
 } from '@tvhc/shared';
 import type { AppConfig } from '../src/config.js';
 import type { InstancePoller } from '../src/tvh/poller.js';
@@ -260,7 +262,7 @@ async function createProfile(app: FastifyInstance, name = 'default'): Promise<Re
 
 async function createPlaylist(
   app: FastifyInstance,
-  body: { slug: string; title: string; epgUrl?: string | null },
+  body: { slug: string; title: string },
 ): Promise<RestreamPlaylist> {
   const res = await app.inject({ method: 'POST', url: '/api/restreamer/playlists', payload: body });
   expect(res.statusCode).toBe(201);
@@ -639,18 +641,20 @@ describe('write-time availability and catalog-resolved identity (routes)', () =>
     });
     expect(res.statusCode).toBe(200);
     // chno sort: cam1 ("5") < AT-X ("9.1") < cam9 (numberless last); the
-    // catalog-resolved logo is the entry value VERBATIM (never proxied),
-    // tvg-id is the catalog entry id, tvg-chno the catalog chno
+    // catalog-resolved logo is the entry value VERBATIM (never proxied);
+    // tvg-id is always the generated stable id (name+number), never the tvh
+    // uuid or catalog entry id — Cam 9 gets one too even with no tvg-chno
+    // (its identity number is unresolved)
     expect(res.body).toBe(
       [
-        '#EXTM3U',
+        `#EXTM3U url-tvg=http://ctrl.example/xmltv/tv.xml`,
         '#PLAYLIST:TV',
         '#KODIPROP:mimetype=application/x-mpegURL',
-        '#EXTINF:-1 tvg-id="cam1" tvg-chno="5" x-url="cam-1" tvg-logo="http://logos.example/cam1.png",Cam 1',
+        `#EXTINF:-1 tvg-id="${channelStableId('Cam 1', '5')}" tvg-chno="5" x-url="cam-1" tvg-logo="http://logos.example/cam1.png",Cam 1`,
         'http://sw.example/hls/cam-1/playlist.m3u8',
-        '#EXTINF:-1 tvg-id="ch-atx-91" tvg-chno="9.1" x-url="at-x" tvg-logo="http://ctrl.example/logos/zone1/imagecache/32736",AT-X',
+        `#EXTINF:-1 tvg-id="${channelStableId('AT-X', '9.1')}" tvg-chno="9.1" x-url="at-x" tvg-logo="http://ctrl.example/logos/zone1/imagecache/32736",AT-X`,
         'http://sw.example/hls/at-x/playlist.m3u8',
-        '#EXTINF:-1 x-url="cam-9",Cam 9',
+        `#EXTINF:-1 tvg-id="${channelStableId('Cam 9', null)}" x-url="cam-9",Cam 9`,
         'http://sw.example/hls/cam-9/playlist.m3u8',
         '',
       ].join('\n'),
@@ -960,7 +964,8 @@ describe('restreamer session passthrough', () => {
 describe('restreamer playlist routes', () => {
   it('CRUD happy path + duplicate slug 409', async () => {
     const { app } = await harness();
-    const created = await createPlaylist(app, { slug: 'tv', title: 'TV', epgUrl: 'http://epg.example/x' });
+    const created = await createPlaylist(app, { slug: 'tv', title: 'TV' });
+    expect(created).not.toHaveProperty('epgUrl');
 
     const dup = await app.inject({
       method: 'POST',
@@ -972,11 +977,10 @@ describe('restreamer playlist routes', () => {
     const updated = await app.inject({
       method: 'PUT',
       url: `/api/restreamer/playlists/${created.id}`,
-      payload: { title: 'TV 2', epgUrl: null },
+      payload: { title: 'TV 2' },
     });
     expect(updated.statusCode).toBe(200);
     expect((updated.json() as RestreamPlaylist).title).toBe('TV 2');
-    expect((updated.json() as RestreamPlaylist).epgUrl).toBeNull();
 
     const list = await app.inject({ method: 'GET', url: '/api/restreamer/playlists' });
     expect((list.json() as RestreamPlaylist[]).map((p) => p.slug)).toEqual(['tv']);
@@ -990,11 +994,7 @@ describe('GET /playlists/:slug.m3u', () => {
   /** playlist with AT-X (single placement), BBB (redundant), CCC (not running) */
   async function seedM3uFixture(h: Harness): Promise<void> {
     const profile = await createProfile(h.app);
-    const playlist = await createPlaylist(h.app, {
-      slug: 'tv',
-      title: 'Mock TV',
-      epgUrl: 'http://epg.example/xmltv',
-    });
+    const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'Mock TV' });
     const post = async (payload: Record<string, unknown>) => {
       const res = await h.app.inject({ method: 'POST', url: '/api/restreamer/channels', payload });
       expect(res.statusCode).toBe(201);
@@ -1050,15 +1050,16 @@ describe('GET /playlists/:slug.m3u', () => {
     // points at the switcher publicUrl — uniform viewer URLs;
     // relative imagecache icon -> controller logo proxy against the request
     // base (no forwarded headers, no configured publicUrl here); absolute
-    // icon (BBB) passes through verbatim
+    // icon (BBB) passes through verbatim; tvg-id is the generated stable id,
+    // never the tvh uuid, so it matches the XMLTV <channel id> for the same entry
     expect(res.body).toBe(
       [
-        '#EXTM3U url-tvg=http://epg.example/xmltv',
+        '#EXTM3U url-tvg=http://ctrl.example/xmltv/tv.xml',
         '#PLAYLIST:Mock TV',
         '#KODIPROP:mimetype=application/x-mpegURL',
-        '#EXTINF:-1 tvg-id="ch-atx-91" tvg-chno="9.1" x-url="at-x" tvg-logo="http://ctrl.example/logos/zone1/imagecache/32736",AT-X',
+        `#EXTINF:-1 tvg-id="${channelStableId('AT-X', '9.1')}" tvg-chno="9.1" x-url="at-x" tvg-logo="http://ctrl.example/logos/zone1/imagecache/32736",AT-X`,
         'http://sw.example/hls/at-x/playlist.m3u8',
-        '#EXTINF:-1 tvg-id="ch-bbb" tvg-chno="10" x-url="bbb" tvg-logo="http://icons.example/bbb.png",BBB',
+        `#EXTINF:-1 tvg-id="${channelStableId('BBB', '10')}" tvg-chno="10" x-url="bbb" tvg-logo="http://icons.example/bbb.png",BBB`,
         'http://sw.example/hls/bbb/playlist.m3u8',
         '',
       ].join('\n'),
@@ -1108,12 +1109,16 @@ describe('GET /playlists/:slug.m3u', () => {
     expect(res.body).toContain('tvg-logo="https://pub.example/logos/zone1/imagecache/32736"');
   });
 
-  it('omits url-tvg when the playlist has no epgUrl', async () => {
+  it('url-tvg always points at the generated per-playlist XMLTV endpoint', async () => {
     const h = await harness();
     await createPlaylist(h.app, { slug: 'bare', title: 'Bare' });
-    const res = await h.app.inject({ method: 'GET', url: '/playlists/bare.m3u' });
+    const res = await h.app.inject({
+      method: 'GET',
+      url: '/playlists/bare.m3u',
+      headers: { host: 'ctrl.example' },
+    });
     expect(res.statusCode).toBe(200);
-    expect(res.body.split('\n')[0]).toBe('#EXTM3U');
+    expect(res.body.split('\n')[0]).toBe('#EXTM3U url-tvg=http://ctrl.example/xmltv/bare.xml');
   });
 
   it('uses direct node serveUrls without a switcher (single and redundant alike)', async () => {
@@ -1131,6 +1136,218 @@ describe('GET /playlists/:slug.m3u', () => {
     const h = await harness();
     const res = await h.app.inject({ method: 'GET', url: '/playlists/nope.m3u' });
     expect(res.statusCode).toBe(404);
+  });
+});
+
+// ---------- playlist XMLTV ----------
+
+describe('GET /xmltv/:slug.xml', () => {
+  /** minimal TvhEpgEvent builder — only the fields the renderer reads are required by callers */
+  function epgEvent(
+    e: Partial<TvhEpgEvent> & { eventId: number; channelName: string; start: number; stop: number },
+  ): TvhEpgEvent {
+    return { channelUuid: 'irrelevant', ...e };
+  }
+
+  /**
+   * AT-X (9.1, single placement), BBB (10, redundant zone1+zone2), CCC (3,
+   * enabled but never given a running session — present in .xml, absent from
+   * .m3u), DDD (disabled member — excluded from both), EEE (enabled, not a
+   * playlist member — excluded from both).
+   */
+  async function seedXmltvFixture(h: Harness): Promise<RestreamPlaylist> {
+    const profile = await createProfile(h.app);
+    const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'Mock TV' });
+    const post = async (payload: Record<string, unknown>) => {
+      const res = await h.app.inject({ method: 'POST', url: '/api/restreamer/channels', payload });
+      expect(res.statusCode).toBe(201);
+      return res.json() as RestreamChannel;
+    };
+    await post({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: profile.id,
+      playlistIds: [playlist.id],
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    await post({
+      channelName: 'BBB',
+      channelNumber: '10',
+      profileId: profile.id,
+      playlistIds: [playlist.id],
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone2', nodeId: 'n1' },
+      ],
+    });
+    await post({
+      channelName: 'CCC',
+      channelNumber: '3',
+      profileId: profile.id,
+      playlistIds: [playlist.id],
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    await post({
+      channelName: 'DDD',
+      channelNumber: '4',
+      profileId: profile.id,
+      playlistIds: [playlist.id],
+      enabled: false,
+    });
+    await post({ channelName: 'EEE', channelNumber: '6', profileId: profile.id });
+    return playlist;
+  }
+
+  /** installs epgEventsAll stubs on the harness's per-instance tvhHttp clients */
+  function stubEpg(
+    h: Harness,
+    zone1: TvhEpgEvent[] | (() => Promise<TvhEpgEvent[]>),
+    zone2: TvhEpgEvent[] | (() => Promise<TvhEpgEvent[]>) = [],
+  ): { zone1: ReturnType<typeof vi.fn>; zone2: ReturnType<typeof vi.fn> } {
+    const toFn = (v: TvhEpgEvent[] | (() => Promise<TvhEpgEvent[]>)) =>
+      typeof v === 'function' ? vi.fn(v) : vi.fn(async () => v);
+    const zone1Fn = toFn(zone1);
+    const zone2Fn = toFn(zone2);
+    h.ctx.tvhHttp.set('zone1', { getRaw: h.tvhGetRaw, epgEventsAll: zone1Fn } as unknown as TvhClient);
+    h.ctx.tvhHttp.set('zone2', { getRaw: h.tvhGetRaw, epgEventsAll: zone2Fn } as unknown as TvhClient);
+    return { zone1: zone1Fn, zone2: zone2Fn };
+  }
+
+  it('members = all enabled playlist members (running state ignored); disabled/non-members excluded', async () => {
+    const h = await harness();
+    await seedXmltvFixture(h);
+    stubEpg(h, []);
+
+    const res = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('application/xml; charset=utf-8');
+    expect(res.body).toContain(`<channel id="${channelStableId('AT-X', '9.1')}">`);
+    expect(res.body).toContain(`<channel id="${channelStableId('BBB', '10')}">`);
+    // CCC has no running session anywhere -> the .m3u would omit it, .xml must not
+    expect(res.body).toContain(`<channel id="${channelStableId('CCC', '3')}">`);
+    expect(res.body).not.toContain('DDD');
+    expect(res.body).not.toContain('EEE');
+
+    const m3u = await h.app.inject({ method: 'GET', url: '/playlists/tv.m3u' });
+    expect(m3u.statusCode).toBe(200);
+    expect(m3u.body).not.toContain('CCC');
+  });
+
+  it('buckets deduped programmes to the right channel; past-24h and future included, stale excluded', async () => {
+    const h = await harness();
+    await seedXmltvFixture(h);
+    const now = Math.floor(Date.now() / 1000);
+    const windowStart = now - 86400;
+    stubEpg(h, [
+      epgEvent({ eventId: 1, channelName: 'AT-X', channelNumber: '9.1', start: now - 1800, stop: now + 1800, title: 'AT-X Now' }),
+      // already ended, but within the past-24h window
+      epgEvent({ eventId: 2, channelName: 'CCC', channelNumber: '3', start: now - 7200, stop: now - 3600, title: 'CCC Past' }),
+      epgEvent({ eventId: 3, channelName: 'CCC', channelNumber: '3', start: now + 3600, stop: now + 7200, title: 'CCC Future' }),
+      // ended before the window even starts -> excluded (belt-and-braces)
+      epgEvent({ eventId: 4, channelName: 'CCC', channelNumber: '3', start: windowStart - 7200, stop: windowStart - 10, title: 'Too Old' }),
+    ]);
+
+    const res = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('<title>AT-X Now</title>');
+    expect(res.body).toContain('<title>CCC Past</title>');
+    expect(res.body).toContain('<title>CCC Future</title>');
+    expect(res.body).not.toContain('Too Old');
+
+    const atxId = channelStableId('AT-X', '9.1');
+    const cccId = channelStableId('CCC', '3');
+    expect(res.body.split(`channel="${atxId}"`).length - 1).toBe(1);
+    expect(res.body.split(`channel="${cccId}"`).length - 1).toBe(2);
+  });
+
+  it('dedups the same broadcast across instances (BBB on zone1+zone2 appears once)', async () => {
+    const h = await harness();
+    await seedXmltvFixture(h);
+    const now = Math.floor(Date.now() / 1000);
+    const bbb = (eventId: number) =>
+      epgEvent({ eventId, channelName: 'BBB', channelNumber: '10', start: now + 3600, stop: now + 7200, title: 'BBB Shared Show' });
+    stubEpg(h, [bbb(10)], [bbb(20)]);
+
+    const res = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+    expect(res.statusCode).toBe(200);
+    expect(res.body.split('BBB Shared Show').length - 1).toBe(1);
+  });
+
+  it('escapes < and & in programme titles; timestamps are UTC XMLTV format', async () => {
+    const h = await harness();
+    await seedXmltvFixture(h);
+    const now = Math.floor(Date.now() / 1000);
+    stubEpg(h, [
+      epgEvent({ eventId: 1, channelName: 'AT-X', channelNumber: '9.1', start: now - 1800, stop: now + 1800, title: 'News <Live> & More' }),
+    ]);
+
+    const res = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('<title>News &lt;Live&gt; &amp; More</title>');
+    expect(res.body).not.toContain('<Live>');
+    expect(res.body).toMatch(/start="\d{14} \+0000" stop="\d{14} \+0000"/);
+  });
+
+  it('fetches each instance with a stop > now-86400 filter', async () => {
+    const h = await harness();
+    await seedXmltvFixture(h);
+    const { zone1, zone2 } = stubEpg(h, [], []);
+
+    const before = Math.floor(Date.now() / 1000);
+    const res = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+    expect(res.statusCode).toBe(200);
+    for (const fn of [zone1, zone2]) {
+      expect(fn).toHaveBeenCalledTimes(1);
+      const arg = fn.mock.calls[0]![0] as {
+        filter: Array<{ field: string; comparison: string; value: number }>;
+      };
+      expect(arg.filter[0]!.field).toBe('stop');
+      expect(arg.filter[0]!.comparison).toBe('gt');
+      expect(Math.abs(arg.filter[0]!.value - (before - 86400))).toBeLessThan(5);
+    }
+  });
+
+  it('404s for an unknown playlist slug', async () => {
+    const h = await harness();
+    const res = await h.app.inject({ method: 'GET', url: '/xmltv/nope.xml' });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('one instance rejecting still 200s with the other instance programmes present', async () => {
+    const h = await harness();
+    await seedXmltvFixture(h);
+    const now = Math.floor(Date.now() / 1000);
+    stubEpg(
+      h,
+      [epgEvent({ eventId: 1, channelName: 'AT-X', channelNumber: '9.1', start: now - 1800, stop: now + 1800, title: 'AT-X Still Up' })],
+      () => Promise.reject(new Error('fetch failed: ECONNREFUSED')),
+    );
+
+    const res = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('AT-X Still Up');
+  });
+
+  it('caches the rendered document for 60s, then refetches past the TTL', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const h = await harness();
+      await seedXmltvFixture(h);
+      const { zone1 } = stubEpg(h, [], []);
+
+      const first = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+      expect(first.statusCode).toBe(200);
+      const second = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+      expect(second.statusCode).toBe(200);
+      expect(zone1).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(Date.now() + 61_000);
+      const third = await h.app.inject({ method: 'GET', url: '/xmltv/tv.xml' });
+      expect(third.statusCode).toBe(200);
+      expect(zone1).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

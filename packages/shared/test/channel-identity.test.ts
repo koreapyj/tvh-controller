@@ -17,7 +17,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { chanKey, chanLabel, chanNumberOrder } from '../src/channel-identity.js';
+import { chanKey, chanLabel, chanNumberOrder, channelStableId } from '../src/channel-identity.js';
 
 describe('chanKey', () => {
   it('passes a string number through', () => {
@@ -76,5 +76,31 @@ describe('chanNumberOrder', () => {
   it('unknown or unparsable sorts last', () => {
     expect(chanNumberOrder(null)).toBe(Infinity);
     expect(chanNumberOrder('weird')).toBe(Infinity);
+  });
+});
+
+describe('channelStableId', () => {
+  it('is deterministic', () => {
+    expect(channelStableId('AT-X', '9.1')).toBe(channelStableId('AT-X', '9.1'));
+  });
+
+  it('matches the expected format', () => {
+    expect(channelStableId('AT-X', '9.1')).toMatch(/^ch-[0-9a-f]{32}$/);
+  });
+
+  it('distinguishes "9.1" from "9.10" (exact-string identity, not numeric)', () => {
+    expect(channelStableId('AT-X', '9.1')).not.toBe(channelStableId('AT-X', '9.10'));
+  });
+
+  it('distinguishes different names with the same number', () => {
+    expect(channelStableId('AT-X', '9.1')).not.toBe(channelStableId('BT-X', '9.1'));
+  });
+
+  it('treats null and undefined number the same (chanKey folds both to "")', () => {
+    expect(channelStableId('AT-X', null)).toBe(channelStableId('AT-X', undefined));
+  });
+
+  it('treats numeric and string forms of the same number the same', () => {
+    expect(channelStableId('AT-X', 10)).toBe(channelStableId('AT-X', '10'));
   });
 });

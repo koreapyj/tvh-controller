@@ -269,7 +269,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     id: string | null;
     slug: string;
     title: string;
-    epgUrl: string;
   }
   let playlistModal: PlaylistForm | null = $state(null);
   let playlistError = $state('');
@@ -302,7 +301,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     const body = {
       slug: f.slug.trim(),
       title: f.title.trim(),
-      epgUrl: f.epgUrl.trim() || null,
     };
     playlistModal = null;
     void run(() =>
@@ -628,7 +626,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     class="primary"
     onclick={() => {
       playlistError = '';
-      playlistModal = { id: null, slug: '', title: '', epgUrl: '' };
+      playlistModal = { id: null, slug: '', title: '' };
     }}
   >
     New playlist
@@ -636,16 +634,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 </div>
 <table>
   <thead>
-    <tr><th>Title</th><th>Slug</th><th>EPG URL</th><th>Members</th><th>M3U</th><th></th></tr>
+    <tr><th>Title</th><th>Slug</th><th>Members</th><th>M3U</th><th></th></tr>
   </thead>
   <tbody>
     {#each playlists as p (p.id)}
       <tr>
         <td>{p.title}</td>
         <td class="small"><code>{p.slug}</code></td>
-        <td class="small cell-clip" title={p.epgUrl ?? ''}>
-          {#if p.epgUrl}{p.epgUrl}{:else}<span class="muted">—</span>{/if}
-        </td>
         <td class="small">{playlistMemberCount(p.id)}</td>
         <td class="small" style="white-space:nowrap">
           <a href="/playlists/{p.slug}.m3u" target="_blank" title="lists this playlist's currently running channels">{m3uUrl(p.slug)}</a>
@@ -656,7 +651,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             disabled={busy}
             onclick={() => {
               playlistError = '';
-              playlistModal = { id: p.id, slug: p.slug, title: p.title, epgUrl: p.epgUrl ?? '' };
+              playlistModal = { id: p.id, slug: p.slug, title: p.title };
             }}
           >
             Edit
@@ -710,10 +705,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <label for="pl-slug">Slug</label>
           <input id="pl-slug" bind:value={playlistModal.slug} placeholder="channels" />
           <div class="muted small">URL path segment: /playlists/&lt;slug&gt;.m3u</div>
-        </div>
-        <div>
-          <label for="pl-epg">EPG URL (url-tvg)</label>
-          <input id="pl-epg" bind:value={playlistModal.epgUrl} placeholder="(none)" />
         </div>
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">

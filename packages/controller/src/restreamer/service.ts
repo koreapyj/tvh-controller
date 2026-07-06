@@ -1208,14 +1208,12 @@ export class RestreamerService {
     id: string;
     slug: string;
     title: string;
-    epg_url: string | null;
     updated_at: Date;
   }): RestreamPlaylist {
     return {
       id: r.id,
       slug: r.slug,
       title: r.title,
-      epgUrl: r.epg_url,
       updatedAt: new Date(r.updated_at).toISOString(),
     };
   }
@@ -1234,14 +1232,13 @@ export class RestreamerService {
     return r ? this.rowToPlaylist(r) : null;
   }
 
-  createPlaylist(input: { slug: string; title: string; epgUrl?: string | null }): Promise<RestreamPlaylist> {
+  createPlaylist(input: { slug: string; title: string }): Promise<RestreamPlaylist> {
     return this.serialize(() => this.createPlaylistInner(input));
   }
 
   private async createPlaylistInner(input: {
     slug: string;
     title: string;
-    epgUrl?: string | null;
   }): Promise<RestreamPlaylist> {
     await this.validatePlaylistSlug(input.slug);
     if (!input.title.trim()) throw httpError(400, 'playlist title must not be empty');
@@ -1252,7 +1249,6 @@ export class RestreamerService {
         id,
         slug: input.slug,
         title: input.title,
-        epg_url: input.epgUrl ?? null,
         updated_at: now(),
       })
       .execute();
@@ -1261,14 +1257,14 @@ export class RestreamerService {
 
   updatePlaylist(
     id: string,
-    patch: { slug?: string; title?: string; epgUrl?: string | null },
+    patch: { slug?: string; title?: string },
   ): Promise<RestreamPlaylist> {
     return this.serialize(() => this.updatePlaylistInner(id, patch));
   }
 
   private async updatePlaylistInner(
     id: string,
-    patch: { slug?: string; title?: string; epgUrl?: string | null },
+    patch: { slug?: string; title?: string },
   ): Promise<RestreamPlaylist> {
     const existing = await this.getPlaylist(id);
     if (!existing) throw httpError(404, `playlist ${id} not found`);
@@ -1283,7 +1279,6 @@ export class RestreamerService {
       .set({
         slug: patch.slug ?? existing.slug,
         title: patch.title ?? existing.title,
-        epg_url: patch.epgUrl === undefined ? existing.epgUrl : patch.epgUrl,
         updated_at: now(),
       })
       .where('id', '=', id)

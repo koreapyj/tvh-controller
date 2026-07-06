@@ -60,7 +60,7 @@ describe('migration 008_restreamer', () => {
       .execute();
     await t.db
       .insertInto('restream_playlists')
-      .values({ id: 'pl-1', slug: 'anime', title: 'Anime', epg_url: null, updated_at: NOW })
+      .values({ id: 'pl-1', slug: 'anime', title: 'Anime', updated_at: NOW })
       .execute();
     await t.db
       .insertInto('restream_playlist_members')
@@ -113,7 +113,8 @@ describe('migration 008_restreamer', () => {
       .selectFrom('restream_playlists')
       .selectAll()
       .executeTakeFirstOrThrow();
-    expect(playlist).toMatchObject({ slug: 'anime', title: 'Anime', epg_url: null });
+    expect(playlist).toMatchObject({ slug: 'anime', title: 'Anime' });
+    expect(playlist).not.toHaveProperty('epg_url');
 
     const member = await t.db
       .selectFrom('restream_playlist_members')

@@ -17,8 +17,8 @@
  */
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { chanNumberOrder } from '@tvhc/shared';
-import type { RestreamChannelWithStatus } from '@tvhc/shared';
+import { chanKey, channelStableId, chanNumberOrder } from '@tvhc/shared';
+import type { RestreamChannelWithStatus, UnifiedEpgEvent } from '@tvhc/shared';
 import type { AppConfig } from '../config.js';
 import {
   AvailabilityError,
@@ -33,6 +33,7 @@ import {
 } from '../restreamer/service.js';
 import { RestreamerError } from '../restreamer/client.js';
 import { httpError, requireDb, type AppContext } from './context.js';
+import { mergeEpg, type EpgMergeInput } from './epg.js';
 
 const BATCH_ACTIONS: ReadonlySet<ChannelBatchAction> = new Set([
   'edit',
@@ -210,16 +211,19 @@ interface EntryIdentity {
 }
 
 /**
- * tvg-id / tvg-chno / tvg-logo come from the first enabled placement (priority
- * order) whose zone resolves the channel's (name, number) identity — same
- * tvh-first-then-catalog rule as the desired-doc computation, per placement:
- * - tvh hit: tvg-id = the tvh uuid, tvg-chno = the pin or the resolved
- *   channel's own number, tvg-logo = the controller's proxied imagecache URL.
- * - catalog hit (only on a tvh miss for that placement): tvg-id = the catalog
- *   entry id, tvg-chno = the pin or the entry's `chno`, tvg-logo = the catalog
+ * number / logo (and the resolved uuid, kept for internal identity checks)
+ * come from the first enabled placement (priority order) whose zone resolves
+ * the channel's (name, number) identity — same tvh-first-then-catalog rule as
+ * the desired-doc computation, per placement:
+ * - tvh hit: uuid = the tvh uuid, number = the pin or the resolved channel's
+ *   own number, logo = the controller's proxied imagecache URL.
+ * - catalog hit (only on a tvh miss for that placement): uuid = the catalog
+ *   entry id, number = the pin or the entry's `chno`, logo = the catalog
  *   `logo` VERBATIM (external logos are already public URLs — never routed
  *   through the controller proxy).
  * No placement resolves → identity nulls (channelNumber only, if pinned).
+ * tvg-id / the XMLTV `<channel id>` never use `uuid` directly — they're
+ * `channelStableId(name, number)`, stable across tvh restarts and uuid churn.
  */
 function resolveEntryIdentity(
   ctx: AppContext,
@@ -283,19 +287,180 @@ async function renderPlaylistM3u(ctx: AppContext, slug: string, baseUrl: string)
   );
 
   const lines: string[] = [
-    playlist.epgUrl ? `#EXTM3U url-tvg=${playlist.epgUrl}` : '#EXTM3U',
+    `#EXTM3U url-tvg=${baseUrl}/xmltv/${playlist.slug}.xml`,
     `#PLAYLIST:${playlist.title}`,
     '#KODIPROP:mimetype=application/x-mpegURL',
   ];
   for (const { channel, url, identity } of entries) {
-    const attrs: string[] = [];
-    if (identity.uuid) attrs.push(`tvg-id="${identity.uuid}"`);
+    const attrs: string[] = [`tvg-id="${channelStableId(channel.channelName, identity.number)}"`];
     if (identity.number != null) attrs.push(`tvg-chno="${identity.number}"`);
     attrs.push(`x-url="${channel.slug}"`);
     if (identity.logo) attrs.push(`tvg-logo="${identity.logo}"`);
     lines.push(`#EXTINF:-1 ${attrs.join(' ')},${channel.channelName}`);
     lines.push(url);
   }
+  return `${lines.join('\n')}\n`;
+}
+
+// ---------------------------------------------------------------------------
+// Master playlist XMLTV generation
+// ---------------------------------------------------------------------------
+
+/** past-programme retention window: XMLTV covers now-24h through everything tvh still holds */
+const XMLTV_PAST_WINDOW_SECONDS = 86400;
+
+/**
+ * On-demand EPG fetch for the XMLTV export. Deliberately NOT the poller cache
+ * (InstancePoller.pollEpg keeps only `stop > now`, dropping ended
+ * programmes) — widening that cache would leak stale events into /api/epg.
+ * `windowStart` is normally `now - 24h`; an unreachable/erroring instance
+ * degrades to an empty, unreachable EpgMergeInput rather than failing the
+ * whole export. Instances with no configured tvhHttp client are skipped
+ * entirely (nothing to fetch). EIT-driven tvheadend may retain less than 24h
+ * of past events — the export simply forwards whatever it returns.
+ */
+async function fetchPlaylistEpg(
+  ctx: AppContext,
+  instanceIds: Iterable<string>,
+  windowStart: number,
+): Promise<EpgMergeInput[]> {
+  const fetches = [...instanceIds].map(async (instanceId): Promise<EpgMergeInput | null> => {
+    const client = ctx.tvhHttp.get(instanceId);
+    if (!client) return null;
+    try {
+      const epg = await client.epgEventsAll({
+        filter: [{ field: 'stop', type: 'numeric', comparison: 'gt', value: windowStart }],
+      });
+      return { instanceId, reachable: true, conflicts: [], epg };
+    } catch {
+      return { instanceId, reachable: false, conflicts: [], epg: [] };
+    }
+  });
+  const results = await Promise.all(fetches);
+  return results.filter((r): r is EpgMergeInput => r !== null);
+}
+
+/** XML 1.0 predefined-entity escaping — no XML lib in the repo for five entities */
+function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/** XMLTV timestamp: UTC `YYYYMMDDHHmmss +0000` — sidesteps per-instance EIT offset guessing */
+function xmltvTimestamp(unixSeconds: number): string {
+  const d = new Date(unixSeconds * 1000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const date = `${d.getUTCFullYear()}${pad(d.getUTCMonth() + 1)}${pad(d.getUTCDate())}`;
+  const time = `${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}${pad(d.getUTCSeconds())}`;
+  return `${date}${time} +0000`;
+}
+
+/**
+ * One `<programme>` element. Field mapping per TvhEpgEvent (tvh-types.ts):
+ * `credits` is deliberately unmapped — tvh's flat Record doesn't translate
+ * cleanly into XMLTV's `<credits>` role elements.
+ */
+function renderProgramme(item: UnifiedEpgEvent, channelId: string): string[] {
+  const d = item.details;
+  const lines: string[] = [
+    `  <programme start="${xmltvTimestamp(item.start)}" stop="${xmltvTimestamp(item.stop)}" channel="${xmlEscape(channelId)}">`,
+    `    <title>${xmlEscape(item.title || item.channelName)}</title>`,
+  ];
+  if (d.subtitle) lines.push(`    <sub-title>${xmlEscape(d.subtitle)}</sub-title>`);
+  const desc = d.description ?? d.summary;
+  if (desc) lines.push(`    <desc>${xmlEscape(desc)}</desc>`);
+  for (const category of d.category ?? []) lines.push(`    <category>${xmlEscape(category)}</category>`);
+  if (d.episodeNumber != null) {
+    // XMLTV xmltv_ns is 0-based; tvh reports 1-based season/episode/part
+    const season = d.seasonNumber != null ? String(d.seasonNumber - 1) : '';
+    const episode = String(d.episodeNumber - 1);
+    const part = d.partNumber != null ? String(d.partNumber - 1) : '';
+    lines.push(`    <episode-num system="xmltv_ns">${season}.${episode}.${part}</episode-num>`);
+  }
+  if (d.first_aired != null) {
+    lines.push(`    <date>${new Date(d.first_aired * 1000).getUTCFullYear()}</date>`);
+  }
+  if (d.new) lines.push('    <new/>');
+  if (d.repeat) lines.push('    <previously-shown/>');
+  if (d.ratingLabel) {
+    lines.push('    <rating>', `      <value>${xmlEscape(d.ratingLabel)}</value>`, '    </rating>');
+  }
+  if (d.image) lines.push(`    <icon src="${xmlEscape(d.image)}"/>`);
+  lines.push('  </programme>');
+  return lines;
+}
+
+/**
+ * Render one DB-managed master playlist's XMLTV document. Member selection
+ * intentionally differs from the M3U: every enabled playlist member, with no
+ * running-placement requirement and no entryUrl filter — EPG stays stable
+ * across channel restarts, unlike the viewer-facing stream list.
+ */
+async function renderPlaylistXmltv(ctx: AppContext, slug: string, baseUrl: string): Promise<string> {
+  const service = requireDb(ctx.restreamer, 'restream playlists');
+  const playlist = (await service.listPlaylists()).find((p) => p.slug === slug);
+  if (!playlist) throw httpError(404, `playlist "${slug}" not found`);
+
+  const members = (await service.listChannels()).filter(
+    (c) => c.enabled && c.playlistIds.includes(playlist.id),
+  );
+
+  const entries = members.map((channel) => ({
+    channel,
+    identity: resolveEntryIdentity(ctx, channel, baseUrl),
+  }));
+  entries.sort(
+    (a, b) =>
+      chanNumberOrder(a.identity.number) - chanNumberOrder(b.identity.number) ||
+      a.channel.channelName.localeCompare(b.channel.channelName),
+  );
+
+  const instanceIds = new Set<string>();
+  for (const { channel } of entries) {
+    for (const p of channel.placements) if (p.enabled) instanceIds.add(p.instanceId);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const windowStart = now - XMLTV_PAST_WINDOW_SECONDS;
+  const inputs = await fetchPlaylistEpg(ctx, instanceIds, windowStart);
+  const merged = mergeEpg(inputs, ctx.config.overlapThreshold, now);
+
+  // bucket merged (deduplicated) programmes per playlist member by channel identity
+  const buckets = new Map<string, UnifiedEpgEvent[]>();
+  for (const item of merged) {
+    if (item.stop <= windowStart) continue; // belt-and-braces — the per-instance filter should already exclude these
+    const key = chanKey(item.channelName, item.channelNumber ?? null);
+    const bucket = buckets.get(key);
+    if (bucket) bucket.push(item);
+    else buckets.set(key, [item]);
+  }
+  for (const bucket of buckets.values()) bucket.sort((a, b) => a.start - b.start);
+
+  const lines: string[] = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<tv generator-info-name="tvh-controller">',
+  ];
+  for (const { channel, identity } of entries) {
+    const id = channelStableId(channel.channelName, identity.number);
+    lines.push(`  <channel id="${xmlEscape(id)}">`);
+    lines.push(`    <display-name>${xmlEscape(channel.channelName)}</display-name>`);
+    if (identity.number != null) {
+      lines.push(`    <display-name>${xmlEscape(identity.number)}</display-name>`);
+      lines.push(`    <lcn>${xmlEscape(identity.number)}</lcn>`);
+    }
+    if (identity.logo) lines.push(`    <icon src="${xmlEscape(identity.logo)}"/>`);
+    lines.push('  </channel>');
+  }
+  for (const { channel, identity } of entries) {
+    const id = channelStableId(channel.channelName, identity.number);
+    const key = chanKey(channel.channelName, identity.number);
+    for (const item of buckets.get(key) ?? []) lines.push(...renderProgramme(item, id));
+  }
+  lines.push('</tv>');
   return `${lines.join('\n')}\n`;
 }
 
@@ -520,7 +685,6 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     const playlist = await svc().createPlaylist({
       slug: requireString(b.slug, 'slug'),
       title: requireString(b.title, 'title'),
-      epgUrl: b.epgUrl == null ? null : String(b.epgUrl),
     });
     reply.code(201);
     return playlist;
@@ -528,10 +692,9 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
 
   app.put<{ Params: { id: string } }>('/api/restreamer/playlists/:id', async (req) => {
     const b = asObject(req.body, 'request body');
-    const patch: { slug?: string; title?: string; epgUrl?: string | null } = {};
+    const patch: { slug?: string; title?: string } = {};
     if (b.slug !== undefined) patch.slug = requireString(b.slug, 'slug');
     if (b.title !== undefined) patch.title = requireString(b.title, 'title');
-    if (b.epgUrl !== undefined) patch.epgUrl = b.epgUrl == null ? null : String(b.epgUrl);
     return svc().updatePlaylist(req.params.id, patch);
   });
 
@@ -601,6 +764,35 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
   };
   app.get<{ Params: { slug: string } }>('/playlists/:slug.m3u', m3uHandler);
   app.get<{ Params: { slug: string } }>('/api/restreamer/playlists/:slug.m3u', m3uHandler);
+
+  // ---------- master playlist XMLTV ----------
+  // Same explicit-route-beats-SPA-fallback reasoning as the M3U above. Time-based
+  // TTL cache (not bus-invalidated): the poller's `epg` event doesn't cover this
+  // on-demand fetch, and XMLTV clients poll on the order of hours anyway.
+
+  const XMLTV_CACHE_TTL_MS = 60_000;
+  const xmltvCache = new Map<string, { at: number; body: string }>();
+
+  const xmltvHandler = async (
+    req: FastifyRequest<{ Params: { slug: string } }>,
+    reply: FastifyReply,
+  ): Promise<string> => {
+    const baseUrl = publicBaseUrl(req, ctx.config);
+    const cacheKey = `${req.params.slug}:${baseUrl}`;
+    const now = Date.now();
+    const cached = xmltvCache.get(cacheKey);
+    let body: string;
+    if (cached && now - cached.at < XMLTV_CACHE_TTL_MS) {
+      body = cached.body;
+    } else {
+      body = await renderPlaylistXmltv(ctx, req.params.slug, baseUrl);
+      xmltvCache.set(cacheKey, { at: now, body });
+    }
+    void reply.header('content-type', 'application/xml; charset=utf-8');
+    return body;
+  };
+  app.get<{ Params: { slug: string } }>('/xmltv/:slug.xml', xmltvHandler);
+  app.get<{ Params: { slug: string } }>('/api/restreamer/xmltv/:slug.xml', xmltvHandler);
 
   // ---------- logo proxy ----------
   // Authenticated passthrough to tvheadend's /imagecache so tvg-logo URLs are

@@ -142,8 +142,6 @@ export interface RestreamPlaylistsTable {
   /** URL path segment */
   slug: string;
   title: string;
-  /** url-tvg for the generated M3U */
-  epg_url: string | null;
   updated_at: ColumnType<Date, string, string>;
 }
 

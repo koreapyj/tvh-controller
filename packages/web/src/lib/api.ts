@@ -95,7 +95,6 @@ export type RestreamChannelBatchAction =
 export interface RestreamPlaylistInput {
   slug: string;
   title: string;
-  epgUrl?: string | null;
 }
 
 /** create/update body: plain rules carry payload, linked clones parentId+overlay */

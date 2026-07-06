@@ -106,8 +106,6 @@ export interface RestreamPlaylist {
   /** URL path segment */
   slug: string;
   title: string;
-  /** url-tvg for the generated M3U; null = none */
-  epgUrl: string | null;
   updatedAt: string;
 }
 
