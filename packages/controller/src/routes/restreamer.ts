@@ -211,17 +211,90 @@ interface EntryIdentity {
 }
 
 /**
- * number / logo (and the resolved uuid, kept for internal identity checks)
- * come from the first enabled placement (priority order) whose zone resolves
- * the channel's (name, number) identity — same tvh-first-then-catalog rule as
- * the desired-doc computation, per placement:
+ * Logo-only fallback across every source that carries this channel — tried in
+ * priority order below, first non-null hit wins. Kept separate from identity
+ * resolution: the identity's zone/uuid/number MUST come from the first
+ * resolving placement (see `resolveEntryIdentity`), but a logo is cosmetic
+ * and worth widening the search for, since plenty of zones simply don't have
+ * a channel icon set.
+ * 1. the channel's own placements, enabled ones, in their existing (priority)
+ *    order — per placement, zone topology icon first (proxied), then that
+ *    node's catalog `logo` (verbatim); a placement that resolves the channel
+ *    but yields no logo (either field) does NOT stop the scan, unlike
+ *    identity resolution.
+ * 2. every OTHER cached instance's tvh topology (stable cache order) —
+ *    covers zones where this channel has no placement at all but the tvh
+ *    still carries it.
+ * 3. every OTHER cached restreamer node's sources catalog (stable cache
+ *    order).
+ * Sources already tried in step 1 are skipped in steps 2/3 (they've already
+ * proven logo-less); everything else is a cheap re-check over in-memory
+ * cache data.
+ */
+function resolveEntryLogo(
+  ctx: AppContext,
+  channel: RestreamChannelWithStatus,
+  baseUrl: string,
+): string | null {
+  const triedInstanceIds = new Set<string>();
+  const triedNodeKeys = new Set<string>();
+
+  for (const p of channel.placements) {
+    if (!p.enabled || !ctx.cache.has(p.instanceId)) continue;
+    triedInstanceIds.add(p.instanceId);
+    triedNodeKeys.add(`${p.instanceId}:${p.nodeId}`);
+    const snap = ctx.cache.get(p.instanceId);
+    const topo = snap.topology;
+    if (topo) {
+      const resolved = resolveTvhChannel(topo.channels, channel.channelName, channel.channelNumber);
+      if (resolved) {
+        const icon = resolved.iconPublicUrl ?? resolved.icon_public_url ?? null;
+        const logo = icon ? proxiedLogoUrl(icon, p.instanceId, baseUrl) : null;
+        if (logo) return logo;
+      }
+    }
+    const sources = snap.restreamers.find((r) => r.nodeId === p.nodeId)?.sources;
+    if (sources) {
+      const entry = resolveCatalogEntry(sources, channel.channelName, channel.channelNumber);
+      if (entry?.logo) return entry.logo;
+    }
+  }
+
+  for (const snap of ctx.cache.all()) {
+    if (triedInstanceIds.has(snap.summary.id) || !snap.topology) continue;
+    const resolved = resolveTvhChannel(snap.topology.channels, channel.channelName, channel.channelNumber);
+    if (!resolved) continue;
+    const icon = resolved.iconPublicUrl ?? resolved.icon_public_url ?? null;
+    const logo = icon ? proxiedLogoUrl(icon, snap.summary.id, baseUrl) : null;
+    if (logo) return logo;
+  }
+
+  for (const snap of ctx.cache.all()) {
+    for (const node of snap.restreamers) {
+      if (triedNodeKeys.has(`${node.instanceId}:${node.nodeId}`) || !node.sources) continue;
+      const entry = resolveCatalogEntry(node.sources, channel.channelName, channel.channelNumber);
+      if (entry?.logo) return entry.logo;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * uuid / number (channel IDENTITY) come from the first enabled placement
+ * (priority order) whose zone resolves the channel's (name, number) identity
+ * — same tvh-first-then-catalog rule as the desired-doc computation, per
+ * placement:
  * - tvh hit: uuid = the tvh uuid, number = the pin or the resolved channel's
- *   own number, logo = the controller's proxied imagecache URL.
+ *   own number.
  * - catalog hit (only on a tvh miss for that placement): uuid = the catalog
- *   entry id, number = the pin or the entry's `chno`, logo = the catalog
- *   `logo` VERBATIM (external logos are already public URLs — never routed
- *   through the controller proxy).
+ *   entry id, number = the pin or the entry's `chno`.
  * No placement resolves → identity nulls (channelNumber only, if pinned).
+ * This ordering is load-bearing and must NOT be touched when adding sources —
+ * uuid/number identify which physical channel this playlist entry IS.
+ * logo is resolved separately (see `resolveEntryLogo`) and falls back across
+ * every source that has the channel, not just the first resolving one —
+ * many zones simply have no channel icon set, and viewers still want one.
  * tvg-id / the XMLTV `<channel id>` never use `uuid` directly — they're
  * `channelStableId(name, number)`, stable across tvh restarts and uuid churn.
  */
@@ -236,11 +309,10 @@ function resolveEntryIdentity(
     if (topo) {
       const resolved = resolveTvhChannel(topo.channels, channel.channelName, channel.channelNumber);
       if (resolved) {
-        const icon = resolved.iconPublicUrl ?? resolved.icon_public_url ?? null;
         return {
           uuid: resolved.uuid,
           number: channel.channelNumber ?? resolved.number ?? null,
-          logo: icon ? proxiedLogoUrl(icon, p.instanceId, baseUrl) : null,
+          logo: resolveEntryLogo(ctx, channel, baseUrl),
         };
       }
     }
@@ -252,12 +324,12 @@ function resolveEntryIdentity(
         return {
           uuid: entry.id,
           number: channel.channelNumber ?? entry.chno,
-          logo: entry.logo ?? null,
+          logo: resolveEntryLogo(ctx, channel, baseUrl),
         };
       }
     }
   }
-  return { uuid: null, number: channel.channelNumber, logo: null };
+  return { uuid: null, number: channel.channelNumber, logo: resolveEntryLogo(ctx, channel, baseUrl) };
 }
 
 /**

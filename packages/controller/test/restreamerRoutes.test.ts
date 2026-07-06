@@ -70,13 +70,31 @@ function zone1Topology(): TopologySnapshot {
   };
 }
 
+/**
+ * BBB (no icon — logo-fallback tests never target it directly, since zone1's
+ * BBB already has a valid absolute icon and would win at the first placement)
+ * and CCC (same name+number as zone1Topology's CCC, but WITH an imagecache
+ * icon) — the latter backs the logo-fallback-across-zones test coverage.
+ */
 function zone2Topology(): TopologySnapshot {
   return {
-    channels: [{ uuid: 'ch2-bbb', name: 'BBB', number: '10', services: ['svc2-bbb'] }],
+    channels: [
+      { uuid: 'ch2-bbb', name: 'BBB', number: '10', services: ['svc2-bbb'] },
+      {
+        uuid: 'ch2-ccc',
+        name: 'CCC',
+        number: '3',
+        services: ['svc2-ccc'],
+        iconPublicUrl: 'imagecache/777',
+      },
+    ],
     tags: [],
     dvrConfigs: [],
     muxes: [],
-    services: [{ uuid: 'svc2-bbb', sid: 202 }],
+    services: [
+      { uuid: 'svc2-bbb', sid: 202 },
+      { uuid: 'svc2-ccc', sid: 203 },
+    ],
     networks: [],
     hardware: [],
     frontendNetworks: new Map(),
@@ -1348,6 +1366,139 @@ describe('GET /xmltv/:slug.xml', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------- logo fallback across zones/catalogs ----------
+
+describe('logo fallback across zones and catalogs (M3U + XMLTV)', () => {
+  /**
+   * CCC identity: zone1Topology carries it with NO icon; zone2Topology
+   * carries the same (name, number) WITH an imagecache/777 icon (see
+   * zone2Topology's doc comment). `placements` controls whether zone2 is
+   * also a placement (rule 1: scan past a resolving-but-logo-less placement)
+   * or left out entirely (rule 2: a zone with no placement at all).
+   */
+  async function createCcc(
+    h: Harness,
+    placements: Array<{ instanceId: string; nodeId: string }>,
+  ): Promise<void> {
+    const profile = await createProfile(h.app);
+    const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'Mock TV' });
+    const res = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'CCC',
+        channelNumber: '3',
+        profileId: profile.id,
+        playlistIds: [playlist.id],
+        placements,
+      },
+    });
+    expect(res.statusCode).toBe(201);
+  }
+
+  it('rule 1: scans past a resolving placement with no icon to a later placement\'s zone icon', async () => {
+    const h = await harness();
+    await createCcc(h, [
+      { instanceId: 'zone1', nodeId: 'n1' },
+      { instanceId: 'zone2', nodeId: 'n1' },
+    ]);
+    seedNodeStatus(h.cache, 'zone1', 'n1', [sessionStatus('ccc')]);
+
+    const m3u = await h.app.inject({
+      method: 'GET',
+      url: '/playlists/tv.m3u',
+      headers: { host: 'ctrl.example' },
+    });
+    expect(m3u.statusCode).toBe(200);
+    // identity (tvg-id/tvg-chno) still comes from zone1 — the first resolving
+    // placement — but the logo falls back to zone2's proxied icon
+    expect(m3u.body).toContain(`tvg-id="${channelStableId('CCC', '3')}" tvg-chno="3"`);
+    expect(m3u.body).toContain('tvg-logo="http://ctrl.example/logos/zone2/imagecache/777"');
+
+    const xmltv = await h.app.inject({
+      method: 'GET',
+      url: '/xmltv/tv.xml',
+      headers: { host: 'ctrl.example' },
+    });
+    expect(xmltv.statusCode).toBe(200);
+    expect(xmltv.body).toContain('<icon src="http://ctrl.example/logos/zone2/imagecache/777"/>');
+  });
+
+  it('rule 2: a zone with NO placement for the channel still supplies the logo via its tvh topology', async () => {
+    const h = await harness();
+    await createCcc(h, [{ instanceId: 'zone1', nodeId: 'n1' }]); // zone2 has no placement at all
+    seedNodeStatus(h.cache, 'zone1', 'n1', [sessionStatus('ccc')]);
+
+    const m3u = await h.app.inject({
+      method: 'GET',
+      url: '/playlists/tv.m3u',
+      headers: { host: 'ctrl.example' },
+    });
+    expect(m3u.statusCode).toBe(200);
+    expect(m3u.body).toContain('tvg-logo="http://ctrl.example/logos/zone2/imagecache/777"');
+
+    const xmltv = await h.app.inject({
+      method: 'GET',
+      url: '/xmltv/tv.xml',
+      headers: { host: 'ctrl.example' },
+    });
+    expect(xmltv.statusCode).toBe(200);
+    expect(xmltv.body).toContain('<icon src="http://ctrl.example/logos/zone2/imagecache/777"/>');
+  });
+
+  it('rule 3: falls back to another node\'s sources catalog when no zone topology has an icon', async () => {
+    const h = await harness();
+    const profile = await createProfile(h.app);
+    const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'Mock TV' });
+    // zone1/n1's catalog resolves the identity (chno match) but its own entry
+    // has no logo; zone2/n1 is NOT a placement of this channel, yet its
+    // catalog carries the same (name, chno) WITH a logo
+    seedNodeStatus(
+      h.cache,
+      'zone1',
+      'n1',
+      [sessionStatus('ghost-cam')],
+      [{ id: 'ghost-z1', name: 'Ghost Cam', url: 'http://cam.example/ghost1.m3u8', chno: '77' }],
+    );
+    seedNodeStatus(
+      h.cache,
+      'zone2',
+      'n1',
+      [],
+      [
+        {
+          id: 'ghost-z2',
+          name: 'Ghost Cam',
+          url: 'http://cam.example/ghost2.m3u8',
+          chno: '77',
+          logo: 'http://logos.example/ghost.png',
+        },
+      ],
+    );
+
+    const created = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'Ghost Cam',
+        channelNumber: '77',
+        profileId: profile.id,
+        playlistIds: [playlist.id],
+        placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+
+    const m3u = await h.app.inject({
+      method: 'GET',
+      url: '/playlists/tv.m3u',
+      headers: { host: 'ctrl.example' },
+    });
+    expect(m3u.statusCode).toBe(200);
+    expect(m3u.body).toContain('tvg-logo="http://logos.example/ghost.png"');
   });
 });
 
