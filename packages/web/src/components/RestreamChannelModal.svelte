@@ -31,9 +31,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   } from '../lib/api.js';
   import { lowestNumberFor, parseChannelInput } from '../lib/channelPick.js';
   import { errText } from '../lib/fetchGuard.js';
+  import { dateTime } from '../lib/format.js';
   import { notify } from '../lib/notifications.js';
   import { placementAvailability } from '../lib/placementAvailability.js';
-  import { deriveSlug, SLUG_PATTERN } from '../lib/restreamFields.js';
+  import {
+    coldActivationLabel,
+    deriveSlug,
+    placementModeBadge,
+    SLUG_PATTERN,
+  } from '../lib/restreamFields.js';
   import { channelOptions, instName, restreamerNodeKey, restreamerNodes } from '../lib/stores.js';
 
   // Logical restream channel editor. Channel identity follows the controller
@@ -172,6 +178,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   let addInstance = $state('');
   let addNode = $state('');
+  let addMode: 'hot' | 'cold' = $state('hot');
   $effect(() => {
     if (!addInstance && nodeInstanceIds.length) addInstance = nodeInstanceIds[0]!;
   });
@@ -184,6 +191,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   interface LocalPlacement {
     instanceId: string;
     nodeId: string;
+    mode: 'hot' | 'cold';
     weight: string;
     programNumber: string;
     enabled: boolean;
@@ -239,13 +247,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         api.addRestreamPlacement(id, {
           instanceId: addInstance,
           nodeId: addNode,
+          mode: addMode,
           ...(forceSave ? { force: true } : {}),
         }),
       );
     } else {
       localPlacements = [
         ...localPlacements,
-        { instanceId: addInstance, nodeId: addNode, weight: '', programNumber: '', enabled: true },
+        {
+          instanceId: addInstance,
+          nodeId: addNode,
+          mode: addMode,
+          weight: '',
+          programNumber: '',
+          enabled: true,
+        },
       ];
     }
   }
@@ -280,6 +296,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return n;
   }
 
+  function commitMode(placementId: string, mode: 'hot' | 'cold'): void {
+    void run(() => api.updateRestreamPlacement(placementId, { mode }));
+  }
+
   function commitWeight(placementId: string, raw: string): void {
     const v = parseOverride(raw, 'weight', false);
     if (v === undefined) return;
@@ -295,6 +315,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   function removePlacement(placementId: string, label: string): void {
     if (!confirm(`Remove the placement on ${label}? The node stops encoding this channel.`)) return;
     void run(() => api.deleteRestreamPlacement(placementId));
+  }
+
+  function deactivateColdBackup(): void {
+    if (!current) return;
+    const id = current.id;
+    void run(() => api.deactivateColdBackup(id));
   }
 
   // ---------- save ----------
@@ -352,6 +378,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             nodeId: p.nodeId,
             priority: i + 1,
             enabled: p.enabled,
+            mode: p.mode,
             weight,
             programNumber,
             ...(forceSave ? { force: true } : {}),
@@ -485,6 +512,27 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </div>
       </div>
 
+      {#if current?.coldActivation}
+        {@const ca = current.coldActivation}
+        {@const caPlacement = current.placements.find((pp) => pp.id === ca.placementId)}
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--warn)" class="small">
+          <span>
+            Cold backup active{#if caPlacement}&nbsp;on {$instName(caPlacement.instanceId)} / {caPlacement.nodeId}{/if}
+            — {coldActivationLabel(ca.reason)} since {dateTime(ca.activatedAt)}
+          </span>
+          <button disabled={busy} onclick={deactivateColdBackup}>Deactivate</button>
+        </div>
+      {/if}
+      {#if current?.coldBlocked}
+        <div
+          class="small"
+          style="color:var(--warn);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title={current.coldBlocked}
+        >
+          Cold backup blocked: {current.coldBlocked}
+        </div>
+      {/if}
+
       <div class="muted small" style="margin-top:8px;text-transform:uppercase;font-size:11px">
         Placements (failover order — every enabled placement encodes hot-hot)
       </div>
@@ -493,6 +541,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <tr>
             <th style="width:60px">Priority</th>
             <th>Node</th>
+            <th>Mode</th>
             <th>Weight</th>
             <th>Program #</th>
             <th>Enabled</th>
@@ -512,6 +561,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                   {$instName(p.instanceId)} / {p.nodeId}
                   {@render availBadge(p.instanceId, p.nodeId)}
                   {#if p.blockedReason}<span class="badge warn" title={p.blockedReason}>blocked</span>{/if}
+                  {#if placementModeBadge(p)}
+                    {@const modeBadge = placementModeBadge(p)!}
+                    <span class="badge {modeBadge.cls}">{modeBadge.label}</span>
+                  {/if}
+                </td>
+                <td>
+                  <select
+                    style="width:auto"
+                    value={p.mode}
+                    disabled={busy}
+                    aria-label="mode"
+                    onchange={(e) => commitMode(p.id, e.currentTarget.value as 'hot' | 'cold')}
+                  >
+                    <option value="hot">hot</option>
+                    <option value="cold">cold</option>
+                  </select>
                 </td>
                 <td>
                   <input
@@ -555,7 +620,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 </td>
               </tr>
             {:else}
-              <tr><td colspan="6" class="muted">No placements — no node encodes this channel yet.</td></tr>
+              <tr><td colspan="7" class="muted">No placements — no node encodes this channel yet.</td></tr>
             {/each}
           {:else}
             {#each localPlacements as p, i (`${p.instanceId}/${p.nodeId}`)}
@@ -568,6 +633,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 <td class="small">
                   {$instName(p.instanceId)} / {p.nodeId}
                   {@render availBadge(p.instanceId, p.nodeId)}
+                  {#if placementModeBadge({ mode: p.mode, coldActive: false })}
+                    {@const modeBadge = placementModeBadge({ mode: p.mode, coldActive: false })!}
+                    <span class="badge {modeBadge.cls}">{modeBadge.label}</span>
+                  {/if}
+                </td>
+                <td>
+                  <select style="width:auto" bind:value={p.mode} aria-label="mode">
+                    <option value="hot">hot</option>
+                    <option value="cold">cold</option>
+                  </select>
                 </td>
                 <td><input style="width:80px" inputmode="numeric" placeholder="(default)" bind:value={p.weight} /></td>
                 <td><input style="width:80px" inputmode="numeric" placeholder="(derived)" bind:value={p.programNumber} /></td>
@@ -579,7 +654,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                 </td>
               </tr>
             {:else}
-              <tr><td colspan="6" class="muted">No placements yet — add a node below.</td></tr>
+              <tr><td colspan="7" class="muted">No placements yet — add a node below.</td></tr>
             {/each}
           {/if}
         </tbody>
@@ -595,6 +670,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {#each nodesByInstance.get(addInstance) ?? [] as n (n)}
             <option value={n}>{n}</option>
           {/each}
+        </select>
+        <select style="width:auto" bind:value={addMode} aria-label="mode">
+          <option value="hot">hot</option>
+          <option value="cold">cold</option>
         </select>
         <button disabled={addDisabled} onclick={addPlacement}>Add placement</button>
         {#if !nodeInstanceIds.length}

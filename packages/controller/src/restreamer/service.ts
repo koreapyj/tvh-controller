@@ -22,6 +22,7 @@ import {
   PipelineParams,
   RESTREAMER_API_VERSION,
   chanNumberOrder,
+  type ColdActivationReason,
   type DesiredSession,
   type DesiredState,
   type RestreamChannel,
@@ -43,6 +44,9 @@ import type { InstanceCache } from '../state/instanceCache.js';
 import type { InstancePoller } from '../tvh/poller.js';
 import { httpError } from '../util/httpError.js';
 import { RestreamerError, type RestreamerClient } from './client.js';
+import { COLD_FAILOVER_TICK_MS, type SourceKey } from './coldFailoverPolicy.js';
+import { ColdFailoverSync } from './coldFailoverSync.js';
+import { DeliveryProbe, type ProbeTarget } from './deliveryProbe.js';
 import type { RestreamerPollerHooks, SwitcherPollerHooks } from './poller.js';
 import {
   SwitcherSync,
@@ -170,6 +174,8 @@ export interface PlacementInput {
   /** failover order; default = current max + 1 */
   priority?: number;
   enabled?: boolean;
+  /** 'hot' (default) = always encodes; 'cold' = standby for the failover loop */
+  mode?: 'hot' | 'cold';
   weight?: number | null;
   programNumber?: number | null;
   /** skip the write-time availability check (pre-provisioning) */
@@ -210,6 +216,8 @@ export interface PlacementPatch {
   nodeId?: string;
   priority?: number;
   enabled?: boolean;
+  /** 'hot' = always encodes; 'cold' = standby for the failover loop */
+  mode?: 'hot' | 'cold';
   weight?: number | null;
   programNumber?: number | null;
   /** skip the write-time availability check when moving to another node */
@@ -312,6 +320,11 @@ function rowIdentity(r: { channel_name: string; channel_number: string | null })
 /** never-hydrated / hydration-failed marker for the last-pushed-doc cache */
 const UNKNOWN = Symbol('unknown');
 
+/** DB reason string → the DTO union (unknown values read conservatively) */
+function coldReason(v: string): ColdActivationReason {
+  return v === 'session-unhealthy' || v === 'delivery-slow' ? v : 'node-unreachable';
+}
+
 /**
  * Restreamer task allocation: owns the restream_* tables, computes each
  * node's desired doc from placements × topology, and pushes it (hash-skip,
@@ -335,6 +348,13 @@ export class RestreamerService {
   private readonly sourcesDebounce = new Map<string, NodeJS.Timeout>();
   /** switcher-side sync (desired doc, pushes, rebalance driver) — shares this op chain */
   private readonly switcherSync: SwitcherSync;
+  /** cold-backup failover driver — shares this op chain via coldFailoverTick */
+  private readonly coldFailoverSync: ColdFailoverSync;
+  private coldFailoverTimer: NodeJS.Timeout | null = null;
+  /** why the failover loop could NOT activate a cold backup, per channel (last tick) */
+  private readonly coldBlockedByChannel = new Map<string, string>();
+  /** segment-path prober; null = deliveryProbe not configured (trigger off) */
+  private readonly deliveryProbe: DeliveryProbe | null;
 
   constructor(
     private readonly db: Db,
@@ -348,6 +368,18 @@ export class RestreamerService {
     private readonly switcherClients: Map<string, SwitcherNodeClient> = new Map(),
   ) {
     this.switcherSync = new SwitcherSync(db, cache, bus, config, switcherClients);
+    this.deliveryProbe = config.restreamer?.deliveryProbe
+      ? new DeliveryProbe(config.restreamer.deliveryProbe, () => this.deliveryProbeTargets())
+      : null;
+    this.coldFailoverSync = new ColdFailoverSync(
+      db,
+      cache,
+      config,
+      switcherClients,
+      (instanceId, nodeId, identity, programOverride) =>
+        this.sourceKeyFor(instanceId, nodeId, identity, programOverride),
+      () => this.deliveryProbe?.snapshot() ?? new Map(),
+    );
   }
 
   private serialize<T>(fn: () => Promise<T>): Promise<T> {
@@ -519,6 +551,7 @@ export class RestreamerService {
     node_id: string;
     priority: number;
     enabled: number;
+    mode: string;
     weight: number | null;
     program_number: number | null;
     updated_at: Date;
@@ -530,6 +563,8 @@ export class RestreamerService {
       nodeId: r.node_id,
       priority: r.priority,
       enabled: !!r.enabled,
+      // unknown values read as 'hot' — the pre-migration behavior
+      mode: r.mode === 'cold' ? 'cold' : 'hot',
       weight: r.weight,
       programNumber: r.program_number,
       updatedAt: new Date(r.updated_at).toISOString(),
@@ -561,7 +596,7 @@ export class RestreamerService {
    * placement, and the viewer-facing playback URL.
    */
   async listChannels(): Promise<RestreamChannelWithStatus[]> {
-    const [channels, profiles, placements, members] = await Promise.all([
+    const [channels, profiles, placements, members, activations] = await Promise.all([
       this.db.selectFrom('restream_channels').selectAll().orderBy('slug').execute(),
       this.db.selectFrom('restream_profiles').selectAll().execute(),
       this.db
@@ -571,12 +606,15 @@ export class RestreamerService {
         .orderBy('id')
         .execute(),
       this.db.selectFrom('restream_playlist_members').selectAll().execute(),
+      this.db.selectFrom('restream_cold_activations').selectAll().execute(),
     ]);
     const profileNames = new Map(profiles.map((p) => [p.id, p.name]));
+    const activationByChannel = new Map(activations.map((a) => [a.channel_id, a]));
 
     return channels.map((c) => {
       const chanPlacements = placements.filter((p) => p.channel_id === c.id);
       const playlistIds = members.filter((m) => m.channel_id === c.id).map((m) => m.playlist_id);
+      const activation = activationByChannel.get(c.id) ?? null;
       const withStatus = chanPlacements.map((p) => {
         const resolution = this.resolvePlacement(
           p.instance_id,
@@ -590,6 +628,7 @@ export class RestreamerService {
           blockedReason: resolution.ok ? null : resolution.reason,
           resolvedVia: resolution.ok ? resolution.via : null,
           session: nodeStatus?.sessions.find((s) => s.name === c.slug) ?? null,
+          coldActive: activation?.placement_id === p.id,
         };
       });
       const { activePlacementId, lastSwitch } = this.switcherView(c.slug);
@@ -597,6 +636,14 @@ export class RestreamerService {
         ...this.rowToChannel(c, playlistIds),
         profileName: profileNames.get(c.profile_id) ?? c.profile_id,
         placements: withStatus,
+        coldActivation: activation
+          ? {
+              placementId: activation.placement_id,
+              reason: coldReason(activation.reason),
+              activatedAt: new Date(activation.activated_at).toISOString(),
+            }
+          : null,
+        coldBlocked: this.coldBlockedByChannel.get(c.id) ?? null,
         activePlacementId,
         lastSwitch,
         playbackUrl: this.playbackUrl(
@@ -737,6 +784,7 @@ export class RestreamerService {
           node_id: p.nodeId,
           priority,
           enabled: p.enabled === false ? 0 : 1,
+          mode: p.mode ?? 'hot',
           weight: p.weight ?? null,
           program_number: p.programNumber ?? null,
           updated_at: now(),
@@ -1059,6 +1107,7 @@ export class RestreamerService {
         node_id: input.nodeId,
         priority,
         enabled: input.enabled === false ? 0 : 1,
+        mode: input.mode ?? 'hot',
         weight: input.weight ?? null,
         program_number: input.programNumber ?? null,
         updated_at: now(),
@@ -1131,6 +1180,7 @@ export class RestreamerService {
         node_id: nodeId,
         priority: patch.priority ?? existing.priority,
         enabled: patch.enabled === undefined ? existing.enabled : patch.enabled ? 1 : 0,
+        mode: patch.mode ?? existing.mode,
         weight: patch.weight === undefined ? existing.weight : patch.weight,
         program_number:
           patch.programNumber === undefined ? existing.program_number : patch.programNumber,
@@ -1547,6 +1597,7 @@ export class RestreamerService {
       .selectFrom('restream_placements as p')
       .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
       .innerJoin('restream_profiles as pr', 'pr.id', 'c.profile_id')
+      .leftJoin('restream_cold_activations as rca', 'rca.placement_id', 'p.id')
       .select([
         'p.id as placement_id',
         'p.weight',
@@ -1561,6 +1612,8 @@ export class RestreamerService {
       .where('p.node_id', '=', nodeId)
       .where('p.enabled', '=', 1)
       .where('c.enabled', '=', 1)
+      // cold placements encode only while the failover loop has them activated
+      .where((eb) => eb.or([eb('p.mode', '=', 'hot'), eb('rca.placement_id', 'is not', null)]))
       .execute();
 
     const sessions: DesiredSession[] = [];
@@ -2090,5 +2143,140 @@ export class RestreamerService {
       );
     }
     return { ok: true, already: false };
+  }
+
+  // ---------- cold-backup failover ----------
+
+  /** encode-source identity of one placement — feeds the policy's source-aware gate */
+  private sourceKeyFor(
+    instanceId: string,
+    nodeId: string,
+    identity: ChannelIdentity,
+    programOverride: number | null,
+  ): SourceKey {
+    const resolved = this.resolvePlacement(instanceId, nodeId, identity, programOverride);
+    if (!resolved.ok) return { kind: 'unresolved' };
+    return resolved.via === 'tvh'
+      ? { kind: 'tvh', instanceId }
+      : { kind: 'catalog', url: (resolved.source as { url: string }).url };
+  }
+
+  /**
+   * Delivery-probe targets: the serveUrl origin of every node hosting an
+   * enabled HOT placement of a channel that has ≥1 enabled cold placement —
+   * the only origins whose slowness could ever trigger a cold activation.
+   * urls = that channel's master playlist through the origin.
+   */
+  private async deliveryProbeTargets(): Promise<ProbeTarget[]> {
+    const rows = await this.db
+      .selectFrom('restream_placements as p')
+      .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
+      .select(['p.instance_id', 'p.node_id', 'p.mode', 'c.id as channel_id', 'c.slug'])
+      .where('p.enabled', '=', 1)
+      .where('c.enabled', '=', 1)
+      .execute();
+    const coldChannels = new Set(
+      rows.filter((r) => r.mode === 'cold').map((r) => r.channel_id),
+    );
+    const byOrigin = new Map<string, Set<string>>();
+    for (const r of rows) {
+      if (r.mode !== 'hot' || !coldChannels.has(r.channel_id)) continue;
+      const serveUrl = this.nodeConfig(r.instance_id, r.node_id)?.serveUrl;
+      if (!serveUrl) continue;
+      let origin: string;
+      try {
+        origin = new URL(serveUrl).origin;
+      } catch {
+        continue;
+      }
+      let urls = byOrigin.get(origin);
+      if (!urls) byOrigin.set(origin, (urls = new Set()));
+      urls.add(`${serveUrl}/${r.slug}/playlist.m3u8`);
+    }
+    return [...byOrigin.entries()].map(([origin, urls]) => ({ origin, urls: [...urls] }));
+  }
+
+  /**
+   * 20s cold-failover cadence (separate from the 60s heal sweep and 300s
+   * rebalance — this loop makes decisions, the sweep only re-pushes). Also
+   * starts the delivery probe when configured.
+   */
+  startColdFailover(): void {
+    if (this.coldFailoverTimer) return;
+    this.deliveryProbe?.start();
+    this.coldFailoverTimer = setInterval(() => {
+      void this.coldFailoverTick().catch(() => {});
+    }, COLD_FAILOVER_TICK_MS);
+    this.coldFailoverTimer.unref?.();
+  }
+
+  stopColdFailover(): void {
+    if (this.coldFailoverTimer) clearInterval(this.coldFailoverTimer);
+    this.coldFailoverTimer = null;
+    this.deliveryProbe?.stop();
+  }
+
+  /** one failover evaluation, serialized like every other op */
+  coldFailoverTick(): Promise<void> {
+    return this.serialize(async () => {
+      const result = await this.coldFailoverSync.tick();
+      this.coldBlockedByChannel.clear();
+      for (const b of result.blocked) {
+        this.coldBlockedByChannel.set(b.channelId, b.reason);
+        console.error(`restreamer: cold backup for "${b.slug}" blocked: ${b.reason}`);
+      }
+      if (result.changedChannelIds.length) {
+        const nodes: NodeRef[] = [];
+        for (const channelId of result.changedChannelIds) {
+          nodes.push(...(await this.affectedNodesByChannel(channelId)));
+        }
+        await this.pushNodesInner(nodes).catch((err) =>
+          console.error('restreamer: cold-failover push failed:', err),
+        );
+        await this.pushAllSwitchersSafe();
+      }
+    });
+  }
+
+  /**
+   * Startup hygiene: prune activation rows orphaned while the controller was
+   * down (placement disabled/mode-flipped, channel disabled). Surviving rows
+   * need no special handling — doc computation joins the table, so the next
+   * push/sweep honors them.
+   */
+  reconcileColdFailoverOnStartup(): Promise<void> {
+    return this.serialize(async () => {
+      const changed = await this.coldFailoverSync.reconcileOnStartup();
+      if (changed.length) {
+        const nodes: NodeRef[] = [];
+        for (const channelId of changed) {
+          nodes.push(...(await this.affectedNodesByChannel(channelId)));
+        }
+        await this.pushNodesInner(nodes).catch(() => {});
+        await this.pushAllSwitchersSafe();
+      }
+    });
+  }
+
+  /** operator escape valve: force-clear a channel's cold activation and re-push */
+  deactivateColdBackup(channelId: string): Promise<{ ok: true; existed: boolean }> {
+    return this.serialize(async () => {
+      const channel = await this.db
+        .selectFrom('restream_channels')
+        .select('id')
+        .where('id', '=', channelId)
+        .executeTakeFirst();
+      if (!channel) throw httpError(404, `restream channel ${channelId} not found`);
+      const result = await this.db
+        .deleteFrom('restream_cold_activations')
+        .where('channel_id', '=', channelId)
+        .executeTakeFirst();
+      const existed = Number(result.numDeletedRows ?? 0) > 0;
+      if (existed) {
+        this.coldBlockedByChannel.delete(channelId);
+        await this.pushAffectedByChannelSafe(channelId);
+      }
+      return { ok: true, existed };
+    });
   }
 }

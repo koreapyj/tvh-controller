@@ -125,7 +125,27 @@ export interface RestreamPlacementsTable {
   weight: number | null;
   /** manual program-number (service SID) override; NULL = derived channel→service→sid */
   program_number: number | null;
+  /** 'hot' = always encodes; 'cold' = standby, encodes only while an activation row exists */
+  mode: Generated<string>;
   updated_at: ColumnType<Date, string, string>;
+}
+
+/**
+ * one active cold backup per channel (PK = channel_id). Row present = the
+ * cold placement is included in node/switcher docs; absent = standby. The
+ * failover loop's debounce/streak state is in-memory only — this row is the
+ * single persisted decision, so a controller restart never orphans a running
+ * cold session.
+ */
+export interface RestreamColdActivationsTable {
+  channel_id: string;
+  placement_id: string;
+  /** the hot placement whose failure triggered this — diagnostics only */
+  preferred_placement_id: string | null;
+  /** 'node-unreachable' | 'session-unhealthy' | 'delivery-slow' */
+  reason: string;
+  activated_at: ColumnType<Date, string | undefined, string>;
+  updated_at: ColumnType<Date, string | undefined, string>;
 }
 
 /** last successfully pushed desired-doc hash per node (doc is atomic — one hash) */
@@ -169,6 +189,7 @@ export interface Database {
   restream_profiles: RestreamProfilesTable;
   restream_channels: RestreamChannelsTable;
   restream_placements: RestreamPlacementsTable;
+  restream_cold_activations: RestreamColdActivationsTable;
   restream_node_state: RestreamNodeStateTable;
   restream_playlists: RestreamPlaylistsTable;
   restream_playlist_members: RestreamPlaylistMembersTable;

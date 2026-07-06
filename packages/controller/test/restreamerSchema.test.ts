@@ -189,6 +189,77 @@ describe('migration 008_restreamer', () => {
     });
   });
 
+  describe('012_cold_backup_placements', () => {
+    it('a pre-existing placement row reads back mode "hot" by default', async () => {
+      await seed();
+      const placement = await t.db
+        .selectFrom('restream_placements')
+        .selectAll()
+        .where('id', '=', 'plc-1')
+        .executeTakeFirstOrThrow();
+      expect(placement.mode).toBe('hot');
+    });
+
+    it('inserts and reads back a restream_cold_activations row', async () => {
+      await seed();
+      await t.db
+        .insertInto('restream_cold_activations')
+        .values({
+          channel_id: 'chan-1',
+          placement_id: 'plc-1',
+          preferred_placement_id: null,
+          reason: 'node-unreachable',
+          activated_at: NOW,
+          updated_at: NOW,
+        })
+        .execute();
+      const row = await t.db.selectFrom('restream_cold_activations').selectAll().executeTakeFirstOrThrow();
+      expect(row).toMatchObject({
+        channel_id: 'chan-1',
+        placement_id: 'plc-1',
+        preferred_placement_id: null,
+        reason: 'node-unreachable',
+      });
+      expect(row.activated_at).toBeInstanceOf(Date);
+    });
+
+    it('deleting the channel cascades to its cold activation row', async () => {
+      await seed();
+      await t.db
+        .insertInto('restream_cold_activations')
+        .values({
+          channel_id: 'chan-1',
+          placement_id: 'plc-1',
+          preferred_placement_id: null,
+          reason: 'node-unreachable',
+          activated_at: NOW,
+          updated_at: NOW,
+        })
+        .execute();
+      await t.db.deleteFrom('restream_channels').where('id', '=', 'chan-1').execute();
+      expect(await t.db.selectFrom('restream_cold_activations').selectAll().execute()).toHaveLength(0);
+    });
+
+    it('deleting the placement cascades to its cold activation row', async () => {
+      await seed();
+      await t.db
+        .insertInto('restream_cold_activations')
+        .values({
+          channel_id: 'chan-1',
+          placement_id: 'plc-1',
+          preferred_placement_id: null,
+          reason: 'node-unreachable',
+          activated_at: NOW,
+          updated_at: NOW,
+        })
+        .execute();
+      await t.db.deleteFrom('restream_placements').where('id', '=', 'plc-1').execute();
+      expect(await t.db.selectFrom('restream_cold_activations').selectAll().execute()).toHaveLength(0);
+      // the channel itself survives -- only the activation row is cascaded
+      expect(await t.db.selectFrom('restream_channels').selectAll().execute()).toHaveLength(1);
+    });
+  });
+
   it('enforces UNIQUE(channel_id, instance_id, node_id) on placements', async () => {
     await seed();
     await expect(

@@ -345,6 +345,40 @@ migrations['011_drop_playlist_epg_url'] = {
   },
 };
 
+migrations['012_cold_backup_placements'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // 'hot' = always encodes (pre-existing behavior); 'cold' = standby,
+    // excluded from node/switcher docs unless an activation row exists below
+    await db.schema
+      .alterTable('restream_placements')
+      .addColumn('mode', 'varchar(8)', (c) => c.notNull().defaultTo('hot'))
+      .execute();
+
+    // at most one active cold backup per channel; persisted so a controller
+    // restart never orphans a running cold session or forgets why it started
+    await db.schema
+      .createTable('restream_cold_activations')
+      .addColumn('channel_id', 'varchar(36)', (c) =>
+        c.primaryKey().references('restream_channels.id').onDelete('cascade'),
+      )
+      .addColumn('placement_id', 'varchar(36)', (c) =>
+        c.notNull().unique().references('restream_placements.id').onDelete('cascade'),
+      )
+      // the hot placement whose failure triggered this — diagnostics only
+      .addColumn('preferred_placement_id', 'varchar(36)', (c) =>
+        c.references('restream_placements.id').onDelete('set null'),
+      )
+      .addColumn('reason', 'varchar(20)', (c) => c.notNull())
+      .addColumn('activated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .addColumn('updated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.dropTable('restream_cold_activations').execute();
+    await db.schema.alterTable('restream_placements').dropColumn('mode').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

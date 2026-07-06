@@ -1614,6 +1614,126 @@ describe('GET /logos/:instanceId/imagecache/:iconId', () => {
   });
 });
 
+// ---------- cold backup ----------
+
+describe('restreamer cold backup routes', () => {
+  async function createChannelWithColdPlacement(h: Harness): Promise<{ channel: RestreamChannel; coldId: string }> {
+    const profile = await createProfile(h.app);
+    const created = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'AT-X',
+        channelNumber: '9.1',
+        profileId: profile.id,
+        placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const channel = created.json() as RestreamChannel;
+    const addedCold = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/placements`,
+      payload: { instanceId: 'zone1', nodeId: 'n2', mode: 'cold' },
+    });
+    expect(addedCold.statusCode).toBe(201);
+    return { channel, coldId: (addedCold.json() as { id: string }).id };
+  }
+
+  async function seedActivation(h: Harness, channelId: string, placementId: string): Promise<void> {
+    await h.ctx.db!
+      .insertInto('restream_cold_activations')
+      .values({
+        channel_id: channelId,
+        placement_id: placementId,
+        preferred_placement_id: null,
+        reason: 'node-unreachable',
+        activated_at: '2026-01-01 00:00:00',
+        updated_at: '2026-01-01 00:00:00',
+      })
+      .execute();
+  }
+
+  it('placement create accepts mode and echoes it; invalid mode -> 400', async () => {
+    const h = await harness();
+    const { channel, coldId } = await createChannelWithColdPlacement(h);
+    expect(coldId).toBeTruthy();
+
+    const badCreate = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/placements`,
+      payload: { instanceId: 'zone2', nodeId: 'n1', mode: 'weird' },
+    });
+    expect(badCreate.statusCode).toBe(400);
+  });
+
+  it('PUT placement patch flips mode; invalid mode -> 400', async () => {
+    const h = await harness();
+    const { coldId } = await createChannelWithColdPlacement(h);
+
+    const flipped = await h.app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${coldId}`,
+      payload: { mode: 'hot' },
+    });
+    expect(flipped.statusCode).toBe(200);
+    expect((flipped.json() as { mode: string }).mode).toBe('hot');
+
+    const badPatch = await h.app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${coldId}`,
+      payload: { mode: 'weird' },
+    });
+    expect(badPatch.statusCode).toBe(400);
+  });
+
+  it('GET channels carries coldActive/coldActivation/coldBlocked, updated once an activation row exists', async () => {
+    const h = await harness();
+    const { channel, coldId } = await createChannelWithColdPlacement(h);
+
+    const before = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const beforeChan = (before.json() as RestreamChannelWithStatus[]).find((c) => c.id === channel.id)!;
+    expect(beforeChan.placements.find((p) => p.id === coldId)!.coldActive).toBe(false);
+    expect(beforeChan.coldActivation).toBeNull();
+    expect(beforeChan.coldBlocked).toBeNull();
+
+    await seedActivation(h, channel.id, coldId);
+
+    const after = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const afterChan = (after.json() as RestreamChannelWithStatus[]).find((c) => c.id === channel.id)!;
+    expect(afterChan.placements.find((p) => p.id === coldId)!.coldActive).toBe(true);
+    expect(afterChan.coldActivation).toMatchObject({ placementId: coldId, reason: 'node-unreachable' });
+  });
+
+  it('POST cold/deactivate: existed:false with none, existed:true (and clears it) once seeded; 404 for an unknown channel', async () => {
+    const h = await harness();
+    const { channel, coldId } = await createChannelWithColdPlacement(h);
+
+    const noneYet = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/cold/deactivate`,
+    });
+    expect(noneYet.statusCode).toBe(200);
+    expect(noneYet.json()).toEqual({ ok: true, existed: false });
+
+    await seedActivation(h, channel.id, coldId);
+
+    const cleared = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/cold/deactivate`,
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toEqual({ ok: true, existed: true });
+    expect(await h.ctx.db!.selectFrom('restream_cold_activations').selectAll().execute()).toHaveLength(0);
+
+    const unknown = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels/ghost/cold/deactivate',
+    });
+    expect(unknown.statusCode).toBe(404);
+  });
+});
+
 // ---------- nodes / no-DB mode ----------
 
 describe('restreamer nodes + overview-only mode', () => {

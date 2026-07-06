@@ -30,6 +30,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { notify } from '../lib/notifications.js';
   import {
     CHANNEL_BATCH_FIELDS,
+    coldActivationLabel,
     compareChannels,
     sessionStateBadge,
     uptimeLabel,
@@ -220,6 +221,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       `${$instName(p.instanceId)} / ${p.nodeId} — ${p.session?.state ?? 'no session'}`,
     ];
     if (!p.enabled) parts.push('placement disabled');
+    if (p.mode === 'cold') parts.push(p.coldActive ? 'cold backup — active' : 'cold backup — standby');
     if (p.blockedReason) parts.push(`blocked: ${p.blockedReason}`);
     if (p.session?.lastError) parts.push(p.session.lastError);
     if (c.activePlacementId === p.id && c.placements.length > 1) {
@@ -527,6 +529,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             {/if}
           {/if}
           {chanLabel(c.channelName, c.channelNumber)}
+          {#if c.coldActivation}
+            {@const ca = c.coldActivation}
+            <span
+              class="badge warn"
+              title="cold backup active — {coldActivationLabel(ca.reason)} since {dateTime(ca.activatedAt)}"
+            >
+              failover
+            </span>
+          {/if}
+          {#if c.coldBlocked}
+            <span class="muted small" title="cold backup could not activate: {c.coldBlocked}">⚠</span>
+          {/if}
           {#if c.comment}<div class="muted small">{c.comment}</div>{/if}
         </td>
         <td class="small m-inline">

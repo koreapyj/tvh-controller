@@ -31,6 +31,14 @@ instances:
     #       serveUrl: https://tv1.example.com
     #       # expected serving bandwidth budget in Mbps (used by the rebalancer):
     #       egressMbps: 500
+    #       # hard cap on concurrent encoding sessions (cold-backup admission gate;
+    #       # omit = uncapped). Measure it: ramp production-profile sessions one at
+    #       # a time, watching every session hold speed >= 1.0 and playlist lag ~0
+    #       # for 10+ minutes (and intel_gpu_top VDBOX headroom); set the largest
+    #       # stable count MINUS 1-2 — the margin absorbs content spikes and
+    #       # doubles as failover headroom. Re-measure when the encode profile
+    #       # changes (resolution/bitrate/deinterlace).
+    #       maxSessions: 6
   - id: zone2
     name: Zone 2
     url: http://192.168.2.10:9981
@@ -79,6 +87,15 @@ rclone:
 #     - id: main
 #       url: http://switcher.internal:5581
 #       publicUrl: https://tv.example.com
+#   # Active segment-path probe of each node serveUrl origin (cache server).
+#   # Playlists stay fast even through a struggling cache, so the cold-backup
+#   # "delivery-slow" trigger needs a real segment download to notice a slow
+#   # cache upstream. Omit = probe off (the delivery-slow trigger never fires).
+#   # `deliveryProbe: true` uses the defaults shown below.
+#   deliveryProbe:
+#     intervalSec: 45      # one segment fetch per cache origin per interval
+#     ttfbMs: 3000         # time-to-first-byte above this = slow
+#     minSpeedFactor: 1.5  # segment must download in < duration/1.5
 
 # optional overrides (milliseconds / ratio)
 # pollIntervals: { dvr: 15000, autorec: 60000, topology: 600000, restreamer: 15000 }

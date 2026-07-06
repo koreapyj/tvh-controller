@@ -84,6 +84,12 @@ function parsePlacementInput(raw: unknown): PlacementInput {
     input.priority = p.priority;
   }
   if (p.enabled !== undefined) input.enabled = !!p.enabled;
+  if (p.mode !== undefined) {
+    if (p.mode !== 'hot' && p.mode !== 'cold') {
+      throw httpError(400, "placement.mode must be 'hot' or 'cold'");
+    }
+    input.mode = p.mode;
+  }
   if (p.weight !== undefined) {
     if (p.weight !== null && typeof p.weight !== 'number') {
       throw httpError(400, 'placement.weight must be a number or null');
@@ -716,6 +722,12 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
       patch.priority = b.priority;
     }
     if (b.enabled !== undefined) patch.enabled = !!b.enabled;
+    if (b.mode !== undefined) {
+      if (b.mode !== 'hot' && b.mode !== 'cold') {
+        throw httpError(400, "mode must be 'hot' or 'cold'");
+      }
+      patch.mode = b.mode;
+    }
     if (b.weight !== undefined) {
       if (b.weight !== null && typeof b.weight !== 'number') {
         throw httpError(400, 'weight must be a number or null');
@@ -774,6 +786,17 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     await svc().deletePlaylist(req.params.id);
     return { ok: true };
   });
+
+  // ---------- cold backup ----------
+  // Operator escape valve: force-clear a channel's cold activation (the
+  // failover loop normally deactivates on its own, make-before-break); the
+  // cleared cold session is torn down by the re-push. existed:false = there
+  // was nothing to clear.
+
+  app.post<{ Params: { id: string } }>(
+    '/api/restreamer/channels/:id/cold/deactivate',
+    async (req) => svc().deactivateColdBackup(req.params.id),
+  );
 
   // ---------- manual switch / reset ----------
   // Passthrough to POST /v1/channels/:slug/switch on the switcher: the

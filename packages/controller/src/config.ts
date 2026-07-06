@@ -36,6 +36,14 @@ export interface RestreamerNodeConfig {
   serveUrl?: string;
   /** expected serving bandwidth budget (Mbps), used by the rebalancer */
   egressMbps?: number;
+  /**
+   * hard cap on concurrent encoding sessions this node's GPU can carry;
+   * absent = uncapped. Consulted by the cold-backup admission gate — measure
+   * by ramping production-profile sessions until speed/lag degrade, then set
+   * the largest stable count MINUS 1-2 (the margin doubles as failover
+   * headroom).
+   */
+  maxSessions?: number;
 }
 
 export interface InstanceConfig {
@@ -65,6 +73,21 @@ export interface SwitcherConfig {
   publicUrl: string;
 }
 
+/**
+ * active segment-path probe of each serveUrl origin (cache server). Playlists
+ * are tiny and refresh fast even through a struggling cache, so segment-path
+ * slowness is invisible to playlist-level health — this probe downloads one
+ * real segment per cache per interval. Absent block = probe off, and the
+ * cold-backup delivery-slow trigger never fires.
+ */
+export interface DeliveryProbeAppConfig {
+  intervalSec: number;
+  /** TTFB above this on playlist or segment fetch = slow */
+  ttfbMs: number;
+  /** segment must download in < segmentSeconds / minSpeedFactor to sustain realtime */
+  minSpeedFactor: number;
+}
+
 export interface AppConfig {
   instances: InstanceConfig[];
   rclone: { remote: string };
@@ -81,7 +104,7 @@ export interface AppConfig {
    * controller-hosted links in M3U output (logo proxy); when unset the base
    * is derived per request from X-Forwarded-Proto/Host or the request itself
    */
-  restreamer?: { switchers: SwitcherConfig[]; publicUrl?: string };
+  restreamer?: { switchers: SwitcherConfig[]; publicUrl?: string; deliveryProbe?: DeliveryProbeAppConfig };
   webDistDir?: string;
 }
 
@@ -101,7 +124,11 @@ interface RawConfig {
   autoUpload?: boolean | { enabled?: boolean; graceSeconds?: number };
   pollIntervals?: Partial<AppConfig['pollIntervals']>;
   overlapThreshold?: number;
-  restreamer?: { switchers?: SwitcherConfig[]; publicUrl?: string };
+  restreamer?: {
+    switchers?: SwitcherConfig[];
+    publicUrl?: string;
+    deliveryProbe?: Partial<DeliveryProbeAppConfig> | boolean;
+  };
 }
 
 /** "+09:00" / "-05:30" / minutes number -> minutes */
@@ -127,19 +154,25 @@ function parseRestreamerNodes(
       throw new Error(`instance "${instanceId}": duplicate restreamer node id "${n.id}"`);
     }
     ids.add(n.id);
+    if (n.maxSessions !== undefined && (!Number.isInteger(n.maxSessions) || n.maxSessions < 0)) {
+      throw new Error(
+        `instance "${instanceId}": restreamer node "${n.id}" maxSessions must be a non-negative integer`,
+      );
+    }
     return {
       id: n.id,
       url: n.url.replace(/\/+$/, ''),
       serveUrl: n.serveUrl?.replace(/\/+$/, ''),
       egressMbps: n.egressMbps,
+      maxSessions: n.maxSessions,
     };
   });
   return { nodes };
 }
 
 function parseSwitchers(
-  raw: { switchers?: SwitcherConfig[]; publicUrl?: string } | undefined,
-): { switchers: SwitcherConfig[]; publicUrl?: string } | undefined {
+  raw: RawConfig['restreamer'] | undefined,
+): AppConfig['restreamer'] | undefined {
   if (!raw) return undefined;
   const ids = new Set<string>();
   const switchers = (raw.switchers ?? []).map((s) => {
@@ -154,7 +187,17 @@ function parseSwitchers(
       publicUrl: s.publicUrl.replace(/\/+$/, ''),
     };
   });
-  return { switchers, publicUrl: raw.publicUrl?.replace(/\/+$/, '') };
+  // `deliveryProbe: true` = defaults; a partial block overrides individual keys
+  const rawProbe = raw.deliveryProbe;
+  const deliveryProbe =
+    rawProbe === undefined || rawProbe === false
+      ? undefined
+      : {
+          intervalSec: (rawProbe === true ? undefined : rawProbe.intervalSec) ?? 45,
+          ttfbMs: (rawProbe === true ? undefined : rawProbe.ttfbMs) ?? 3000,
+          minSpeedFactor: (rawProbe === true ? undefined : rawProbe.minSpeedFactor) ?? 1.5,
+        };
+  return { switchers, publicUrl: raw.publicUrl?.replace(/\/+$/, ''), deliveryProbe };
 }
 
 function defaultConfigPath(): string {

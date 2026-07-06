@@ -55,6 +55,11 @@ export interface RestreamPlacementInput {
   /** failover order; server default = current max + 1 */
   priority?: number;
   enabled?: boolean;
+  /**
+   * 'hot' = always encodes; 'cold' = standby that only encodes while the
+   * failover loop has it activated (preferred placement not ready)
+   */
+  mode?: 'hot' | 'cold';
   /** tvheadend subscription weight override; null = daemon default */
   weight?: number | null;
   /** manual program-number (service SID) override; null = derived */
@@ -296,6 +301,12 @@ export const api = {
   /** {placementId} = explicit switch; {reset: true} = back to the highest-priority healthy placement */
   switchRestreamChannel: (id: string, body: { placementId: string } | { reset: true }) =>
     http<{ ok: boolean; already?: boolean }>('POST', `/api/restreamer/channels/${id}/switch`, body),
+  /** operator escape valve: force-deactivate a channel's current cold-backup activation */
+  deactivateColdBackup: (channelId: string) =>
+    http<{ ok: boolean; existed: boolean }>(
+      'POST',
+      `/api/restreamer/channels/${channelId}/cold/deactivate`,
+    ),
 
   addRestreamPlacement: (channelId: string, input: RestreamPlacementInput) =>
     http<RestreamPlacement>('POST', `/api/restreamer/channels/${channelId}/placements`, input),

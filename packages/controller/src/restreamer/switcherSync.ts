@@ -116,6 +116,7 @@ export class SwitcherSync {
       .selectFrom('restream_placements as p')
       .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
       .innerJoin('restream_profiles as pr', 'pr.id', 'c.profile_id')
+      .leftJoin('restream_cold_activations as rca', 'rca.placement_id', 'p.id')
       .select([
         'p.id as placement_id',
         'p.instance_id',
@@ -127,6 +128,8 @@ export class SwitcherSync {
       ])
       .where('p.enabled', '=', 1)
       .where('c.enabled', '=', 1)
+      // a cold placement becomes a switcher upstream only while activated
+      .where((eb) => eb.or([eb('p.mode', '=', 'hot'), eb('rca.placement_id', 'is not', null)]))
       .orderBy('c.slug')
       .orderBy('p.priority')
       .orderBy('p.id')

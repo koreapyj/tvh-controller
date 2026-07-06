@@ -231,11 +231,15 @@ async function main(): Promise<void> {
     });
   }
 
+  // prune cold activations orphaned while the controller was down, before
+  // the pollers/sweep start acting on the persisted state
+  await restreamer?.reconcileColdFailoverOnStartup();
   for (const [, poller] of pollers) poller.start();
   for (const poller of restreamerPollers) poller.start();
   for (const poller of switcherPollers) poller.start();
   restreamer?.startSweep();
   restreamer?.startRebalance();
+  restreamer?.startColdFailover();
   if (dispatcher) await dispatcher.resume();
   autoUploader?.start();
 
@@ -252,6 +256,7 @@ async function main(): Promise<void> {
       for (const poller of switcherPollers) poller.stop();
       restreamer?.stopSweep();
       restreamer?.stopRebalance();
+      restreamer?.stopColdFailover();
       // give in-flight upload loops a bounded chance to checkpoint before the
       // database goes away; resume() recovers anything still unfinished
       await dispatcher?.stop();

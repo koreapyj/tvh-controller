@@ -26,7 +26,9 @@
 import {
   chanNumberOrder,
   type AribHlsParams,
+  type ColdActivationReason,
   type RestreamChannel,
+  type RestreamPlacement,
   type RestreamProfile,
   type SessionState,
   type TvhSubscription,
@@ -347,6 +349,29 @@ export function sessionStateBadge(state: SessionState): string {
     case 'stopping':
     case 'disabled':
       return 'neutral';
+  }
+}
+
+/**
+ * Placement mode badge (hot/cold). Hot placements always encode and carry no
+ * badge; cold placements show their current activation state.
+ */
+export function placementModeBadge(
+  p: Pick<RestreamPlacement, 'mode'> & { coldActive: boolean },
+): { cls: string; label: string } | null {
+  if (p.mode === 'hot') return null;
+  return p.coldActive ? { cls: 'warn', label: 'cold · active' } : { cls: 'neutral', label: 'cold' };
+}
+
+/** short human text for why the failover loop activated a cold backup */
+export function coldActivationLabel(reason: ColdActivationReason): string {
+  switch (reason) {
+    case 'node-unreachable':
+      return 'node down';
+    case 'session-unhealthy':
+      return 'session unhealthy';
+    case 'delivery-slow':
+      return 'delivery slow';
   }
 }
 

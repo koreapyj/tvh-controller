@@ -25,6 +25,7 @@ import {
   AUDIO_ENTRY_FIELDS,
   buildProfilePayload,
   CHANNEL_BATCH_FIELDS,
+  coldActivationLabel,
   compareChannels,
   defaultProfilePayload,
   deriveSlug,
@@ -34,6 +35,7 @@ import {
   MAX_AUDIO_ENTRIES,
   MIN_AUDIO_ENTRIES,
   parseProfileValue,
+  placementModeBadge,
   PROFILE_FIELDS,
   profileToVals,
   removeAudioRow,
@@ -292,6 +294,32 @@ describe('sessionStateBadge', () => {
     expect(sessionStateBadge('invalid')).toBe('bad');
     expect(sessionStateBadge('stopping')).toBe('neutral');
     expect(sessionStateBadge('disabled')).toBe('neutral');
+  });
+});
+
+describe('placementModeBadge', () => {
+  it('hot placements carry no badge, regardless of coldActive', () => {
+    expect(placementModeBadge({ mode: 'hot', coldActive: false })).toBeNull();
+    expect(placementModeBadge({ mode: 'hot', coldActive: true })).toBeNull();
+  });
+
+  it('cold placements show neutral "cold" when inactive, warn "cold · active" when active', () => {
+    expect(placementModeBadge({ mode: 'cold', coldActive: false })).toEqual({
+      cls: 'neutral',
+      label: 'cold',
+    });
+    expect(placementModeBadge({ mode: 'cold', coldActive: true })).toEqual({
+      cls: 'warn',
+      label: 'cold · active',
+    });
+  });
+});
+
+describe('coldActivationLabel', () => {
+  it('maps every activation reason to short human text', () => {
+    expect(coldActivationLabel('node-unreachable')).toBe('node down');
+    expect(coldActivationLabel('session-unhealthy')).toBe('session unhealthy');
+    expect(coldActivationLabel('delivery-slow')).toBe('delivery slow');
   });
 });
 

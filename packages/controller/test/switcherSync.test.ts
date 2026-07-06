@@ -314,6 +314,50 @@ describe('computeSwitcherDoc', () => {
   });
 });
 
+// ---------- cold-backup placements ----------
+
+describe('computeSwitcherDoc: cold-backup placements', () => {
+  it('excludes an enabled cold placement without an activation row; includes it at its priority once activated', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'BBB',
+      channelNumber: '10',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }], // hot, priority 1
+    });
+    const hotId = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements[0]!.id;
+    const cold = await h.service.addPlacement(chan.id, {
+      instanceId: 'zone2',
+      nodeId: 'n1',
+      mode: 'cold',
+      priority: 2,
+    });
+
+    const before = await h.service.computeSwitcherDoc();
+    const chBefore = before.doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(chBefore.upstreams.map((u) => u.id)).toEqual([hotId]);
+
+    await h.db
+      .insertInto('restream_cold_activations')
+      .values({
+        channel_id: chan.id,
+        placement_id: cold.id,
+        preferred_placement_id: hotId,
+        reason: 'node-unreachable',
+        activated_at: '2026-01-01 00:00:00',
+        updated_at: '2026-01-01 00:00:00',
+      })
+      .execute();
+
+    const after = await h.service.computeSwitcherDoc();
+    const chAfter = after.doc.channels.find((c) => c.slug === 'bbb')!;
+    // priority order: the hot placement (priority 1) first, the now-activated cold one (priority 2) second
+    expect(chAfter.upstreams.map((u) => u.id)).toEqual([hotId, cold.id]);
+    await h.destroy();
+  });
+});
+
 // ---------- push ----------
 
 describe('switcher push', () => {

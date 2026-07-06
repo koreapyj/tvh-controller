@@ -1336,6 +1336,104 @@ describe('listChannels status', () => {
   });
 });
 
+// ---------- cold backup placements ----------
+
+describe('cold backup placements', () => {
+  async function seedColdChannel(h: Harness) {
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' }, // hot (default)
+        { instanceId: 'zone1', nodeId: 'n2', mode: 'cold' },
+      ],
+    });
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    const hot = placements.find((x) => x.nodeId === 'n1')!;
+    const cold = placements.find((x) => x.nodeId === 'n2')!;
+    return { chan, hot, cold };
+  }
+
+  async function insertActivation(
+    h: Harness,
+    fields: { channelId: string; placementId: string; preferredPlacementId?: string | null; reason?: string },
+  ): Promise<void> {
+    await h.db
+      .insertInto('restream_cold_activations')
+      .values({
+        channel_id: fields.channelId,
+        placement_id: fields.placementId,
+        preferred_placement_id: fields.preferredPlacementId ?? null,
+        reason: fields.reason ?? 'node-unreachable',
+        activated_at: TS,
+        updated_at: TS,
+      })
+      .execute();
+  }
+
+  it('computeNodeDoc excludes an enabled cold placement with no activation row', async () => {
+    const h = await setup();
+    const { cold } = await seedColdChannel(h);
+    expect(cold.mode).toBe('cold');
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n2');
+    expect(doc!.sessions).toHaveLength(0);
+    await h.destroy();
+  });
+
+  it('computeNodeDoc includes it once a restream_cold_activations row exists', async () => {
+    const h = await setup();
+    const { chan, hot, cold } = await seedColdChannel(h);
+    await insertActivation(h, { channelId: chan.id, placementId: cold.id, preferredPlacementId: hot.id });
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n2');
+    expect(doc!.sessions.map((s) => s.name)).toEqual(['at-x']);
+    await h.destroy();
+  });
+
+  it('listChannels surfaces placement.mode, coldActive on the activated placement, and channel.coldActivation', async () => {
+    const h = await setup();
+    const { chan, hot, cold } = await seedColdChannel(h);
+    let [listed] = await h.service.listChannels();
+    const hotBefore = listed!.placements.find((x) => x.id === hot.id)!;
+    const coldBefore = listed!.placements.find((x) => x.id === cold.id)!;
+    expect(hotBefore.mode).toBe('hot');
+    expect(coldBefore.mode).toBe('cold');
+    expect(coldBefore.coldActive).toBe(false);
+    expect(listed!.coldActivation).toBeNull();
+
+    await insertActivation(h, {
+      channelId: chan.id,
+      placementId: cold.id,
+      preferredPlacementId: hot.id,
+      reason: 'session-unhealthy',
+    });
+    [listed] = await h.service.listChannels();
+    expect(listed!.placements.find((x) => x.id === cold.id)!.coldActive).toBe(true);
+    expect(listed!.placements.find((x) => x.id === hot.id)!.coldActive).toBe(false);
+    expect(listed!.coldActivation).toMatchObject({ placementId: cold.id, reason: 'session-unhealthy' });
+    expect(listed!.coldActivation!.activatedAt).toBe('2026-01-01T00:00:00.000Z');
+    await h.destroy();
+  });
+
+  it('addPlacement with mode:"cold" persists; updatePlacement({mode:"hot"}) flips it', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const cold = await h.service.addPlacement(chan.id, { instanceId: 'zone1', nodeId: 'n2', mode: 'cold' });
+    expect(cold.mode).toBe('cold');
+
+    const flipped = await h.service.updatePlacement(cold.id, { mode: 'hot' });
+    expect(flipped.mode).toBe('hot');
+    await h.destroy();
+  });
+});
+
 // ---------- poller hooks ----------
 
 describe('poller hooks', () => {

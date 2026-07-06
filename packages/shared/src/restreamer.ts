@@ -41,6 +41,9 @@ export interface RestreamProfile {
   updatedAt: string;
 }
 
+/** why a cold backup was activated */
+export type ColdActivationReason = 'node-unreachable' | 'session-unhealthy' | 'delivery-slow';
+
 /** one encode of a logical channel on one restreamer node */
 export interface RestreamPlacement {
   id: string;
@@ -50,6 +53,11 @@ export interface RestreamPlacement {
   /** failover order — lower is preferred */
   priority: number;
   enabled: boolean;
+  /**
+   * 'hot' = always encodes; 'cold' = standby that only encodes while the
+   * failover loop has it activated (preferred placement not ready)
+   */
+  mode: 'hot' | 'cold';
   /** tvheadend subscription weight override; null = daemon default */
   weight: number | null;
   /** manual program-number (service SID) override; null = derived channel→service→sid */
@@ -91,8 +99,18 @@ export interface RestreamChannelWithStatus extends RestreamChannel {
       resolvedVia: 'tvh' | 'catalog' | null;
       /** live session status from the node's last poll; null = unknown/absent */
       session: SessionStatus | null;
+      /** true = this cold placement is currently activated by the failover loop */
+      coldActive: boolean;
     }
   >;
+  /** current cold-backup activation for this channel; null = none */
+  coldActivation: {
+    placementId: string;
+    reason: ColdActivationReason;
+    activatedAt: string;
+  } | null;
+  /** why the failover loop could NOT activate a cold backup last tick; null = n/a */
+  coldBlocked: string | null;
   /** placement currently served by the switcher (redundant channels); null = n/a or unknown */
   activePlacementId: string | null;
   lastSwitch: { at: string; from: string | null; to: string; reason: SwitchReason } | null;
