@@ -405,19 +405,24 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     return withAvailability(reply, async () => {
       const channel = await svc().createChannel(input);
       reply.code(201);
-      return channel;
+      // single-channel responses use the WithStatus shape (placements,
+      // playlistIds, ...) — the web treats them like list rows
+      return (await svc().channelWithStatus(channel.id)) ?? channel;
     });
   });
 
   app.get<{ Params: { id: string } }>('/api/restreamer/channels/:id', async (req) => {
-    const channel = await svc().getChannel(req.params.id);
+    const channel = await svc().channelWithStatus(req.params.id);
     if (!channel) throw httpError(404, `restream channel ${req.params.id} not found`);
     return channel;
   });
 
   app.put<{ Params: { id: string } }>('/api/restreamer/channels/:id', async (req, reply) => {
     const patch = parseChannelPatch(req.body);
-    return withAvailability(reply, () => svc().updateChannel(req.params.id, patch));
+    return withAvailability(reply, async () => {
+      const updated = await svc().updateChannel(req.params.id, patch);
+      return (await svc().channelWithStatus(updated.id)) ?? updated;
+    });
   });
 
   app.delete<{ Params: { id: string } }>('/api/restreamer/channels/:id', async (req) => {

@@ -607,6 +607,16 @@ export class RestreamerService {
     });
   }
 
+  /**
+   * Single-channel variant of listChannels() — the shape the web edit modal
+   * re-fetches after placement mutations (a bare RestreamChannel would crash
+   * its placement rendering). Tables are small; reusing listChannels keeps
+   * the status/resolution semantics identical by construction.
+   */
+  async channelWithStatus(id: string): Promise<RestreamChannelWithStatus | null> {
+    return (await this.listChannels()).find((c) => c.id === id) ?? null;
+  }
+
   private cachedNodeStatus(instanceId: string, nodeId: string): RestreamerNodeStatus | null {
     if (!this.cache.has(instanceId)) return null;
     return this.cache.get(instanceId).restreamers.find((r) => r.nodeId === nodeId) ?? null;
