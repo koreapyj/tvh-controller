@@ -581,19 +581,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </button>
             {#if c.activePlacementId === p.id && c.placements.length > 1}
               <span class="badge ok" title="the switcher currently serves this placement">active</span>
-              <button
-                disabled={busy}
-                title="switch back to the highest-priority healthy placement"
-                onclick={() => resetSwitch(c)}
-              >
-                Reset
-              </button>
             {/if}
           {:else}
             <span class="muted small m-hide">no placements</span>
           {/each}
         </td>
         <td style="white-space:nowrap;text-align:right">
+          <button
+            disabled={busy}
+            title="switch back to the highest-priority healthy placement"
+            onclick={() => resetSwitch(c)}
+          >
+            Reset
+          </button>
           <button disabled={busy} onclick={() => (channelModal = { channel: c })}>Edit</button>
           <button class="danger" disabled={busy} onclick={() => removeChannel(c)}>Delete</button>
         </td>
