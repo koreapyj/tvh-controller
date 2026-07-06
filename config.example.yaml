@@ -36,6 +36,19 @@ instances:
     url: http://192.168.2.10:9981
     rclone:
       rcUrl: http://192.168.2.10:5572
+  # tvh-less zone: an explicit `url: null` means this location has NO
+  # tvheadend — it exists purely to host restreamer nodes fed by their m3u
+  # source catalogs. No tvheadend machinery is created for it, rule sync
+  # scope "all" skips it, and username/password/serverOffset/rclone are
+  # rejected (meaningless without a tvheadend).
+  # - id: zone3
+  #   name: Zone 3 (restreamer only)
+  #   url: null
+  #   restreamer:
+  #     nodes:
+  #       - id: node1
+  #         url: http://192.168.3.10:5580
+  #         serveUrl: https://tv3.example.com
 
 rclone:
   remote: "gdrive:tvh-archive"

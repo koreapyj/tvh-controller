@@ -56,11 +56,21 @@ export function resolveEffective(
   return normalizePayload({ ...rule.payload, name: rule.name });
 }
 
-export function inScope(instances: RuleInstances, instanceId: string): boolean {
-  return instances === 'all' || instances.includes(instanceId);
+/**
+ * Whether a rule targets an instance. Scope 'all' means "all instances WITH a
+ * tvheadend" — a tvh-less zone (hasTvh=false) is silently excluded, exactly as
+ * if it were not part of the fleet. An EXPLICIT instance list is honored as
+ * written (the push path then reports the tvh-less target as blocked).
+ */
+export function inScope(instances: RuleInstances, instanceId: string, hasTvh = true): boolean {
+  return instances === 'all' ? hasTvh : instances.includes(instanceId);
 }
 
-/** materialize 'all' into an explicit list (used when narrowing a scope) */
+/**
+ * Materialize 'all' into an explicit list (used when narrowing a scope).
+ * Callers must pass tvh-capable ids only (cache.tvhIds()) — 'all' never
+ * includes a tvh-less instance.
+ */
 export function materializeScope(instances: RuleInstances, allIds: string[]): string[] {
   return instances === 'all' ? [...allIds] : [...instances];
 }

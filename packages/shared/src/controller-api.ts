@@ -30,7 +30,13 @@ import type { RestreamerNodeStatus, SwitcherNodeStatus } from './restreamer.js';
 export interface InstanceSummary {
   id: string;
   name: string;
-  url: string;
+  /** tvheadend base URL; null for a tvh-less zone (restreamer-only) */
+  url: string | null;
+  /**
+   * false = this zone has NO tvheadend (config `url: null`) — reachable stays
+   * false forever and must be rendered neutrally, never as an error
+   */
+  hasTvh: boolean;
   reachable: boolean;
   version: string | null;
   lastPollAt: string | null;

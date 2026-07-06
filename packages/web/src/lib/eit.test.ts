@@ -33,6 +33,7 @@ function instance(serverOffsetMinutes: number | null): InstanceSummary {
     id: 'i1',
     name: 'i1',
     url: 'http://x',
+    hasTvh: true,
     reachable: true,
     version: null,
     lastPollAt: null,

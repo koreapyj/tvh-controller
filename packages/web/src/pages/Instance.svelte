@@ -16,7 +16,7 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
-  import type { InstanceOverview } from '@tvhc/shared';
+  import type { InstanceOverview, RestreamerNodeStatus } from '@tvhc/shared';
   import { api } from '../lib/api.js';
   import { latestWins } from '../lib/fetchGuard.js';
   import { ts } from '../lib/format.js';
@@ -27,6 +27,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let { instanceId }: { instanceId: string } = $props();
 
   let overview: InstanceOverview | null = $state(null);
+  /** this zone's restreamer nodes — the only content a tvh-less instance has */
+  let nodes: RestreamerNodeStatus[] = $state([]);
 
   const inst = $derived($instances.find((i) => i.id === instanceId));
 
@@ -42,11 +44,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     );
   }
 
+  async function refreshNodes(id: string): Promise<void> {
+    try {
+      const res = await api.restreamerNodes();
+      nodes = res.nodes.filter((n) => n.instanceId === id);
+    } catch {
+      nodes = [];
+    }
+  }
+
   // navigating /instance/A -> /instance/B reuses this component; never show
   // A's overview under B's header while B loads
   $effect(() => {
     overview = null;
+    nodes = [];
     void refresh(instanceId);
+    void refreshNodes(instanceId);
   });
 
   // live refresh when a recordings grid changed on THIS instance
@@ -69,18 +82,24 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   {@const inputs = live?.inputs ?? overview.inputs}
   {@const subs = live?.subscriptions ?? overview.subscriptions}
   <div class="toolbar">
-    <span class="badge {overview.instance.reachable ? 'ok' : 'bad'}">
-      {overview.instance.reachable ? 'online' : 'offline'}
-    </span>
-    <span class="muted small">{overview.instance.url}</span>
+    {#if !overview.instance.hasTvh}
+      <span class="badge neutral">no tvheadend</span>
+    {:else}
+      <span class="badge {overview.instance.reachable ? 'ok' : 'bad'}">
+        {overview.instance.reachable ? 'online' : 'offline'}
+      </span>
+    {/if}
+    <span class="muted small">{overview.instance.url ?? 'restreamer-only zone'}</span>
     {#if overview.instance.version}<span class="muted small">v{overview.instance.version}</span>{/if}
     {#if overview.instance.lastPollAt}
       <span class="muted small">polled {ts(Date.parse(overview.instance.lastPollAt) / 1000)}</span>
     {/if}
     <span class="spacer"></span>
-    <a class="muted small" href="/recordings">
-      {overview.counts.upcoming} upcoming · {overview.counts.finished} finished · {overview.counts.failed} failed
-    </a>
+    {#if overview.instance.hasTvh}
+      <a class="muted small" href="/recordings">
+        {overview.counts.upcoming} upcoming · {overview.counts.finished} finished · {overview.counts.failed} failed
+      </a>
+    {/if}
   </div>
 
   {#if overview.instance.error}<div class="error-banner">{overview.instance.error}</div>{/if}
@@ -96,6 +115,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
   {/if}
 
+  {#if !overview.instance.hasTvh}
+    <h2>Restreamer nodes</h2>
+    {#if nodes.length}
+      <table>
+        <thead>
+          <tr><th>Node</th><th>URL</th><th>Status</th><th>Sessions</th></tr>
+        </thead>
+        <tbody>
+          {#each nodes as n (n.nodeId)}
+            <tr>
+              <td class="small"><a href="/restreamer">{n.nodeId}</a></td>
+              <td class="small muted">{n.url}</td>
+              <td class="small">
+                {#if n.reachable}<span class="badge ok">reachable</span>{:else}<span class="badge bad">unreachable</span>{/if}
+              </td>
+              <td class="small muted">{n.sessions.length}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {:else}
+      <div class="muted">No restreamer nodes configured in this zone.</div>
+    {/if}
+  {:else}
   <h2>Tuners / inputs</h2>
   {#if inputs.length}
     <table>
@@ -153,6 +196,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </table>
   {:else}
     <div class="muted">No active subscriptions.</div>
+  {/if}
   {/if}
 {:else}
   <div class="muted">loading…</div>

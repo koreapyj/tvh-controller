@@ -106,7 +106,10 @@ Everything is configured by a single `config.yaml` (instances, database DSN,
 port, rclone remote). Lookup order: `$TVHC_CONFIG`, `./config.yaml`,
 `/etc/tvhc/config.yaml`. State lives in MariaDB/MySQL (`database:` key —
 omit it to run in overview-only mode); tables are created by migrations at
-startup.
+startup. An instance with an explicit `url: null` is a **tvh-less zone**: no
+tvheadend machinery is created for it — it exists purely to host restreamer
+nodes fed by m3u source catalogs, and every tvh-dependent feature (rule sync
+scope `all`, recordings, EPG, uploads) cleanly excludes it.
 
 ## Development
 

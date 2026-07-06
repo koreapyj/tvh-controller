@@ -258,7 +258,8 @@ export function registerEpgRoutes(app: FastifyInstance, ctx: AppContext): void {
     requireInstance(ctx, instanceId);
     const poller = ctx.pollers.get(instanceId);
     if (!poller) {
-      throw httpError(404, `unknown instance "${instanceId}"`);
+      // known-but-tvh-less instances land here too: no DVR without a tvheadend
+      throw httpError(404, `instance "${instanceId}" has no tvheadend`);
     }
     const cfgUuid = defaultDvrConfigUuid(ctx.cache.get(instanceId).topology?.dvrConfigs ?? []);
     const uuid = await poller.client.dvrEntryCreateByEvent(Number(eventId), cfgUuid);

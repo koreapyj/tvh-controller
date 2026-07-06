@@ -1978,3 +1978,54 @@ describe('write-time availability', () => {
     await h.destroy();
   });
 });
+
+// ---------------------------------------------------------------------------
+// tvh-less instances (config url: null) — first-class, not a degraded tvh zone
+// ---------------------------------------------------------------------------
+
+describe('tvh-less instance (url: null)', () => {
+  it('a zone with url: null, NO poller and a catalog-fed node computes and pushes docs', async () => {
+    const { db, destroy } = await createTestDb();
+    const cache = new InstanceCache();
+    const bus = new EventBus();
+    // exactly how main.ts wires a tvh-less zone: snapshot seeded with url null,
+    // no InstancePoller constructed, restreamer node client as usual
+    const config = makeConfig({
+      instances: [
+        {
+          id: 'ext1',
+          name: 'ext1',
+          url: null,
+          restreamer: {
+            nodes: [{ id: 'n1', url: 'http://ext1-n1:5580', serveUrl: 'http://hls.ext1-n1' }],
+          },
+        },
+      ],
+    });
+    cache.init('ext1', 'ext1', null);
+    expect(cache.get('ext1').summary.hasTvh).toBe(false);
+    const pollers = new Map<string, InstancePoller>(); // deliberately EMPTY
+    const fake = fakeRestreamerNode();
+    const clients = new Map<string, RestreamerNodeClient>([[nodeKey('ext1', 'n1'), fake]]);
+    const service = new RestreamerService(db, cache, pollers, bus, config, clients);
+
+    setNodeSources(cache, 'ext1', 'n1', [CAM], 'h1');
+    const pf = await service.createProfile('p', profilePayload());
+    await service.createChannel({
+      channelName: 'Cam 1',
+      channelNumber: '1',
+      profileId: pf.id,
+      placements: [{ instanceId: 'ext1', nodeId: 'n1' }],
+    });
+
+    const computed = await service.computeNodeDoc('ext1', 'n1');
+    expect(computed.deferred).toBe(false);
+    expect(computed.blocked).toEqual([]);
+    expect(computed.doc!.sessions[0]!.source).toEqual({ url: 'http://cam.example/1.m3u8' });
+
+    const result = await service.pushNode('ext1', 'n1', true);
+    expect(result.action).toBe('pushed');
+    expect(fake.desired!.sessions[0]!.source).toEqual({ url: 'http://cam.example/1.m3u8' });
+    await destroy();
+  });
+});

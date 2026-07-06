@@ -161,7 +161,8 @@ export class SyncEngine {
     instances: RuleInstances,
   ): T {
     if (!payload.channel || payload.channel_number != null) return payload;
-    const ids = instances === 'all' ? this.cache.ids() : instances;
+    // 'all' = tvh-capable instances only (a tvh-less zone has no channels)
+    const ids = instances === 'all' ? this.cache.tvhIds() : instances;
     let lowest: string | null = null;
     for (const id of ids) {
       if (!this.cache.has(id)) continue;
@@ -344,7 +345,8 @@ export class SyncEngine {
     }
 
     // scope shrink: remove from instances that are no longer targeted
-    const allIds = this.cache.ids();
+    // ('all' materializes to tvh-capable instances only)
+    const allIds = this.cache.tvhIds();
     const oldScope = materializeScope(existing.instances, allIds);
     const newScope = input.instances === 'all' ? allIds : input.instances;
     const removed = oldScope.filter((i) => !newScope.includes(i));
@@ -427,8 +429,14 @@ export class SyncEngine {
   private applyScopeDelta(current: RuleInstances, delta: Record<string, boolean>): RuleInstances {
     const removed = Object.keys(delta).filter((i) => delta[i] === false);
     if (current === 'all') {
-      if (!removed.length) return 'all';
-      return materializeScope('all', this.cache.ids()).filter((i) => !removed.includes(i));
+      // 'all' covers tvh-capable instances only; a checked tvh-less instance
+      // is NOT already included, so it forces materialization like an uncheck
+      const added = Object.keys(delta).filter(
+        (i) => delta[i] && this.cache.has(i) && !this.cache.hasTvh(i),
+      );
+      if (!removed.length && !added.length) return 'all';
+      const base = materializeScope('all', this.cache.tvhIds());
+      return [...base.filter((i) => !removed.includes(i)), ...added];
     }
     const added = Object.keys(delta).filter((i) => delta[i] && !current.includes(i));
     return [...current.filter((i) => !removed.includes(i)), ...added];
@@ -715,7 +723,7 @@ export class SyncEngine {
     const rule = await this.getResolved(ruleId);
     if (!rule) throw new Error(`master rule ${ruleId} not found`);
     if (rule.deletedAt) throw new Error(`rule "${rule.name}" is deleted — restore it first`);
-    const targets = (instanceIds ?? this.cache.ids()).filter((i) => inScope(rule.instances, i));
+    const targets = (instanceIds ?? this.cache.ids()).filter((i) => this.inScopeHere(rule.instances, i));
     const results: PushResult[] = [];
     for (const instanceId of targets) {
       results.push(await this.pushRuleToInstance(rule, instanceId));
@@ -729,7 +737,7 @@ export class SyncEngine {
       const results: PushResult[] = [];
       for (const rule of rules) {
         for (const instanceId of this.cache.ids()) {
-          if (!inScope(rule.instances, instanceId)) continue;
+          if (!this.inScopeHere(rule.instances, instanceId)) continue;
           results.push(await this.pushRuleToInstance(rule, instanceId));
         }
       }
@@ -737,9 +745,23 @@ export class SyncEngine {
     });
   }
 
+  /** cache-aware inScope: scope 'all' excludes tvh-less instances */
+  private inScopeHere(instances: RuleInstances, instanceId: string): boolean {
+    return inScope(
+      instances,
+      instanceId,
+      this.cache.has(instanceId) ? this.cache.hasTvh(instanceId) : true,
+    );
+  }
+
   private async pushRuleToInstance(rule: ResolvedRule, instanceId: string): Promise<PushResult> {
     const base: Omit<PushResult, 'action'> = { masterRuleId: rule.id, instanceId };
     try {
+      if (this.cache.has(instanceId) && !this.cache.hasTvh(instanceId)) {
+        // explicit scope listing a tvh-less instance: never an error, never a
+        // tvh call — the rule simply cannot exist there
+        return { ...base, action: 'blocked', detail: 'instance has no tvheadend' };
+      }
       if (!rule.effective) {
         return { ...base, action: 'error', detail: 'linked clone has a missing parent rule' };
       }
@@ -1101,7 +1123,7 @@ export class SyncEngine {
         if (!master) throw new Error('master rule vanished');
         if (master.parentId) throw new Error('cannot split a linked clone');
 
-        const allIds = this.cache.ids();
+        const allIds = this.cache.tvhIds();
         const newScope = materializeScope(master.instances, allIds).filter(
           (i) => i !== item.instanceId,
         );
@@ -1417,13 +1439,17 @@ export class SyncEngine {
       const perInstance: RuleWithStatus['perInstance'] = {};
       let upcomingMatches = 0;
       for (const instanceId of this.cache.ids()) {
-        if (!inScope(rule.instances, instanceId)) continue;
+        if (!this.inScopeHere(rule.instances, instanceId)) continue;
         const b = bindings.find(
           (x) => x.master_rule_id === rule.id && x.instance_id === instanceId,
         );
         let state: SyncState;
         let blockedReason: string | undefined;
-        if (!rule.effective) {
+        if (!this.cache.hasTvh(instanceId)) {
+          // explicitly-listed tvh-less instance: permanently blocked there
+          state = 'blocked';
+          blockedReason = 'instance has no tvheadend';
+        } else if (!rule.effective) {
           state = 'blocked';
           blockedReason = 'parent rule is missing';
         } else if (!b) {

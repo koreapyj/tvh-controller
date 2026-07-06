@@ -67,7 +67,10 @@ async function main(): Promise<void> {
   const pollers = new Map<string, InstancePoller>();
 
   for (const inst of config.instances) {
+    // tvh-less instances (url: null) get a cache snapshot — the UI needs them
+    // — but NO tvheadend machinery: no poller, no comet, no conflict recompute
     cache.init(inst.id, inst.name, inst.url, inst.serverOffsetMinutes ?? null);
+    if (inst.url === null) continue;
     const poller = new InstancePoller(inst, cache, bus, config.pollIntervals);
     poller.onCapacityInputsChanged = () => conflicts.recompute(inst.id);
     pollers.set(inst.id, poller);
@@ -77,6 +80,7 @@ async function main(): Promise<void> {
   // pollers use, independent of the database (works in overview-only mode)
   const tvhHttp = new Map<string, TvhClient>();
   for (const inst of config.instances) {
+    if (inst.url === null) continue; // tvh-less: the logo proxy 404s on a missing entry
     tvhHttp.set(inst.id, new TvhClient(inst.url, inst.username, inst.password));
   }
 
@@ -109,7 +113,8 @@ async function main(): Promise<void> {
     // pollTopology, next to ConflictService.recompute) — the service
     // debounces and hash-skips, so extra invocations are cheap
     for (const inst of config.instances) {
-      const poller = pollers.get(inst.id)!;
+      const poller = pollers.get(inst.id);
+      if (!poller) continue; // tvh-less: no topology will ever change here
       const prev = poller.onCapacityInputsChanged;
       poller.onCapacityInputsChanged = () => {
         prev?.();

@@ -207,6 +207,16 @@ describe('scope helpers', () => {
     expect(inScope(['tyo1', 'tyo2'], 'tyo2')).toBe(true);
   });
 
+  it("inScope: 'all' excludes a tvh-less instance (hasTvh=false)", () => {
+    expect(inScope('all', 'ext1', false)).toBe(false);
+    expect(inScope('all', 'tyo1', true)).toBe(true);
+  });
+
+  it('inScope: an EXPLICIT list is honored even for a tvh-less instance (push reports it blocked)', () => {
+    expect(inScope(['ext1'], 'ext1', false)).toBe(true);
+    expect(inScope(['tyo1'], 'ext1', false)).toBe(false);
+  });
+
   it('materializeScope expands all into the current instance list', () => {
     expect(materializeScope('all', ['tyo1', 'tyo2'])).toEqual(['tyo1', 'tyo2']);
     expect(materializeScope(['tyo2'], ['tyo1', 'tyo2'])).toEqual(['tyo2']);

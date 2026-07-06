@@ -80,8 +80,9 @@ export function registerRecordingsRoutes(app: FastifyInstance, ctx: AppContext):
       const poller = ctx.pollers.get(op.instanceId);
       const uuids = Array.isArray(op.uuids) ? op.uuids : [];
       if (!poller) {
+        const reason = ctx.cache.has(op.instanceId) ? 'instance has no tvheadend' : 'unknown instance';
         for (const u of uuids) {
-          results.push({ instanceId: op.instanceId, uuid: u, ok: false, error: 'unknown instance' });
+          results.push({ instanceId: op.instanceId, uuid: u, ok: false, error: reason });
         }
         continue;
       }
@@ -152,7 +153,8 @@ export function registerRecordingsRoutes(app: FastifyInstance, ctx: AppContext):
     for (const [instanceId, uuids] of byInstance) {
       const poller = ctx.pollers.get(instanceId);
       if (!poller) {
-        for (const u of uuids) results.push({ instanceId, uuid: u, ok: false, error: 'unknown instance' });
+        const reason = ctx.cache.has(instanceId) ? 'instance has no tvheadend' : 'unknown instance';
+        for (const u of uuids) results.push({ instanceId, uuid: u, ok: false, error: reason });
         continue;
       }
       const known = knownUuids(ctx, instanceId);

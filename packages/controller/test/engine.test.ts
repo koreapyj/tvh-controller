@@ -1449,3 +1449,75 @@ describe('batchEdit: instance scope delta', () => {
     await destroy();
   });
 });
+
+// ---------- 20. tvh-less instances (config url: null) ----------
+
+describe('tvh-less instances', () => {
+  it("scope 'all' excludes a tvh-less instance from push targets and per-instance status", async () => {
+    const { destroy, engine, cache } = await setup(['tyo1']);
+    // tvh-less zone: cache snapshot exists (url null → hasTvh=false) but there
+    // is NO poller and NO topology — exactly how main.ts wires it
+    cache.init('ext1', 'ext1', null);
+
+    const rule = await engine.createRule({
+      name: 'News',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'News' }),
+    });
+    const results = await engine.pushRule(rule.id);
+    expect(results.map((r) => r.instanceId)).toEqual(['tyo1']);
+    expect(results[0]?.action).toBe('created');
+
+    const [status] = await engine.rulesWithStatus();
+    expect(Object.keys(status!.perInstance)).toEqual(['tyo1']);
+
+    await destroy();
+  });
+
+  it('an EXPLICIT scope listing a tvh-less instance is blocked there with a clear reason (no tvh calls)', async () => {
+    const { destroy, engine, cache } = await setup(['tyo1']);
+    cache.init('ext1', 'ext1', null);
+
+    const rule = await engine.createRule({
+      name: 'News',
+      instances: ['tyo1', 'ext1'],
+      payload: masterRulePayload({ name: 'News' }),
+    });
+    const results = await engine.pushRule(rule.id);
+    const byInstance = new Map(results.map((r) => [r.instanceId, r]));
+    expect(byInstance.get('tyo1')?.action).toBe('created');
+    expect(byInstance.get('ext1')).toMatchObject({
+      action: 'blocked',
+      detail: 'instance has no tvheadend',
+    });
+
+    const [status] = await engine.rulesWithStatus();
+    expect(status!.perInstance['ext1']).toMatchObject({
+      state: 'blocked',
+      blockedReason: 'instance has no tvheadend',
+    });
+    expect(status!.perInstance['tyo1']?.state).toBe('in-sync');
+
+    await destroy();
+  });
+
+  it("batchEdit: checking a tvh-less instance under an 'all' scope materializes it into an explicit list", async () => {
+    const { destroy, engine, cache } = await setup(['tyo1', 'osk1']);
+    cache.init('ext1', 'ext1', null);
+
+    const rule = await engine.createRule({
+      name: 'Docs',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'Docs' }),
+    });
+    const results = await engine.batchEdit([rule.id], {}, { ext1: true });
+    expect(results).toEqual([{ id: rule.id, ok: true }]);
+
+    // 'all' never covers ext1, so the check materialized the tvh-capable
+    // instances and appended ext1 explicitly
+    const updated = await engine.getRule(rule.id);
+    expect(updated!.instances).toEqual(['tyo1', 'osk1', 'ext1']);
+
+    await destroy();
+  });
+});

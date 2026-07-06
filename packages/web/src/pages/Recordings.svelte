@@ -453,6 +453,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'already recorded' };
       if (addLoading)
         return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'checking…' };
+      if (!inst.hasTvh)
+        return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'no tvheadend' };
       if (!inst.reachable)
         return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'unreachable' };
       const eventId = addById.get(inst.id);

@@ -82,6 +82,8 @@ export class InstancePoller {
   onAutorecsChanged: (() => void) | null = null;
 
   private readonly rclone: RcloneRcClient | null;
+  /** narrowed tvheadend base URL (a tvh-less `url: null` instance never gets a poller) */
+  private readonly tvhUrl: string;
 
   constructor(
     readonly instance: InstanceConfig,
@@ -89,6 +91,12 @@ export class InstancePoller {
     private readonly bus: EventBus,
     private readonly intervals: AppConfig['pollIntervals'],
   ) {
+    if (instance.url === null) {
+      // main.ts never constructs a poller for a tvh-less instance; keep the
+      // invariant explicit instead of failing later on a bad request URL
+      throw new Error(`instance "${instance.id}" has no tvheadend url — cannot construct a poller`);
+    }
+    this.tvhUrl = instance.url;
     this.client = new TvhClient(instance.url, instance.username, instance.password);
     this.rclone = instance.rclone ? new RcloneRcClient(instance.rclone) : null;
   }
@@ -121,7 +129,7 @@ export class InstancePoller {
     // periodic polling stays only as the fallback/consistency pass. The comet
     // upgrade is authenticated (Basic→Digest) so it works for all instances.
     this.comet = new CometClient(
-      this.instance.url,
+      this.tvhUrl,
       (n) => this.handleComet(n),
       undefined,
       this.instance.username,

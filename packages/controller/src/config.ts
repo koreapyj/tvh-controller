@@ -41,7 +41,12 @@ export interface RestreamerNodeConfig {
 export interface InstanceConfig {
   id: string;
   name: string;
-  url: string;
+  /**
+   * tvheadend base URL; an explicit `url: null` marks a tvh-less zone (no
+   * tvheadend machinery is constructed — the instance exists purely to host
+   * restreamer nodes fed by their m3u source catalogs)
+   */
+  url: string | null;
   /** absent when tvheadend allows anonymous access */
   username?: string;
   password?: string;
@@ -80,7 +85,9 @@ export interface AppConfig {
   webDistDir?: string;
 }
 
-interface RawInstance extends Omit<InstanceConfig, 'serverOffsetMinutes' | 'restreamer'> {
+interface RawInstance extends Omit<InstanceConfig, 'url' | 'serverOffsetMinutes' | 'restreamer'> {
+  /** required key: a string, or literal null for a tvh-less zone (absent = config error) */
+  url?: string | null;
   /** "+09:00" style or minutes */
   serverOffset?: string | number;
   restreamer?: { nodes?: RestreamerNodeConfig[] };
@@ -174,6 +181,22 @@ export function loadConfig(path = defaultConfigPath()): AppConfig {
   const instances: InstanceConfig[] = raw.instances.map((i) => {
     if (ids.has(i.id)) throw new Error(`duplicate instance id "${i.id}"`);
     ids.add(i.id);
+    if (i.url === undefined) {
+      // absent url stays an error (catches typos); a tvh-less zone must say so explicitly
+      throw new Error(`instance "${i.id}": url is required (use "url: null" for a tvh-less zone)`);
+    }
+    if (i.url === null) {
+      // tvh-less zone: fields that only make sense with a tvheadend are rejected
+      if (i.username !== undefined || i.password !== undefined) {
+        throw new Error(`instance "${i.id}": username/password are meaningless with "url: null" (no tvheadend)`);
+      }
+      if (i.serverOffset !== undefined) {
+        throw new Error(`instance "${i.id}": serverOffset is meaningless with "url: null" (no tvheadend)`);
+      }
+      if (i.rclone) {
+        throw new Error(`instance "${i.id}": rclone is meaningless with "url: null" (no tvheadend DVR to upload from)`);
+      }
+    }
     if (i.username && !i.password) {
       throw new Error(`instance "${i.id}": username is set but password is missing`);
     }
@@ -183,7 +206,7 @@ export function loadConfig(path = defaultConfigPath()): AppConfig {
     return {
       id: i.id,
       name: i.name ?? i.id,
-      url: i.url.replace(/\/+$/, ''),
+      url: i.url === null ? null : i.url.replace(/\/+$/, ''),
       username: i.username,
       password: i.password,
       serverOffsetMinutes: parseOffset(i.serverOffset),

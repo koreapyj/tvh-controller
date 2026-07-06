@@ -67,7 +67,7 @@ export interface InstanceSnapshot {
 export function emptySnapshot(
   id: string,
   name: string,
-  url: string,
+  url: string | null,
   serverOffsetMinutes: number | null = null,
 ): InstanceSnapshot {
   return {
@@ -75,6 +75,8 @@ export function emptySnapshot(
       id,
       name,
       url,
+      // tvh-less zone (url: null): hasTvh=false, reachable stays false forever
+      hasTvh: url !== null,
       reachable: false,
       version: null,
       lastPollAt: null,
@@ -104,7 +106,7 @@ export class InstanceCache {
    */
   readonly switchers = new Map<string, SwitcherNodeStatus>();
 
-  init(id: string, name: string, url: string, serverOffsetMinutes: number | null = null): void {
+  init(id: string, name: string, url: string | null, serverOffsetMinutes: number | null = null): void {
     this.snapshots.set(id, emptySnapshot(id, name, url, serverOffsetMinutes));
   }
 
@@ -124,5 +126,14 @@ export class InstanceCache {
 
   ids(): string[] {
     return [...this.snapshots.keys()];
+  }
+
+  /** ids of instances that HAVE a tvheadend — rule sync scope 'all' expands to these only */
+  tvhIds(): string[] {
+    return [...this.snapshots.values()].filter((s) => s.summary.hasTvh).map((s) => s.summary.id);
+  }
+
+  hasTvh(id: string): boolean {
+    return this.get(id).summary.hasTvh;
   }
 }

@@ -64,17 +64,25 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <div class="card">
       <h3>
         <a href="/instance/{inst.id}">{inst.name}</a>
-        <span class="badge {inst.reachable ? 'ok' : 'bad'}">{inst.reachable ? 'online' : 'offline'}</span>
+        {#if !inst.hasTvh}
+          <span class="badge neutral">no tvheadend</span>
+        {:else}
+          <span class="badge {inst.reachable ? 'ok' : 'bad'}">{inst.reachable ? 'online' : 'offline'}</span>
+        {/if}
         {#if conflicts.some((c) => c.level === 'conflict')}
           <span class="badge bad">tuner conflict</span>
         {:else if conflicts.length}
           <span class="badge warn">low margin</span>
         {/if}
       </h3>
-      <div class="muted small">{inst.url} {#if inst.version}· {inst.version}{/if}</div>
+      <div class="muted small">{inst.url ?? 'restreamer-only zone'} {#if inst.version}· {inst.version}{/if}</div>
       {#if inst.error}<div class="small" style="color:var(--bad)">{inst.error}</div>{/if}
 
-      {#if o}
+      {#if !inst.hasTvh}
+        <div class="muted small" style="margin:10px 0">
+          Hosts restreamer nodes only — see the <a href="/restreamer">Restreamer</a> page.
+        </div>
+      {:else if o}
         <div style="display:flex;gap:18px;margin:10px 0">
           <div><b>{o.counts.upcoming}</b> <span class="muted small">upcoming</span></div>
           <div><b>{o.counts.finished}</b> <span class="muted small">finished</span></div>

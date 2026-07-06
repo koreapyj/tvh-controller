@@ -98,6 +98,70 @@ instances:
     expect(() => loadConfig(path)).toThrow(/rclone.user is set but rclone.pass is missing/);
   });
 
+  describe('tvh-less instances (url: null)', () => {
+    it('accepts an explicit null url (with or without restreamer nodes)', () => {
+      const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+  - id: ext1
+    name: External
+    url: null
+    restreamer:
+      nodes:
+        - id: node1
+          url: http://ext1-n1:5580
+  - id: ext2
+    url: null
+`);
+      const cfg = loadConfig(path);
+      expect(cfg.instances[1]).toMatchObject({ id: 'ext1', name: 'External', url: null });
+      expect(cfg.instances[1]?.restreamer?.nodes).toHaveLength(1);
+      expect(cfg.instances[2]).toMatchObject({ id: 'ext2', url: null, restreamer: undefined });
+    });
+
+    it('still rejects an ABSENT url (must be explicit null)', () => {
+      const path = writeConfig(`
+instances:
+  - id: tyo1
+    name: Typo Zone
+`);
+      expect(() => loadConfig(path)).toThrow(/instance "tyo1": url is required/);
+    });
+
+    it('rejects username/password with a null url', () => {
+      const path = writeConfig(`
+instances:
+  - id: ext1
+    url: null
+    username: admin
+    password: pw
+`);
+      expect(() => loadConfig(path)).toThrow(/username\/password are meaningless/);
+    });
+
+    it('rejects serverOffset with a null url', () => {
+      const path = writeConfig(`
+instances:
+  - id: ext1
+    url: null
+    serverOffset: "+09:00"
+`);
+      expect(() => loadConfig(path)).toThrow(/serverOffset is meaningless/);
+    });
+
+    it('rejects rclone with a null url', () => {
+      const path = writeConfig(`
+instances:
+  - id: ext1
+    url: null
+    rclone:
+      rcUrl: http://ext1:5572
+`);
+      expect(() => loadConfig(path)).toThrow(/rclone is meaningless/);
+    });
+  });
+
   it('parses a "+HH:MM" serverOffset on an instance', () => {
     const path = writeConfig(`
 instances:
