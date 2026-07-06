@@ -1347,15 +1347,20 @@ export class RestreamerService {
   /**
    * Resolve one placement to a session source + program number. Each
    * placement resolves the (name, number) identity independently in its own
-   * zone: tvheadend topology FIRST, then — only on a tvh miss — the node's
-   * polled sources.m3u catalog by the SAME identity rules (exact-string pin,
-   * lowest-numbered same-name entry when unpinned).
+   * zone: tvheadend topology FIRST, then — only on a tvh miss OR when the
+   * instance's topology is simply unavailable (tvh-less zone; tvh is UNKNOWN,
+   * not a miss) — the node's polled sources.m3u catalog by the SAME identity
+   * rules (exact-string pin, lowest-numbered same-name entry when unpinned).
    * - tvh hit: (channel uuid, program number) — override wins, else the
    *   lowest linked-service SID; underivable + no override blocks WITHOUT
    *   trying the catalog (the identity did resolve — the tvh session just
    *   cannot be built).
-   * - catalog hit (only on a tvh miss): a `{url}` source; programNumber =
-   *   placement override, else undefined (the daemon PAT-probes).
+   * - catalog hit (tvh miss, or topology unavailable): a `{url}` source;
+   *   programNumber = placement override, else undefined (the daemon
+   *   PAT-probes). computeNodeDoc layers an anti-flap guard on top of a
+   *   catalog hit reached via unavailable topology — see its doc comment.
+   * - catalog miss/unknown while topology is unavailable blocks with a reason
+   *   naming BOTH: topology not loaded, and the catalog state.
    * Every reason is also what listChannels surfaces as blockedReason. An
    * unknown instance/node on an EXISTING row (config shrank) is a reason,
    * never a crash.
@@ -1378,9 +1383,7 @@ export class RestreamerService {
     }
 
     const topo = this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
-    if (!topo) return { ok: false, reason: `topology not loaded for instance ${instanceId}` };
-
-    const channel = resolveTvhChannel(topo.channels, ch.channelName, ch.channelNumber);
+    const channel = topo ? resolveTvhChannel(topo.channels, ch.channelName, ch.channelNumber) : null;
     if (channel) {
       if (programOverride != null) {
         return {
@@ -1391,7 +1394,7 @@ export class RestreamerService {
         };
       }
       const svcUuids = new Set(channel.services ?? []);
-      const sids = topo.services
+      const sids = topo!.services
         .filter((s) => svcUuids.has(s.uuid) && typeof s.sid === 'number')
         .map((s) => s.sid as number);
       if (!sids.length) {
@@ -1408,21 +1411,28 @@ export class RestreamerService {
       };
     }
 
-    // tvh miss — fall back to the node's sources catalog by the same identity
+    // tvh miss (topology present) OR tvh UNKNOWN (topology unavailable) —
+    // fall back to the node's sources catalog by the same identity rules
     const key = nodeKey(instanceId, nodeId);
     const suffix = ch.channelNumber != null ? ` (#${ch.channelNumber})` : '';
     const sources = this.cachedNodeStatus(instanceId, nodeId)?.sources ?? null;
     if (sources === null) {
+      const catalogPart = `node ${key}'s sources catalog not loaded`;
       return {
         ok: false,
-        reason: `channel "${ch.channelName}"${suffix} not found on instance ${instanceId}; node ${key}'s sources catalog not loaded`,
+        reason: topo
+          ? `channel "${ch.channelName}"${suffix} not found on instance ${instanceId}; ${catalogPart}`
+          : `topology not loaded for instance ${instanceId} and ${catalogPart}`,
       };
     }
     const entry = resolveCatalogEntry(sources, ch.channelName, ch.channelNumber);
     if (!entry) {
+      const catalogPart = `channel "${ch.channelName}"${suffix} not in node ${key}'s sources catalog`;
       return {
         ok: false,
-        reason: `channel "${ch.channelName}"${suffix} not found on instance ${instanceId} nor in node ${key}'s sources catalog`,
+        reason: topo
+          ? `channel "${ch.channelName}"${suffix} not found on instance ${instanceId} nor in node ${key}'s sources catalog`
+          : `topology not loaded for instance ${instanceId} and ${catalogPart}`,
       };
     }
     return {
@@ -1436,11 +1446,15 @@ export class RestreamerService {
   /**
    * Write-time availability of one placement target for a channel identity:
    * - 'ok'      — resolves right now (session would run), via tvh or catalog.
-   * - 'unknown' — cannot be judged yet: topology not loaded, or a tvh miss
-   *   whose node catalog was never fetched → allow the write, lazy blocking
-   *   covers it.
+   * - 'unknown' — cannot be judged yet: topology not loaded (unless the
+   *   catalog already has a hit — see below), or a tvh miss whose node
+   *   catalog was never fetched → allow the write, lazy blocking covers it.
    * - {reason}  — BOTH sides are known and it still misses (resolve miss on
    *   both, or a tvh hit with a SID underivable without an override).
+   * Topology unavailable + a KNOWN catalog hit is 'ok' (not 'unknown') — this
+   * is what makes an external-only (tvh-less) zone creatable at all; a
+   * catalog miss/unknown while topology is unavailable stays 'unknown'
+   * (unchanged), never a hard reject.
    */
   private placementAvailability(
     instanceId: string,
@@ -1449,7 +1463,12 @@ export class RestreamerService {
     programOverride: number | null,
   ): 'ok' | 'unknown' | { reason: string } {
     const topo = this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
-    if (!topo) return 'unknown';
+    if (!topo) {
+      const sources = this.cachedNodeStatus(instanceId, nodeId)?.sources ?? null;
+      if (sources === null) return 'unknown';
+      const entry = resolveCatalogEntry(sources, ch.channelName, ch.channelNumber);
+      return entry ? 'ok' : 'unknown';
+    }
     const tvhHit = resolveTvhChannel(topo.channels, ch.channelName, ch.channelNumber) != null;
     if (!tvhHit) {
       const sources = this.cachedNodeStatus(instanceId, nodeId)?.sources ?? null;
@@ -1486,20 +1505,38 @@ export class RestreamerService {
 
   /**
    * Desired doc for one node. Read-only (safe outside the op chain).
-   * - No topology yet → fire-and-forget a topology poll, return deferred.
+   * - No topology yet → fire-and-forget a topology poll (so the zone keeps
+   *   trying to recover tvh), but resolution proceeds regardless: a
+   *   tvh-less zone (topology permanently null) must still serve its
+   *   catalog-only placements — see resolvePlacement.
    * - Sessions = enabled placements of enabled channels on this node.
+   * - Anti-flap guard: a placement that resolves via the catalog ONLY
+   *   because this instance's topology is currently unavailable, whose slug
+   *   the node was last known to run from tvheadend (`channelUuid` source in
+   *   lastPushedDoc), is treated as blocked instead — never silently
+   *   re-source a live tvh session from the catalog on what may be a
+   *   transient topology flap. That blocked entry then falls into the
+   *   ordinary pushedSlugs defer path below (the whole node defers, the
+   *   running encode is left untouched). A slug never pushed, or last pushed
+   *   with a `{url}` source, proceeds catalog-only as normal.
    * - Blocked placements whose session is in the node's CURRENT doc defer the
    *   whole push (a full replace must not tear down a running stream on a
    *   topology flap); never-pushed blocked placements just stay out.
    */
   async computeNodeDoc(instanceId: string, nodeId: string): Promise<ComputedNodeDoc> {
-    const topo =
-      this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
+    const topo = this.cache.has(instanceId) ? this.cache.get(instanceId).topology : null;
     if (!topo) {
       const poller = this.pollers.get(instanceId);
       if (poller) void poller.pollTopology().catch(() => {});
-      return { doc: null, blocked: [], deferred: true };
     }
+
+    // lazily hydrated at most once per call — shared by the anti-flap guard
+    // below and the pushedSlugs defer check at the end
+    let lastPushed: DesiredState | null | typeof UNKNOWN | undefined;
+    const getLastPushed = async (): Promise<DesiredState | null | typeof UNKNOWN> => {
+      if (lastPushed === undefined) lastPushed = await this.lastPushedDoc(instanceId, nodeId);
+      return lastPushed;
+    };
 
     const rows = await this.db
       .selectFrom('restream_placements as p')
@@ -1539,6 +1576,25 @@ export class RestreamerService {
         });
         continue;
       }
+
+      // anti-flap guard: this placement only resolved via the catalog
+      // because the instance's topology is unavailable right now — if the
+      // node was last known to run this slug from tvheadend, refuse to
+      // silently re-source it from the catalog (UNKNOWN hydration is treated
+      // the same conservative way as the pushedSlugs check below: block it).
+      if (!topo && resolved.via === 'catalog') {
+        const last = await getLastPushed();
+        const prevSession = last === UNKNOWN ? null : (last?.sessions.find((s) => s.name === row.slug) ?? null);
+        if (last === UNKNOWN || (prevSession && 'channelUuid' in prevSession.source)) {
+          blocked.push({
+            placementId: row.placement_id,
+            channelId: row.channel_id,
+            slug: row.slug,
+            reason: `topology not loaded for instance ${instanceId} — refusing to re-source a tvheadend session from the catalog`,
+          });
+          continue;
+        }
+      }
       // stored profiles are already validated; Default-complete again so a doc
       // computed from an older row hashes identically to a fresh one
       const pipeline = Value.Default(
@@ -1562,7 +1618,7 @@ export class RestreamerService {
     sessions.sort((a, b) => a.name.localeCompare(b.name));
 
     if (blocked.length) {
-      const last = await this.lastPushedDoc(instanceId, nodeId);
+      const last = await getLastPushed();
       if (last === UNKNOWN) {
         // something was pushed but the node can't confirm what — do not risk
         // tearing down a session we can no longer compute

@@ -752,16 +752,151 @@ describe('blocked and defer semantics', () => {
     await h.destroy();
   });
 
-  it('missing topology defers without throwing and triggers a topology poll', async () => {
+  it('missing topology no longer defers on its own (no placements to resolve) but still triggers a topology poll', async () => {
     const h = await setup();
     h.cache.get('zone1').topology = null;
     const computed = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(computed).toEqual({ doc: null, blocked: [], deferred: true });
+    expect(computed.deferred).toBe(false);
+    expect(computed.blocked).toEqual([]);
+    expect(computed.doc!.sessions).toEqual([]);
     const poller = h.pollers.get('zone1')! as unknown as { pollTopology: ReturnType<typeof vi.fn> };
     expect(poller.pollTopology).toHaveBeenCalledTimes(1);
+    // never-pushed node with nothing to run: push is a no-op skip, not an error
+    const result = await h.service.pushNode('zone1', 'n1');
+    expect(result.action).toBe('skipped');
+    expect(result.detail).toBe('nothing to manage');
+    await h.destroy();
+  });
+
+  it('a permanently topology-less (external-only) zone resolves catalog-only placements — not deferred', async () => {
+    const h = await setup();
+    const pf = await h.service.createProfile('p', profilePayload());
+    h.cache.get('zone1').topology = null; // this zone's tvh never answers
+    setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
+    await h.service.createChannel({
+      channelName: 'Cam 1',
+      channelNumber: '1',
+      profileId: pf.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const computed = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(computed.deferred).toBe(false);
+    expect(computed.blocked).toEqual([]);
+    expect(computed.doc!.sessions[0]!.source).toEqual({ url: 'http://cam.example/1.m3u8' });
+    const poller = h.pollers.get('zone1')! as unknown as { pollTopology: ReturnType<typeof vi.fn> };
+    expect(poller.pollTopology).toHaveBeenCalled(); // still keeps trying to recover tvh
+    await h.destroy();
+  });
+
+  it('topology unavailable + catalog miss blocks (never-pushed placement stays out, rest of node still pushes)', async () => {
+    const h = await setup();
+    const pf = await h.service.createProfile('p', profilePayload());
+    h.cache.get('zone1').topology = null;
+    setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1'); // catalog present but no match
+    await h.service.createChannel({
+      channelName: 'Cam 9',
+      profileId: pf.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      force: true, // unresolvable on purpose — the compute-time reason is under test
+    });
+    const computed = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(computed.deferred).toBe(false);
+    expect(computed.doc!.sessions).toHaveLength(0);
+    expect(computed.blocked[0]!.reason).toBe(
+      'topology not loaded for instance zone1 and channel "Cam 9" not in node zone1/n1\'s sources catalog',
+    );
+    await h.destroy();
+  });
+
+  it('topology drops + the catalog entry for a previously-pushed placement also disappears: the node defers', async () => {
+    const h = await setup();
+    const pf = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
+    await h.service.createChannel({
+      channelName: 'Cam 1',
+      channelNumber: '1',
+      profileId: pf.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const node = h.nodes.get('zone1/n1')!;
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['cam-1']);
+    const putsBefore = node.puts().length;
+
+    h.cache.get('zone1').topology = null; // this zone's tvh stops answering...
+    setNodeSources(h.cache, 'zone1', 'n1', [], 'h2'); // ...AND the catalog entry vanishes too
+
     const result = await h.service.pushNode('zone1', 'n1');
     expect(result.action).toBe('deferred');
-    expect(result.detail).toBe('topology not loaded');
+    expect(result.blocked[0]!.reason).toBe(
+      'topology not loaded for instance zone1 and channel "Cam 1" (#1) not in node zone1/n1\'s sources catalog',
+    );
+    expect(node.puts().length).toBe(putsBefore); // running session left untouched
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['cam-1']);
+    await h.destroy();
+  });
+
+  it('anti-flap: refuses to re-source a previously tvh-sourced session from the catalog when topology drops', async () => {
+    const h = await setup();
+    const pf = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pf.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const node = h.nodes.get('zone1/n1')!;
+    expect(node.desired!.sessions[0]!.source).toMatchObject({ channelUuid: 'ch-atx-91' });
+    const putsBefore = node.puts().length;
+
+    // topology drops AND a same-identity catalog entry shows up — a naive
+    // catalog-only resolution would silently re-source the live tvh session
+    h.cache.get('zone1').topology = null;
+    const shadow: SourceCatalogEntry = {
+      id: 'shadow',
+      name: 'AT-X',
+      url: 'http://shadow.example/atx.m3u8',
+      chno: '9.1',
+    };
+    setNodeSources(h.cache, 'zone1', 'n1', [shadow], 'h1');
+
+    const result = await h.service.pushNode('zone1', 'n1');
+    expect(result.action).toBe('deferred');
+    expect(result.blocked[0]!.reason).toBe(
+      'topology not loaded for instance zone1 — refusing to re-source a tvheadend session from the catalog',
+    );
+    expect(node.puts().length).toBe(putsBefore); // running tvh session left untouched
+    expect(node.desired!.sessions[0]!.source).toMatchObject({ channelUuid: 'ch-atx-91' });
+
+    // topology returns — normal tvh resolution resumes, doc unchanged so the push hash-skips
+    h.cache.get('zone1').topology = zone1Topology();
+    const resumed = await h.service.pushNode('zone1', 'n1');
+    expect(resumed.action).toBe('skipped');
+    expect(node.desired!.sessions[0]!.source).toMatchObject({ channelUuid: 'ch-atx-91' });
+    await h.destroy();
+  });
+
+  it('anti-flap does not apply to a slug previously pushed with a {url} (catalog) source — it proceeds catalog-only', async () => {
+    const h = await setup();
+    const pf = await h.service.createProfile('p', profilePayload());
+    setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
+    await h.service.createChannel({
+      channelName: 'Cam 1',
+      channelNumber: '1',
+      profileId: pf.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const node = h.nodes.get('zone1/n1')!;
+    expect(node.desired!.sessions[0]!.source).toEqual({ url: 'http://cam.example/1.m3u8' });
+
+    // the catalog entry's URL changes while topology happens to be down too —
+    // this was already a {url} source, so the anti-flap guard must not apply
+    h.cache.get('zone1').topology = null;
+    const camMoved: SourceCatalogEntry = { ...CAM, url: 'http://cam.example/2.m3u8' };
+    setNodeSources(h.cache, 'zone1', 'n1', [camMoved], 'h2');
+
+    const result = await h.service.pushNode('zone1', 'n1');
+    expect(result.action).toBe('pushed');
+    expect(node.desired!.sessions[0]!.source).toEqual({ url: 'http://cam.example/2.m3u8' });
     await h.destroy();
   });
 });
@@ -1617,6 +1752,24 @@ describe('write-time availability', () => {
       placements: [{ instanceId: 'zone2', nodeId: 'n1' }],
     });
     expect(chan.id).toBeTruthy();
+    await h.destroy();
+  });
+
+  it('unloaded topology + a KNOWN catalog hit is "ok" — the write is allowed without force (external-only zone)', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    h.cache.get('zone2').topology = null;
+    setNodeSources(h.cache, 'zone2', 'n1', [CAM], 'h1');
+    const chan = await h.service.createChannel({
+      channelName: 'Cam 1',
+      channelNumber: '1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone2', nodeId: 'n1' }], // NOT forced — availability must be 'ok'
+    });
+    expect(chan.id).toBeTruthy();
+    const [listed] = await h.service.listChannels();
+    expect(listed!.placements[0]!.resolvedVia).toBe('catalog');
+    expect(listed!.placements[0]!.blockedReason).toBeNull();
     await h.destroy();
   });
 
