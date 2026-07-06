@@ -27,6 +27,9 @@ rclone:
   remote: "gdrive:tvh-archive"
 pollIntervals: { dvr: 5000, autorec: 10000, topology: 30000, restreamer: 5000 }
 restreamer:
+  # fixed controller base for M3U logo-proxy links; omit to derive it from
+  # X-Forwarded-Proto/Host (or the request) per request
+  # publicUrl: http://127.0.0.1:8090
   switchers:
     - id: sw1
       url: http://127.0.0.1:15900

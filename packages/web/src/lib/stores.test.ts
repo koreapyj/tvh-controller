@@ -43,6 +43,8 @@ function node(over: Partial<RestreamerNodeStatus> = {}): RestreamerNodeStatus {
     desiredRevision: null,
     pendingPush: false,
     sessions: [],
+    sourcesHash: null,
+    sources: null,
     ...over,
   };
 }

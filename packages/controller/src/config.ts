@@ -70,8 +70,13 @@ export interface AppConfig {
   overlapThreshold: number;
   /** auto-archive every finished recording's best copy */
   autoUpload: { enabled: boolean; graceSeconds: number };
-  /** standalone switcher service(s); absent = redundancy feature off */
-  restreamer?: { switchers: SwitcherConfig[] };
+  /**
+   * standalone switcher service(s) (absent block = redundancy feature off)
+   * plus the controller's own viewer-facing base URL (`publicUrl`), used for
+   * controller-hosted links in M3U output (logo proxy); when unset the base
+   * is derived per request from X-Forwarded-Proto/Host or the request itself
+   */
+  restreamer?: { switchers: SwitcherConfig[]; publicUrl?: string };
   webDistDir?: string;
 }
 
@@ -89,7 +94,7 @@ interface RawConfig {
   autoUpload?: boolean | { enabled?: boolean; graceSeconds?: number };
   pollIntervals?: Partial<AppConfig['pollIntervals']>;
   overlapThreshold?: number;
-  restreamer?: { switchers?: SwitcherConfig[] };
+  restreamer?: { switchers?: SwitcherConfig[]; publicUrl?: string };
 }
 
 /** "+09:00" / "-05:30" / minutes number -> minutes */
@@ -126,8 +131,8 @@ function parseRestreamerNodes(
 }
 
 function parseSwitchers(
-  raw: { switchers?: SwitcherConfig[] } | undefined,
-): { switchers: SwitcherConfig[] } | undefined {
+  raw: { switchers?: SwitcherConfig[]; publicUrl?: string } | undefined,
+): { switchers: SwitcherConfig[]; publicUrl?: string } | undefined {
   if (!raw) return undefined;
   const ids = new Set<string>();
   const switchers = (raw.switchers ?? []).map((s) => {
@@ -142,7 +147,7 @@ function parseSwitchers(
       publicUrl: s.publicUrl.replace(/\/+$/, ''),
     };
   });
-  return { switchers };
+  return { switchers, publicUrl: raw.publicUrl?.replace(/\/+$/, '') };
 }
 
 function defaultConfigPath(): string {

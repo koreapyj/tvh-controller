@@ -205,6 +205,23 @@ describe('planRebalance', () => {
     ]);
   });
 
+  it('single-upstream channels contribute load but never generate moves', () => {
+    // `solo` (one upstream, no alternative) loads node a; only `big` can move,
+    // and it does — proving solo's load is visible to the policy
+    const channels = [
+      chan('solo', 60, [up('solo-a', 'a')]),
+      chan('big', 30, [up('big-a', 'a'), up('big-b', 'b', { priority: 2 })]),
+    ];
+    expect(planRebalance({ channels, nodes: AB, now: NOW })).toEqual([
+      { slug: 'big', toPlacementId: 'big-b', reason: 'rebalance' },
+    ]);
+
+    // a lone single-upstream channel proposes nothing, however lopsided
+    expect(
+      planRebalance({ channels: [chan('solo', 60, [up('solo-a', 'a')])], nodes: AB, now: NOW }),
+    ).toEqual([]);
+  });
+
   it('one move per pass, even when several channels are out of place', () => {
     const channels = [
       chan('c1', 30, [up('c1-a', 'a'), up('c1-b', 'b')]),

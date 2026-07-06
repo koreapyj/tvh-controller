@@ -39,6 +39,7 @@ import type { AppContext } from './routes/context.js';
 import { EventBus } from './state/events.js';
 import { InstanceCache } from './state/instanceCache.js';
 import { SyncEngine } from './sync/engine.js';
+import { TvhClient } from './tvh/client.js';
 import { InstancePoller } from './tvh/poller.js';
 import { AutoUploader } from './uploads/autoUpload.js';
 import { UploadDispatcher } from './uploads/dispatcher.js';
@@ -70,6 +71,13 @@ async function main(): Promise<void> {
     const poller = new InstancePoller(inst, cache, bus, config.pollIntervals);
     poller.onCapacityInputsChanged = () => conflicts.recompute(inst.id);
     pollers.set(inst.id, poller);
+  }
+
+  // authenticated tvheadend HTTP clients for the logo proxy — same creds the
+  // pollers use, independent of the database (works in overview-only mode)
+  const tvhHttp = new Map<string, TvhClient>();
+  for (const inst of config.instances) {
+    tvhHttp.set(inst.id, new TvhClient(inst.url, inst.username, inst.password));
   }
 
   const sync = db ? new SyncEngine(db, cache, pollers, bus) : null;
@@ -133,6 +141,8 @@ async function main(): Promise<void> {
           desiredRevision: null,
           pendingPush: false,
           sessions: [],
+          sourcesHash: null,
+          sources: null,
         },
       ];
       restreamerPollers.push(
@@ -174,6 +184,7 @@ async function main(): Promise<void> {
     cache,
     bus,
     pollers,
+    tvhHttp,
     sync,
     ledger,
     dispatcher,

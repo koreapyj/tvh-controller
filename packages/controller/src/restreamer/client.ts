@@ -19,6 +19,7 @@
 import type {
   DesiredState,
   LogLine,
+  SourcesResponse,
   StatusResponse,
   SwitcherDesiredState,
   SwitcherStatus,
@@ -103,6 +104,22 @@ export class RestreamerClient {
 
   status(): Promise<StatusResponse> {
     return this.req<StatusResponse>('GET', '/v1/status');
+  }
+
+  /**
+   * The node's local sources.m3u catalog. An old daemon without the sources
+   * API 404s — mapped to the same shape a no-catalog daemon reports
+   * (catalogHash null, no entries) so callers never special-case it.
+   */
+  async sources(): Promise<SourcesResponse> {
+    try {
+      return await this.req<SourcesResponse>('GET', '/v1/sources');
+    } catch (err) {
+      if (err instanceof RestreamerError && err.status === 404) {
+        return { apiVersion: 1, catalogHash: null, updatedAt: null, entries: [] };
+      }
+      throw err;
+    }
   }
 
   /** persisted desired-doc read-back; null when never pushed (daemon 404s) */

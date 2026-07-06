@@ -176,6 +176,7 @@ async function seedRedundant(h: Harness, name = 'BBB', number = '10') {
       { instanceId: 'zone1', nodeId: 'n1' },
       { instanceId: 'zone2', nodeId: 'n1' },
     ],
+    force: true, // callers pass names that resolve nowhere — resolution is not under test here
   });
   const placements = (await h.service.listChannels()).find((c) => c.id === channel.id)!.placements;
   return { profile, channel, placements };
@@ -184,11 +185,12 @@ async function seedRedundant(h: Harness, name = 'BBB', number = '10') {
 // ---------- computeSwitcherDoc ----------
 
 describe('computeSwitcherDoc', () => {
-  it('includes only enabled channels with ≥2 enabled placements, upstreams in priority order', async () => {
+  it('includes every enabled channel with ≥1 usable upstream, upstreams in priority order', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
-    // single placement — not redundant, not the switcher's business
-    await h.service.createChannel({
+    // single placement — with a switcher configured it is fronted too, with a
+    // one-entry upstreams array mirroring its one node
+    const single = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
       profileId: p.id,
@@ -199,9 +201,13 @@ describe('computeSwitcherDoc', () => {
     const { doc, blocked } = await h.service.computeSwitcherDoc();
     expect(blocked).toEqual([]);
     expect(doc.apiVersion).toBe(1);
-    expect(doc.channels).toHaveLength(1);
-    const ch = doc.channels[0]!;
-    expect(ch.slug).toBe('bbb');
+    expect(doc.channels.map((c) => c.slug)).toEqual(['at-x', 'bbb']);
+    const singlePlacement = (await h.service.listChannels()).find((c) => c.id === single.id)!
+      .placements[0]!;
+    expect(doc.channels[0]!.upstreams).toEqual([
+      { id: singlePlacement.id, url: 'http://hls.zone1-n1/at-x', priority: 1 },
+    ]);
+    const ch = doc.channels[1]!;
     expect(ch.segmentSeconds).toBe(5); // contract default
     expect(ch.upstreams).toEqual([
       { id: placements[0]!.id, url: 'http://hls.zone1-n1/bbb', priority: 1 },
@@ -209,18 +215,18 @@ describe('computeSwitcherDoc', () => {
     ]);
     expect(doc.revision).toBe(sessionsHash(doc.channels));
 
-    // disabling the channel removes it from the doc
+    // disabling a channel removes it from the doc
     await h.service.updateChannel(channel.id, { enabled: false });
     const after = await h.service.computeSwitcherDoc();
-    expect(after.doc.channels).toHaveLength(0);
+    expect(after.doc.channels.map((c) => c.slug)).toEqual(['at-x']);
     await h.destroy();
   });
 
-  it('skips serveUrl-less placements with a reason; <2 usable upstreams skips the channel', async () => {
+  it('skips serveUrl-less placements with a reason; 0 usable upstreams skips the channel', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
-    // placements on zone1/n1 (serveUrl) and zone1/n2 (NO serveUrl): redundant
-    // by placement count but only one usable upstream — channel skipped
+    // placements on zone1/n1 (serveUrl) and zone1/n2 (NO serveUrl): one
+    // usable upstream — channel stays in the doc, n2 blocked with a reason
     const chan = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -232,19 +238,47 @@ describe('computeSwitcherDoc', () => {
     });
 
     const { doc, blocked } = await h.service.computeSwitcherDoc();
-    expect(doc.channels).toHaveLength(0);
-    expect(blocked).toHaveLength(2);
+    expect(doc.channels.map((c) => c.slug)).toEqual(['at-x']);
+    expect(doc.channels[0]!.upstreams).toEqual([
+      { id: expect.any(String), url: 'http://hls.zone1-n1/at-x', priority: 1 },
+    ]);
+    expect(blocked).toHaveLength(1);
     expect(blocked[0]!.reason).toContain('has no serveUrl');
     expect(blocked[0]!.placementId).not.toBeNull();
-    expect(blocked[1]).toMatchObject({ channelId: chan.id, slug: 'at-x', placementId: null });
-    expect(blocked[1]!.reason).toContain('fewer than 2 usable upstreams');
+    expect(blocked[0]!.channelId).toBe(chan.id);
 
-    // a third, usable placement fixes it: channel included, n2 still blocked
-    await h.service.addPlacement(chan.id, { instanceId: 'zone2', nodeId: 'n1' });
+    // a channel whose ONLY placement is unusable is skipped entirely
+    const zero = await h.service.createChannel({
+      channelName: 'ZeroUp',
+      channelNumber: '99',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n2' }],
+      force: true, // ZeroUp resolves nowhere — write-time availability would 409
+    });
     const after = await h.service.computeSwitcherDoc();
     expect(after.doc.channels.map((c) => c.slug)).toEqual(['at-x']);
-    expect(after.doc.channels[0]!.upstreams).toHaveLength(2);
-    expect(after.blocked).toHaveLength(1);
+    const zeroBlocked = after.blocked.filter((b) => b.channelId === zero.id);
+    expect(zeroBlocked).toHaveLength(2); // the n2 placement + the whole channel
+    expect(zeroBlocked[1]).toMatchObject({ channelId: zero.id, slug: 'zeroup', placementId: null });
+    expect(zeroBlocked[1]!.reason).toContain('no usable upstreams');
+    await h.destroy();
+  });
+
+  it('the revision changes when a single-placement channel appears', async () => {
+    const h = await setup();
+    await seedRedundant(h);
+    const before = await h.service.computeSwitcherDoc();
+
+    const p = await h.service.createProfile('p-single', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const after = await h.service.computeSwitcherDoc();
+    expect(after.doc.channels).toHaveLength(2);
+    expect(after.doc.revision).not.toBe(before.doc.revision);
     await h.destroy();
   });
 
@@ -327,7 +361,7 @@ describe('switcher push', () => {
     await h.destroy();
   });
 
-  it('adding a second placement makes the switcher doc gain the channel', async () => {
+  it('a single-placement channel is pushed too; placements change the upstream list, not membership', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     const chan = await h.service.createChannel({
@@ -336,16 +370,21 @@ describe('switcher push', () => {
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
-    expect(h.switcher.puts()).toHaveLength(0); // single placement: nothing to manage
-
-    await h.service.addPlacement(chan.id, { instanceId: 'zone2', nodeId: 'n1' });
+    // single placement: with a switcher configured this IS its business now
     expect(h.switcher.puts()).toHaveLength(1);
     expect(h.switcher.desired!.channels.map((c) => c.slug)).toEqual(['bbb']);
+    expect(h.switcher.desired!.channels[0]!.upstreams).toHaveLength(1);
 
-    // removing it again empties the pushed doc (state exists → push happens)
+    await h.service.addPlacement(chan.id, { instanceId: 'zone2', nodeId: 'n1' });
+    expect(h.switcher.puts()).toHaveLength(2);
+    expect(h.switcher.desired!.channels[0]!.upstreams).toHaveLength(2);
+
+    // removing it again shrinks the upstream list back to one — the channel
+    // stays in the doc (its playback URL never changes)
     const placements = (await h.service.listChannels())[0]!.placements;
     await h.service.deletePlacement(placements[1]!.id);
-    expect(h.switcher.desired!.channels).toHaveLength(0);
+    expect(h.switcher.desired!.channels.map((c) => c.slug)).toEqual(['bbb']);
+    expect(h.switcher.desired!.channels[0]!.upstreams).toHaveLength(1);
     await h.destroy();
   });
 

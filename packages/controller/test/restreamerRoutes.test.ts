@@ -12,6 +12,7 @@ import type {
   RestreamPlaylist,
   RestreamProfile,
   SessionStatus,
+  SourceCatalogEntry,
 } from '@tvhc/shared';
 import type { AppConfig } from '../src/config.js';
 import type { InstancePoller } from '../src/tvh/poller.js';
@@ -24,6 +25,7 @@ import {
 } from '../src/restreamer/service.js';
 import { registerRestreamerRoutes } from '../src/routes/restreamer.js';
 import type { AppContext } from '../src/routes/context.js';
+import type { TvhClient } from '../src/tvh/client.js';
 import { EventBus } from '../src/state/events.js';
 import { InstanceCache, type TopologySnapshot } from '../src/state/instanceCache.js';
 import { createTestDb } from './support/testDb.js';
@@ -127,6 +129,7 @@ function seedNodeStatus(
   instanceId: string,
   nodeId: string,
   sessions: SessionStatus[] = [],
+  sources: SourceCatalogEntry[] | null = null,
 ): void {
   cache.get(instanceId).restreamers = [
     ...cache.get(instanceId).restreamers,
@@ -144,6 +147,8 @@ function seedNodeStatus(
       desiredRevision: null,
       pendingPush: false,
       sessions,
+      sourcesHash: sources === null ? null : 'h1',
+      sources,
     },
   ];
 }
@@ -156,6 +161,7 @@ interface Harness {
   restartSession: ReturnType<typeof vi.fn>;
   sessionLog: ReturnType<typeof vi.fn>;
   switchChannel: ReturnType<typeof vi.fn>;
+  tvhGetRaw: ReturnType<typeof vi.fn>;
   close: () => Promise<void>;
 }
 
@@ -182,17 +188,27 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
     }
   }
   const switchChannel = vi.fn(async () => {});
+  const putDesired = vi.fn(async () => {});
   const switcherClients = new Map<string, SwitcherClient>();
   for (const sw of config.restreamer?.switchers ?? []) {
-    switcherClients.set(sw.id, { switchChannel } as unknown as SwitcherClient);
+    switcherClients.set(sw.id, { switchChannel, putDesired } as unknown as SwitcherClient);
   }
-  const service = new RestreamerService(db, cache, pollers, bus, config, clients);
+  const tvhGetRaw = vi.fn(
+    async () => new Response('png', { status: 200, headers: { 'content-type': 'image/png' } }),
+  );
+  const tvhHttp = new Map<string, TvhClient>();
+  for (const inst of config.instances) {
+    tvhHttp.set(inst.id, { getRaw: tvhGetRaw } as unknown as TvhClient);
+  }
+  // the service gets the switcher clients too (reset switching goes through it)
+  const service = new RestreamerService(db, cache, pollers, bus, config, clients, switcherClients);
   const ctx = {
     config,
     db,
     cache,
     bus,
     pollers,
+    tvhHttp,
     sync: null,
     ledger: null,
     dispatcher: null,
@@ -213,6 +229,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
     restartSession,
     sessionLog,
     switchChannel,
+    tvhGetRaw,
     close: async () => {
       await app.close();
       await destroy();
@@ -323,7 +340,8 @@ describe('restreamer channel routes', () => {
     expect(withStatus!.placements).toHaveLength(1);
     expect(withStatus!.placements[0]!.blockedReason).toBeNull();
     expect(withStatus!.placements[0]!.session?.state).toBe('running');
-    expect(withStatus!.playbackUrl).toBe('http://hls.zone1-n1/at-x/playlist.m3u8');
+    // a switcher is configured -> even a single-placement channel is fronted by it
+    expect(withStatus!.playbackUrl).toBe('http://sw.example/hls/at-x/playlist.m3u8');
 
     const got = await app.inject({ method: 'GET', url: `/api/restreamer/channels/${channel.id}` });
     expect(got.statusCode).toBe(200);
@@ -399,6 +417,285 @@ describe('restreamer channel routes', () => {
     expect(bad.statusCode).toBe(400);
   });
 
+});
+
+// ---------- write-time availability + external source parsing ----------
+
+describe('write-time availability and external sources (routes)', () => {
+  const CAM: SourceCatalogEntry = {
+    id: 'cam1',
+    name: 'Cam 1',
+    url: 'http://cam.example/1.m3u8',
+    chno: '5',
+    logo: 'http://logos.example/cam1.png',
+  };
+
+  it('create 409s with {error, unavailable:[{instanceId,nodeId,reason}]}; force creates', async () => {
+    const { app } = await harness();
+    const profile = await createProfile(app);
+    const payload = {
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: profile.id,
+      placements: [{ instanceId: 'zone2', nodeId: 'n1' }], // zone2 has no AT-X
+    };
+    const denied = await app.inject({ method: 'POST', url: '/api/restreamer/channels', payload });
+    expect(denied.statusCode).toBe(409);
+    expect(denied.json()).toEqual({
+      error: expect.stringContaining('— pass force to create anyway'),
+      unavailable: [
+        {
+          instanceId: 'zone2',
+          nodeId: 'n1',
+          reason: 'channel "AT-X" (#9.1) not found on instance zone2',
+        },
+      ],
+    });
+
+    const forced = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: { ...payload, force: true },
+    });
+    expect(forced.statusCode).toBe(201);
+  });
+
+  it('PUT channel identity change 409s with the shape; force passes', async () => {
+    const { app } = await harness();
+    const profile = await createProfile(app);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'AT-X',
+        channelNumber: '9.1',
+        profileId: profile.id,
+        placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      },
+    });
+    const channel = created.json() as RestreamChannel;
+
+    const denied = await app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/channels/${channel.id}`,
+      payload: { channelName: 'Ghost' },
+    });
+    expect(denied.statusCode).toBe(409);
+    expect(denied.json()).toEqual({
+      error: expect.stringContaining('— pass force to update anyway'),
+      unavailable: [
+        { instanceId: 'zone1', nodeId: 'n1', reason: 'channel "Ghost" not found on instance zone1' },
+      ],
+    });
+
+    const forced = await app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/channels/${channel.id}`,
+      payload: { channelName: 'Ghost', force: true },
+    });
+    expect(forced.statusCode).toBe(200);
+    expect((forced.json() as RestreamChannel).channelName).toBe('Ghost');
+  });
+
+  it('placement add and move 409 with the shape; force passes', async () => {
+    const { app } = await harness();
+    const profile = await createProfile(app);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'AT-X',
+        channelNumber: '9.1',
+        profileId: profile.id,
+        placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      },
+    });
+    const channel = created.json() as RestreamChannel;
+
+    const addDenied = await app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/placements`,
+      payload: { instanceId: 'zone2', nodeId: 'n1' },
+    });
+    expect(addDenied.statusCode).toBe(409);
+    expect(addDenied.json()).toEqual({
+      error: expect.stringContaining('— pass force to add anyway'),
+      unavailable: [{ instanceId: 'zone2', nodeId: 'n1', reason: expect.any(String) }],
+    });
+
+    const list = await app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const placementId = (list.json() as RestreamChannelWithStatus[])[0]!.placements[0]!.id;
+    const moveDenied = await app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${placementId}`,
+      payload: { instanceId: 'zone2' },
+    });
+    expect(moveDenied.statusCode).toBe(409);
+    expect(moveDenied.json()).toEqual({
+      error: expect.stringContaining('— pass force to move anyway'),
+      unavailable: [{ instanceId: 'zone2', nodeId: 'n1', reason: expect.any(String) }],
+    });
+
+    const moveForced = await app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${placementId}`,
+      payload: { instanceId: 'zone2', force: true },
+    });
+    expect(moveForced.statusCode).toBe(200);
+  });
+
+  it('rejects an invalid sourceType enum (400) on create and update', async () => {
+    const { app } = await harness();
+    const profile = await createProfile(app);
+    const bad = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: { channelName: 'X', profileId: profile.id, sourceType: 'weird' },
+    });
+    expect(bad.statusCode).toBe(400);
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: { channelName: 'AT-X', channelNumber: '9.1', profileId: profile.id },
+    });
+    const channel = created.json() as RestreamChannel;
+    const badPatch = await app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/channels/${channel.id}`,
+      payload: { sourceType: 'weird' },
+    });
+    expect(badPatch.statusCode).toBe(400);
+  });
+
+  it('parses sourceType/sourceKey on create; external without a key is a 400', async () => {
+    const { app } = await harness();
+    const profile = await createProfile(app);
+    const missingKey = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: { channelName: 'Cam', profileId: profile.id, sourceType: 'external' },
+    });
+    expect(missingKey.statusCode).toBe(400);
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'Cam 1',
+        profileId: profile.id,
+        sourceType: 'external',
+        sourceKey: 'cam1',
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const channel = created.json() as RestreamChannel;
+    expect(channel.sourceType).toBe('external');
+    expect(channel.sourceKey).toBe('cam1');
+    expect(channel.channelNumber).toBeNull();
+  });
+
+  it('batch edit forwards force through the patch', async () => {
+    const { app } = await harness();
+    const profile = await createProfile(app);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'AT-X',
+        channelNumber: '9.1',
+        profileId: profile.id,
+        placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      },
+    });
+    const channel = created.json() as RestreamChannel;
+
+    const denied = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels/batch',
+      payload: { action: 'edit', ids: [channel.id], patch: { channelName: 'Ghost' } },
+    });
+    const deniedResults = denied.json() as Array<{ ok: boolean; error?: string }>;
+    expect(deniedResults[0]!.ok).toBe(false);
+    expect(deniedResults[0]!.error).toContain('pass force');
+
+    const forced = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels/batch',
+      payload: { action: 'edit', ids: [channel.id], patch: { channelName: 'Ghost', force: true } },
+    });
+    expect((forced.json() as Array<{ ok: boolean }>)[0]!.ok).toBe(true);
+  });
+
+  it('renders external channels in the M3U from the node catalog, sorted among tvh channels by chno', async () => {
+    const h = await harness();
+    const profile = await createProfile(h.app);
+    const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'TV' });
+    // the catalog must be in the cache BEFORE the external create (write-time
+    // availability checks it) — sessions running so the entries render
+    seedNodeStatus(
+      h.cache,
+      'zone1',
+      'n1',
+      [sessionStatus('at-x'), sessionStatus('cam-1'), sessionStatus('cam-9')],
+      [CAM],
+    );
+
+    const post = async (payload: Record<string, unknown>) => {
+      const res = await h.app.inject({ method: 'POST', url: '/api/restreamer/channels', payload });
+      expect(res.statusCode).toBe(201);
+      return res.json() as RestreamChannel;
+    };
+    await post({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: profile.id,
+      playlistIds: [playlist.id],
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    await post({
+      channelName: 'Cam 1',
+      profileId: profile.id,
+      sourceType: 'external',
+      sourceKey: 'cam1',
+      playlistIds: [playlist.id],
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    // catalog entry missing everywhere → identity falls back to the bare key
+    await post({
+      channelName: 'Cam 9',
+      profileId: profile.id,
+      sourceType: 'external',
+      sourceKey: 'cam9',
+      playlistIds: [playlist.id],
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      force: true,
+    });
+
+    const res = await h.app.inject({
+      method: 'GET',
+      url: '/playlists/tv.m3u',
+      headers: { host: 'ctrl.example' },
+    });
+    expect(res.statusCode).toBe(200);
+    // chno sort: cam1 ("5") < AT-X ("9.1") < cam9 (numberless last); the
+    // external logo is the catalog value VERBATIM (never proxied), tvg-id is
+    // the sourceKey, tvg-chno the catalog chno
+    expect(res.body).toBe(
+      [
+        '#EXTM3U',
+        '#PLAYLIST:TV',
+        '#KODIPROP:mimetype=application/x-mpegURL',
+        '#EXTINF:-1 tvg-id="cam1" tvg-chno="5" x-url="cam-1" tvg-logo="http://logos.example/cam1.png",Cam 1',
+        'http://sw.example/hls/cam-1/playlist.m3u8',
+        '#EXTINF:-1 tvg-id="ch-atx-91" tvg-chno="9.1" x-url="at-x" tvg-logo="http://ctrl.example/logos/zone1/imagecache/32736",AT-X',
+        'http://sw.example/hls/at-x/playlist.m3u8',
+        '#EXTINF:-1 tvg-id="cam9" x-url="cam-9",Cam 9',
+        'http://sw.example/hls/cam-9/playlist.m3u8',
+        '',
+      ].join('\n'),
+    );
+  });
 });
 
 // ---------- manual switch ----------
@@ -523,6 +820,141 @@ describe('POST /api/restreamer/channels/:id/switch', () => {
     });
     expect(down.statusCode).toBe(502);
   });
+
+  // ---------- {reset: true} — back to the highest-priority healthy upstream ----------
+
+  function seedSwitcherStatus(
+    h: Harness,
+    channels: Array<{
+      slug: string;
+      activeUpstreamId: string | null;
+      upstreams: Array<{ id: string; healthy: boolean }>;
+    }>,
+  ): void {
+    h.cache.switchers.set('sw1', {
+      switcherId: 'sw1',
+      url: 'http://sw1:5581',
+      publicUrl: 'http://sw.example',
+      reachable: true,
+      error: null,
+      lastPollAt: null,
+      version: '1.0.0',
+      pendingPush: false,
+      channels: channels.map((c) => ({ ...c, lastSwitch: null })),
+    });
+  }
+
+  it('reset switches to the lowest-priority-number healthy placement', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    seedSwitcherStatus(h, [
+      {
+        slug: 'bbb',
+        activeUpstreamId: placements[1]!.id, // manually switched away earlier
+        upstreams: placements.map((p) => ({ id: p.id, healthy: true })),
+      },
+    ]);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, already: false });
+    expect(h.switchChannel).toHaveBeenCalledWith('bbb', placements[0]!.id);
+  });
+
+  it('reset skips an unhealthy priority-1 upstream and picks priority-2', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    seedSwitcherStatus(h, [
+      {
+        slug: 'bbb',
+        activeUpstreamId: placements[0]!.id,
+        upstreams: [
+          { id: placements[0]!.id, healthy: false },
+          { id: placements[1]!.id, healthy: true },
+        ],
+      },
+    ]);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, already: false });
+    expect(h.switchChannel).toHaveBeenCalledWith('bbb', placements[1]!.id);
+  });
+
+  it('reset is a no-op when the target upstream is already active', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    seedSwitcherStatus(h, [
+      {
+        slug: 'bbb',
+        activeUpstreamId: placements[0]!.id,
+        upstreams: placements.map((p) => ({ id: p.id, healthy: true })),
+      },
+    ]);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, already: true });
+    expect(h.switchChannel).not.toHaveBeenCalled();
+  });
+
+  it('reset 409s when the switcher reports no healthy upstream (or no channel at all)', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+
+    // no switcher reports the slug yet
+    const unknown = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(unknown.statusCode).toBe(409);
+
+    seedSwitcherStatus(h, [
+      {
+        slug: 'bbb',
+        activeUpstreamId: placements[0]!.id,
+        upstreams: placements.map((p) => ({ id: p.id, healthy: false })),
+      },
+    ]);
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(h.switchChannel).not.toHaveBeenCalled();
+  });
+
+  it('400s a body with both, neither, or a non-true reset', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    for (const payload of [
+      {},
+      { placementId: placements[0]!.id, reset: true },
+      { reset: false },
+    ]) {
+      const res = await h.app.inject({
+        method: 'POST',
+        url: `/api/restreamer/channels/${channel.id}/switch`,
+        payload,
+      });
+      expect(res.statusCode, JSON.stringify(payload)).toBe(400);
+    }
+    expect(h.switchChannel).not.toHaveBeenCalled();
+  });
 });
 
 // ---------- session passthrough ----------
@@ -645,20 +1077,27 @@ describe('GET /playlists/:slug.m3u', () => {
     const h = await harness();
     await seedM3uFixture(h);
 
-    const res = await h.app.inject({ method: 'GET', url: '/playlists/tv.m3u' });
+    const res = await h.app.inject({
+      method: 'GET',
+      url: '/playlists/tv.m3u',
+      headers: { host: 'ctrl.example' },
+    });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toBe('audio/x-mpegurl');
     // sorted by chanNumberOrder: "9.1" before "10" (numeric, not lexical);
     // CCC ("3") would sort first but is excluded (session not running);
-    // single placement -> node serveUrl; redundant -> switcher publicUrl;
-    // relative imagecache icon absolutized against the instance url
+    // a switcher is configured -> EVERY entry (single-placement AT-X included)
+    // points at the switcher publicUrl — uniform viewer URLs;
+    // relative imagecache icon -> controller logo proxy against the request
+    // base (no forwarded headers, no configured publicUrl here); absolute
+    // icon (BBB) passes through verbatim
     expect(res.body).toBe(
       [
         '#EXTM3U url-tvg=http://epg.example/xmltv',
         '#PLAYLIST:Mock TV',
         '#KODIPROP:mimetype=application/x-mpegURL',
-        '#EXTINF:-1 tvg-id="ch-atx-91" tvg-chno="9.1" x-url="at-x" tvg-logo="http://zone1:9981/imagecache/32736",AT-X',
-        'http://hls.zone1-n1/at-x/playlist.m3u8',
+        '#EXTINF:-1 tvg-id="ch-atx-91" tvg-chno="9.1" x-url="at-x" tvg-logo="http://ctrl.example/logos/zone1/imagecache/32736",AT-X',
+        'http://sw.example/hls/at-x/playlist.m3u8',
         '#EXTINF:-1 tvg-id="ch-bbb" tvg-chno="10" x-url="bbb" tvg-logo="http://icons.example/bbb.png",BBB',
         'http://sw.example/hls/bbb/playlist.m3u8',
         '',
@@ -666,9 +1105,47 @@ describe('GET /playlists/:slug.m3u', () => {
     );
 
     // the /api twin serves the identical body
-    const api = await h.app.inject({ method: 'GET', url: '/api/restreamer/playlists/tv.m3u' });
+    const api = await h.app.inject({
+      method: 'GET',
+      url: '/api/restreamer/playlists/tv.m3u',
+      headers: { host: 'ctrl.example' },
+    });
     expect(api.statusCode).toBe(200);
     expect(api.body).toBe(res.body);
+  });
+
+  it('derives the logo-proxy base from X-Forwarded-Proto/Host (first value each)', async () => {
+    const h = await harness();
+    await seedM3uFixture(h);
+    const res = await h.app.inject({
+      method: 'GET',
+      url: '/playlists/tv.m3u',
+      headers: {
+        'x-forwarded-proto': 'https, http',
+        'x-forwarded-host': 'tv.example, inner.local',
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('tvg-logo="https://tv.example/logos/zone1/imagecache/32736"');
+    // absolute icons stay verbatim regardless of the base
+    expect(res.body).toContain('tvg-logo="http://icons.example/bbb.png"');
+  });
+
+  it('config restreamer.publicUrl wins over forwarded headers as the logo-proxy base', async () => {
+    const h = await harness({
+      restreamer: {
+        switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'http://sw.example' }],
+        publicUrl: 'https://pub.example',
+      },
+    });
+    await seedM3uFixture(h);
+    const res = await h.app.inject({
+      method: 'GET',
+      url: '/playlists/tv.m3u',
+      headers: { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'tv.example' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('tvg-logo="https://pub.example/logos/zone1/imagecache/32736"');
   });
 
   it('omits url-tvg when the playlist has no epgUrl', async () => {
@@ -679,11 +1156,13 @@ describe('GET /playlists/:slug.m3u', () => {
     expect(res.body.split('\n')[0]).toBe('#EXTM3U');
   });
 
-  it('falls back to the first placement serveUrl for redundant channels without a switcher', async () => {
+  it('uses direct node serveUrls without a switcher (single and redundant alike)', async () => {
     const h = await harness({ restreamer: undefined });
     await seedM3uFixture(h);
     const res = await h.app.inject({ method: 'GET', url: '/playlists/tv.m3u' });
     expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('http://hls.zone1-n1/at-x/playlist.m3u8');
+    // redundant channel: first placement whose node has a serveUrl
     expect(res.body).toContain('http://hls.zone1-n1/bbb/playlist.m3u8');
     expect(res.body).not.toContain('sw.example');
   });
@@ -692,6 +1171,118 @@ describe('GET /playlists/:slug.m3u', () => {
     const h = await harness();
     const res = await h.app.inject({ method: 'GET', url: '/playlists/nope.m3u' });
     expect(res.statusCode).toBe(404);
+  });
+});
+
+// ---------- logo proxy ----------
+
+describe('GET /logos/:instanceId/imagecache/:iconId', () => {
+  const CACHE_CONTROL = 'public, max-age=2592000, immutable'; // 30 days, exact
+
+  it('200: streams the upstream body through with content-type, etag and Cache-Control', async () => {
+    const h = await harness();
+    h.tvhGetRaw.mockResolvedValueOnce(
+      new Response(Buffer.from('png-bytes'), {
+        status: 200,
+        headers: {
+          'content-type': 'image/png',
+          etag: '"icon-32736"',
+          'last-modified': 'Wed, 01 Jan 2025 00:00:00 GMT',
+        },
+      }),
+    );
+    const res = await h.app.inject({ method: 'GET', url: '/logos/zone1/imagecache/32736' });
+    expect(res.statusCode).toBe(200);
+    expect(h.tvhGetRaw).toHaveBeenCalledWith('/imagecache/32736', {});
+    expect(res.headers['content-type']).toBe('image/png');
+    expect(res.headers.etag).toBe('"icon-32736"');
+    expect(res.headers['last-modified']).toBe('Wed, 01 Jan 2025 00:00:00 GMT');
+    expect(res.headers['cache-control']).toBe(CACHE_CONTROL);
+    expect(res.body).toBe('png-bytes');
+  });
+
+  it('falls back to image/png when the upstream sends no content-type', async () => {
+    const h = await harness();
+    h.tvhGetRaw.mockResolvedValueOnce(
+      new Response(Buffer.from('bytes'), { status: 200, headers: {} }),
+    );
+    const res = await h.app.inject({ method: 'GET', url: '/logos/zone1/imagecache/1' });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['content-type']).toBe('image/png');
+  });
+
+  it('forwards If-None-Match upstream and passes a 304 through with validators', async () => {
+    const h = await harness();
+    h.tvhGetRaw.mockResolvedValueOnce(
+      new Response(null, { status: 304, headers: { etag: '"icon-32736"' } }),
+    );
+    const res = await h.app.inject({
+      method: 'GET',
+      url: '/logos/zone1/imagecache/32736',
+      headers: { 'if-none-match': '"icon-32736"' },
+    });
+    expect(h.tvhGetRaw).toHaveBeenCalledWith('/imagecache/32736', {
+      'if-none-match': '"icon-32736"',
+    });
+    expect(res.statusCode).toBe(304);
+    expect(res.headers.etag).toBe('"icon-32736"');
+    expect(res.headers['cache-control']).toBe(CACHE_CONTROL);
+  });
+
+  it('forwards If-Modified-Since upstream', async () => {
+    const h = await harness();
+    h.tvhGetRaw.mockResolvedValueOnce(new Response(null, { status: 304 }));
+    const res = await h.app.inject({
+      method: 'GET',
+      url: '/logos/zone1/imagecache/7',
+      headers: { 'if-modified-since': 'Wed, 01 Jan 2025 00:00:00 GMT' },
+    });
+    expect(h.tvhGetRaw).toHaveBeenCalledWith('/imagecache/7', {
+      'if-modified-since': 'Wed, 01 Jan 2025 00:00:00 GMT',
+    });
+    expect(res.statusCode).toBe(304);
+  });
+
+  it('404s non-numeric or traversal iconIds without contacting the upstream', async () => {
+    const h = await harness();
+    // (a raw `/1/../2` path is not testable here: the inject client normalizes
+    // dot segments before routing; on the wire it would simply not match the
+    // route, since a path param never spans `/`)
+    for (const url of [
+      '/logos/zone1/imagecache/abc',
+      '/logos/zone1/imagecache/1%2F..%2F2', // urlencoded traversal decodes into the param
+      '/logos/zone1/imagecache/..%2F..%2Fapi%2Fserverinfo',
+    ]) {
+      const res = await h.app.inject({ method: 'GET', url });
+      expect(res.statusCode, url).toBe(404);
+    }
+    expect(h.tvhGetRaw).not.toHaveBeenCalled();
+  });
+
+  it('404s an unknown instanceId without contacting the upstream', async () => {
+    const h = await harness();
+    const res = await h.app.inject({ method: 'GET', url: '/logos/ghost/imagecache/1' });
+    expect(res.statusCode).toBe(404);
+    expect(h.tvhGetRaw).not.toHaveBeenCalled();
+  });
+
+  it('maps upstream 404/401 to a plain 404 without the long-lived Cache-Control', async () => {
+    const h = await harness();
+    h.tvhGetRaw.mockResolvedValueOnce(new Response('missing', { status: 404 }));
+    const missing = await h.app.inject({ method: 'GET', url: '/logos/zone1/imagecache/9' });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.headers['cache-control']).toBeUndefined();
+
+    h.tvhGetRaw.mockResolvedValueOnce(new Response('unauthorized', { status: 401 }));
+    const denied = await h.app.inject({ method: 'GET', url: '/logos/zone1/imagecache/9' });
+    expect(denied.statusCode).toBe(404);
+  });
+
+  it('502s when the upstream fetch throws', async () => {
+    const h = await harness();
+    h.tvhGetRaw.mockRejectedValueOnce(new Error('fetch failed: ECONNREFUSED'));
+    const res = await h.app.inject({ method: 'GET', url: '/logos/zone1/imagecache/1' });
+    expect(res.statusCode).toBe(502);
   });
 });
 
@@ -718,6 +1309,7 @@ describe('restreamer nodes + overview-only mode', () => {
       cache,
       restreamer: null,
       restreamerClients: new Map(),
+      tvhHttp: new Map(),
     } as unknown as AppContext;
     const app = Fastify();
     registerRestreamerRoutes(app, ctx);

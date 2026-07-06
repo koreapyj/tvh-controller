@@ -23,7 +23,14 @@
 // subscription detection used by the Instance page. No Svelte imports —
 // everything here is node-testable.
 
-import type { AribHlsParams, RestreamProfile, SessionState, TvhSubscription } from '@tvhc/shared';
+import {
+  chanNumberOrder,
+  type AribHlsParams,
+  type RestreamChannel,
+  type RestreamProfile,
+  type SessionState,
+  type TvhSubscription,
+} from '@tvhc/shared';
 import type { FieldSpec } from './ruleFields.js';
 
 // ---------------------------------------------------------------------------
@@ -307,6 +314,23 @@ export function deriveSlug(name: string): string {
     .slice(0, 64)
     .replace(/-+$/, '');
   return slug || 'channel';
+}
+
+/**
+ * Channels-table order — the same rule the generated M3U playlist uses:
+ * numeric-aware channel number first (chanNumberOrder: "9.1" < "10" < "51";
+ * "9.1"/"9.10" tie by design — ordering only, identity stays exact string
+ * equality), channels without a number AFTER numbered ones
+ * (chanNumberOrder(null) = Infinity), name (localeCompare) as the tie-break.
+ */
+export function compareChannels(
+  a: Pick<RestreamChannel, 'channelName' | 'channelNumber'>,
+  b: Pick<RestreamChannel, 'channelName' | 'channelNumber'>,
+): number {
+  return (
+    chanNumberOrder(a.channelNumber) - chanNumberOrder(b.channelNumber) ||
+    a.channelName.localeCompare(b.channelName)
+  );
 }
 
 /** badge class per session state (existing badge palette) */

@@ -83,19 +83,31 @@ export class TvhClient {
     return sp.toString();
   }
 
-  async call<T>(path: string, params: Params = {}): Promise<T> {
+  /**
+   * Authenticated fetch with the Basic->Digest 401 negotiation shared by all
+   * verbs: try the cached digest session (else Basic), on a 401 with a digest
+   * challenge retry once with a fresh/updated session, and drop the session
+   * after a 401 that survived the retry (e.g. a stale nonce not flagged
+   * `stale`) so the next request renegotiates from Basic again. Returns the
+   * raw Response — status handling is the caller's job.
+   */
+  private async authedFetch(
+    method: string,
+    path: string,
+    init: { headers?: Record<string, string>; body?: string; contentType?: string } = {},
+  ): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
     const uri = new URL(url).pathname;
-    const body = this.encode(params);
     const doFetch = async (auth: string | null) => {
       try {
         return await this.fetchImpl(url, {
-          method: 'POST',
+          method,
           headers: {
-            'content-type': 'application/x-www-form-urlencoded',
+            ...(init.contentType ? { 'content-type': init.contentType } : {}),
+            ...(init.headers ?? {}),
             ...(auth ? { authorization: auth } : {}),
           },
-          body,
+          body: init.body,
           signal: AbortSignal.timeout(this.timeoutMs),
         });
       } catch (err) {
@@ -106,7 +118,7 @@ export class TvhClient {
       }
     };
 
-    let res = await doFetch(this.digest ? this.digest.authorize('POST', uri) : this.basic);
+    let res = await doFetch(this.digest ? this.digest.authorize(method, uri) : this.basic);
 
     if (res.status === 401 && this.basic) {
       const challengeHeader = res.headers.get('www-authenticate') ?? '';
@@ -114,19 +126,37 @@ export class TvhClient {
       if (challenge) {
         if (this.digest) this.digest.updateChallenge(challenge);
         else this.digest = new DigestSession(this.username, this.password, challenge);
-        res = await doFetch(this.digest.authorize('POST', uri));
+        res = await doFetch(this.digest.authorize(method, uri));
       }
     }
 
-    // a 401 that survived the digest retry means the session is bad (e.g. a
-    // stale nonce not flagged `stale`) — drop it so the next call renegotiates
+    // a 401 that survived the digest retry means the session is bad — drop it
+    // so the next call renegotiates
     if (res.status === 401) this.digest = null;
 
+    return res;
+  }
+
+  async call<T>(path: string, params: Params = {}): Promise<T> {
+    const res = await this.authedFetch('POST', path, {
+      contentType: 'application/x-www-form-urlencoded',
+      body: this.encode(params),
+    });
     if (!res.ok) {
       throw new TvhApiError(res.status, path, await res.text().catch(() => ''));
     }
     const text = await res.text();
     return (text === '' ? {} : JSON.parse(text)) as T;
+  }
+
+  /**
+   * Authenticated GET returning the raw Response (used by the logo proxy to
+   * pass tvheadend's /imagecache bytes, validators and 304s through). Never
+   * throws on HTTP status — the caller inspects it; network/timeout errors
+   * still throw.
+   */
+  getRaw(path: string, headers?: Record<string, string>): Promise<Response> {
+    return this.authedFetch('GET', path, { headers });
   }
 
   private async grid<T>(path: string, limit = 5000, extra: Params = {}): Promise<T[]> {

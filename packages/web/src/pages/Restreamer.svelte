@@ -28,7 +28,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { errText } from '../lib/fetchGuard.js';
   import { dateTime } from '../lib/format.js';
   import { notify } from '../lib/notifications.js';
-  import { CHANNEL_BATCH_FIELDS, sessionStateBadge, uptimeLabel } from '../lib/restreamFields.js';
+  import {
+    CHANNEL_BATCH_FIELDS,
+    compareChannels,
+    sessionStateBadge,
+    uptimeLabel,
+  } from '../lib/restreamFields.js';
   import {
     channelOptions,
     instName,
@@ -120,9 +125,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     (id: string) => playlists.find((p) => p.id === id)?.title ?? id,
   );
 
-  const orderedChannels = $derived(
-    [...channels].sort((a, b) => a.slug.localeCompare(b.slug)),
-  );
+  /** M3U playlist order: numeric channel number, null numbers last, then name */
+  const orderedChannels = $derived([...channels].sort(compareChannels));
 
   let selected: Record<string, boolean> = $state({});
   const selectedIds = $derived(orderedChannels.filter((c) => selected[c.id]).map((c) => c.id));
@@ -195,7 +199,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     if (c.placements.filter((p) => p.enabled).length < 2) return; // not redundant — nothing to switch
     if (c.activePlacementId === placementId) return;
     if (!confirm(`Switch "${c.slug}" to ${label}? Viewers see one discontinuity.`)) return;
-    void run(() => api.switchRestreamChannel(c.id, placementId));
+    void run(() => api.switchRestreamChannel(c.id, { placementId }));
+  }
+
+  /** undo manual switching: back to the highest-priority HEALTHY placement */
+  function resetSwitch(c: RestreamChannelWithStatus): void {
+    if (!confirm(`Reset "${c.slug}" to its highest-priority healthy placement? Viewers may see one discontinuity.`)) return;
+    void run(async () => {
+      const res = await api.switchRestreamChannel(c.id, { reset: true });
+      if (res.already) notify.info(`"${c.slug}" is already on its priority upstream`);
+      else notify.success(`"${c.slug}" reset to its priority upstream`);
+    });
   }
 
   function placementTitle(
@@ -508,13 +522,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           />
         </td>
         <td class="m-inline">
-          {#if c.channelNumber == null}
-            {@const n = lowestNumberFor(c.channelName, $channelOptions)}
-            {#if n !== null}
-              <span class="muted" title="not pinned — targets the lowest-numbered channel with this name">{n}　</span>
+          {#if c.sourceType === 'external'}
+            <span class="badge info" title="external source: {c.sourceKey}">ext</span>
+            {c.channelName}
+          {:else}
+            {#if c.channelNumber == null}
+              {@const n = lowestNumberFor(c.channelName, $channelOptions)}
+              {#if n !== null}
+                <span class="muted" title="not pinned — targets the lowest-numbered channel with this name">{n}　</span>
+              {/if}
             {/if}
+            {chanLabel(c.channelName, c.channelNumber)}
           {/if}
-          {chanLabel(c.channelName, c.channelNumber)}
           {#if c.comment}<div class="muted small">{c.comment}</div>{/if}
         </td>
         <td class="small m-inline">
@@ -555,6 +574,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             </button>
             {#if c.activePlacementId === p.id && c.placements.length > 1}
               <span class="badge ok" title="the switcher currently serves this placement">active</span>
+              <button
+                disabled={busy}
+                title="switch back to the highest-priority healthy placement"
+                onclick={() => resetSwitch(c)}
+              >
+                Reset
+              </button>
             {/if}
           {:else}
             <span class="muted small m-hide">no placements</span>

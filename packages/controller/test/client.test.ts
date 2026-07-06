@@ -123,6 +123,83 @@ describe('TvhClient auth: double-401 resets the digest session', () => {
   });
 });
 
+describe('TvhClient.getRaw', () => {
+  it('anonymous: GETs without any Authorization header and returns the raw Response', async () => {
+    const seen: Array<{ method?: string; auth: string | null }> = [];
+    const fetchImpl: FetchImpl = (async (_url, init) => {
+      seen.push({
+        method: init?.method,
+        auth: (init?.headers as Record<string, string> | undefined)?.authorization ?? null,
+      });
+      return new Response('png-bytes', { status: 200, headers: { 'content-type': 'image/png' } });
+    }) as unknown as FetchImpl;
+
+    const client = new TvhClient('http://tvh.local', undefined, undefined, fetchImpl);
+    const res = await client.getRaw('/imagecache/1');
+
+    expect(seen).toEqual([{ method: 'GET', auth: null }]);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
+    expect(await res.text()).toBe('png-bytes');
+  });
+
+  it('sends Basic auth when credentials are configured, without a content-type or body', async () => {
+    let captured: RequestInit | undefined;
+    const fetchImpl: FetchImpl = (async (_url, init) => {
+      captured = init as RequestInit;
+      return new Response('ok', { status: 200 });
+    }) as unknown as FetchImpl;
+
+    const client = new TvhClient('http://tvh.local', 'user', 'pass', fetchImpl);
+    await client.getRaw('/imagecache/1');
+
+    const headers = captured?.headers as Record<string, string>;
+    expect(headers.authorization).toBe(
+      `Basic ${Buffer.from('user:pass').toString('base64')}`,
+    );
+    expect(headers['content-type']).toBeUndefined();
+    expect(captured?.body).toBeUndefined();
+  });
+
+  it('retries a 401 digest challenge with method GET in the digest computation', async () => {
+    const authHeaders: (string | null)[] = [];
+    const fetchImpl: FetchImpl = (async (_url, init) => {
+      const auth = (init?.headers as Record<string, string> | undefined)?.authorization ?? null;
+      authHeaders.push(auth);
+      if (!auth || auth.startsWith('Basic')) {
+        return new Response('unauthorized', {
+          status: 401,
+          headers: { 'www-authenticate': 'Digest realm="tvheadend", qop="auth", nonce="n1"' },
+        });
+      }
+      return new Response('png-bytes', { status: 200 });
+    }) as unknown as FetchImpl;
+
+    const client = new TvhClient('http://tvh.local', 'user', 'pass', fetchImpl);
+    const res = await client.getRaw('/imagecache/32736');
+
+    expect(res.status).toBe(200);
+    expect(authHeaders).toHaveLength(2);
+    expect(authHeaders[0]).toMatch(/^Basic /);
+    expect(authHeaders[1]).toMatch(/^Digest /);
+    expect(authHeaders[1]).toContain('uri="/imagecache/32736"');
+  });
+
+  it('passes extra request headers through and never throws on an error status', async () => {
+    let captured: Record<string, string> | undefined;
+    const fetchImpl: FetchImpl = (async (_url, init) => {
+      captured = init?.headers as Record<string, string>;
+      return new Response('nope', { status: 404 });
+    }) as unknown as FetchImpl;
+
+    const client = new TvhClient('http://tvh.local', undefined, undefined, fetchImpl);
+    const res = await client.getRaw('/imagecache/9', { 'if-none-match': '"abc"' });
+
+    expect(captured?.['if-none-match']).toBe('"abc"');
+    expect(res.status).toBe(404); // caller inspects; no TvhApiError
+  });
+});
+
 describe('TvhClient timeout', () => {
   it('maps an aborted request to a "timed out after" error', async () => {
     const fetchImpl: FetchImpl = (async (_url, init) => {

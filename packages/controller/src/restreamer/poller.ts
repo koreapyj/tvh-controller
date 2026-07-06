@@ -17,7 +17,7 @@
  */
 
 import { RESTREAMER_API_VERSION } from '@tvhc/shared';
-import type { RestreamerNodeStatus, SwitcherNodeStatus } from '@tvhc/shared';
+import type { RestreamerNodeStatus, SourceCatalogEntry, SwitcherNodeStatus } from '@tvhc/shared';
 import type { RestreamerNodeConfig, SwitcherConfig } from '../config.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
@@ -55,6 +55,12 @@ export interface RestreamerPollerHooks {
     nodeId: string,
     seenRevision: string | null,
   ) => void | Promise<void>;
+  /**
+   * Fired (not awaited, errors swallowed) when the node's sources-catalog
+   * hash actually changed — after a successful `/v1/sources` re-fetch or when
+   * a catalog disappeared. B2 wires this to a debounced push.
+   */
+  onSourcesChanged?: (instanceId: string, nodeId: string) => void | Promise<void>;
 }
 
 /** switcher-side twin of RestreamerPollerHooks, keyed by switcherId */
@@ -80,11 +86,15 @@ export class RestreamerPoller {
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
   private lastStatusKey = '';
+  /** last-known sources catalog; null = never fetched, [] = known-empty */
+  private lastSources: SourceCatalogEntry[] | null = null;
+  /** fingerprint matching lastSources; null = no catalog / unknown */
+  private lastSourcesHash: string | null = null;
 
   constructor(
     private readonly instanceId: string,
     private readonly node: RestreamerNodeConfig,
-    private readonly client: Pick<RestreamerClient, 'status'>,
+    private readonly client: Pick<RestreamerClient, 'status' | 'sources'>,
     private readonly cache: InstanceCache,
     private readonly bus: EventBus,
     private readonly intervalMs: number,
@@ -117,6 +127,9 @@ export class RestreamerPoller {
     let status: RestreamerNodeStatus;
     try {
       const res = await this.client.status();
+      // absent (old daemon) and null (no sourcesM3u configured) mean the same
+      // thing to the controller: this node has no catalog
+      await this.updateSources(res.sourcesHash ?? null);
       status = {
         instanceId: this.instanceId,
         nodeId: this.node.id,
@@ -131,6 +144,8 @@ export class RestreamerPoller {
         desiredRevision: res.desiredRevision,
         pendingPush,
         sessions: res.sessions,
+        sourcesHash: this.lastSourcesHash,
+        sources: this.lastSources,
       };
       await this.checkRevision(res.desiredRevision);
     } catch (err) {
@@ -149,6 +164,9 @@ export class RestreamerPoller {
         desiredRevision: null,
         pendingPush,
         sessions: [],
+        // last-known catalog carried across unreachable polls (like topology)
+        sourcesHash: this.lastSourcesHash,
+        sources: this.lastSources,
       };
     }
 
@@ -169,6 +187,42 @@ export class RestreamerPoller {
       return (await this.hooks.getPendingPush?.(this.instanceId, this.node.id)) ?? false;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Track the node's sources catalog from the status fingerprint. A string
+   * hash differing from the last-known one triggers ONE `/v1/sources`
+   * re-fetch (a fetch failure keeps the last-known catalog; the unchanged
+   * lastSourcesHash retries on the next tick). A null hash = known-no-catalog
+   * (no `sourcesM3u` configured / old daemon) → sources become known-empty.
+   */
+  private async updateSources(reportedHash: string | null): Promise<void> {
+    const prevHash = this.lastSourcesHash;
+    if (typeof reportedHash === 'string') {
+      if (reportedHash !== this.lastSourcesHash) {
+        try {
+          const res = await this.client.sources();
+          this.lastSources = res.entries;
+          this.lastSourcesHash = reportedHash;
+        } catch (err) {
+          console.error(
+            `restreamer ${this.instanceId}/${this.node.id}: sources fetch failed, keeping last-known catalog:`,
+            err,
+          );
+        }
+      }
+    } else {
+      this.lastSources = [];
+      this.lastSourcesHash = null;
+    }
+    if (this.lastSourcesHash === prevHash || !this.hooks.onSourcesChanged) return;
+    try {
+      void Promise.resolve(this.hooks.onSourcesChanged(this.instanceId, this.node.id)).catch(
+        () => {},
+      );
+    } catch {
+      // fire-and-forget: a failing push trigger must not fail the poll
     }
   }
 

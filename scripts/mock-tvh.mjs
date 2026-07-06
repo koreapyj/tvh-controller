@@ -194,11 +194,32 @@ const dynamic = {
   },
 };
 
+// 1x1 transparent PNG served for every /imagecache/<n> — exercises the
+// controller's authenticated logo proxy passthrough (content-type + ETag)
+const ICON_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
+
 createServer((req, res) => {
   const path = req.url.split('?')[0];
   let chunks = '';
   req.on('data', (c) => (chunks += c));
   req.on('end', () => {
+    const icon = /^\/imagecache\/(\d+)$/.exec(path);
+    if (icon) {
+      const etag = `"mock-icon-${icon[1]}"`;
+      if (req.headers['if-none-match'] === etag) {
+        console.log(`[mock-tvh:${port}] 304 ${path}`);
+        res.writeHead(304, { etag });
+        res.end();
+        return;
+      }
+      console.log(`[mock-tvh:${port}] 200 ${path}`);
+      res.writeHead(200, { 'content-type': 'image/png', etag });
+      res.end(ICON_PNG);
+      return;
+    }
     const dyn = dynamic[path];
     if (dyn) {
       console.log(`[mock-tvh:${port}] 200 ${path} (dynamic)`);

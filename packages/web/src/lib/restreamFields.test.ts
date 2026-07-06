@@ -25,6 +25,7 @@ import {
   AUDIO_ENTRY_FIELDS,
   buildProfilePayload,
   CHANNEL_BATCH_FIELDS,
+  compareChannels,
   defaultProfilePayload,
   deriveSlug,
   emptyAudioRow,
@@ -233,6 +234,53 @@ describe('deriveSlug (mirror of the controller derivation)', () => {
       expect(SLUG_PATTERN.test(deriveSlug(name)), JSON.stringify(name)).toBe(true);
     }
     expect(deriveSlug('')).toBe('channel');
+  });
+});
+
+describe('compareChannels', () => {
+  const ch = (channelName: string, channelNumber: string | null) => ({
+    channelName,
+    channelNumber,
+  });
+
+  it('orders numerically, not lexicographically ("9.1" < "10" < "51")', () => {
+    expect(compareChannels(ch('a', '9.1'), ch('b', '10'))).toBeLessThan(0);
+    expect(compareChannels(ch('a', '10'), ch('b', '51'))).toBeLessThan(0);
+    expect(compareChannels(ch('a', '51'), ch('b', '9.1'))).toBeGreaterThan(0);
+  });
+
+  it('puts channels without a number AFTER numbered ones', () => {
+    expect(compareChannels(ch('a', null), ch('b', '999'))).toBeGreaterThan(0);
+    expect(compareChannels(ch('a', '999'), ch('b', null))).toBeLessThan(0);
+  });
+
+  it('tie-breaks equal numbers by name (localeCompare)', () => {
+    expect(compareChannels(ch('ABC', '9'), ch('XYZ', '9'))).toBeLessThan(0);
+    expect(compareChannels(ch('XYZ', '9'), ch('ABC', '9'))).toBeGreaterThan(0);
+  });
+
+  it('tie-breaks two number-less channels by name', () => {
+    expect(compareChannels(ch('ABC', null), ch('XYZ', null))).toBeLessThan(0);
+    expect(compareChannels(ch('ABC', null), ch('ABC', null))).toBe(0);
+  });
+
+  it('sorts a channel list into playlist order', () => {
+    const sorted = [
+      ch('ext one', null),
+      ch('SubTen', '9.10'),
+      ch('Fifty-one', '51'),
+      ch('SubOne', '9.1'),
+      ch('Ten', '10'),
+      ch('another ext', null),
+    ].sort(compareChannels);
+    expect(sorted.map((c) => c.channelName)).toEqual([
+      'SubOne',
+      'SubTen', // "9.10" ties "9.1" numerically (ordering only) — name breaks it
+      'Ten',
+      'Fifty-one',
+      'another ext',
+      'ext one',
+    ]);
   });
 });
 

@@ -5,7 +5,12 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { SseEvent, StatusResponse, SwitcherStatus } from '@tvhc/shared';
+import type {
+  SourcesResponse,
+  SseEvent,
+  StatusResponse,
+  SwitcherStatus,
+} from '@tvhc/shared';
 import { EventBus } from '../src/state/events.js';
 import { InstanceCache } from '../src/state/instanceCache.js';
 import { RestreamerPoller, SwitcherPoller } from '../src/restreamer/poller.js';
@@ -39,6 +44,10 @@ function switcherStatus(overrides: Partial<SwitcherStatus> = {}): SwitcherStatus
   };
 }
 
+function catalog(hash: string, entries: SourcesResponse['entries'] = []): SourcesResponse {
+  return { apiVersion: 1, catalogHash: hash, updatedAt: '2026-07-06T00:00:00Z', entries };
+}
+
 function setup(hooks = {}) {
   const cache = new InstanceCache();
   cache.init('i1', 'Instance 1', 'http://tvh1');
@@ -46,8 +55,9 @@ function setup(hooks = {}) {
   const events: SseEvent[] = [];
   bus.subscribe((e) => events.push(e));
   const status = vi.fn<() => Promise<StatusResponse>>();
-  const poller = new RestreamerPoller('i1', NODE, { status }, cache, bus, 15_000, hooks);
-  return { cache, bus, events, status, poller };
+  const sources = vi.fn<() => Promise<SourcesResponse>>();
+  const poller = new RestreamerPoller('i1', NODE, { status, sources }, cache, bus, 15_000, hooks);
+  return { cache, bus, events, status, sources, poller };
 }
 
 afterEach(() => {
@@ -213,6 +223,160 @@ describe('RestreamerPoller', () => {
       status.mockResolvedValue(nodeStatus({ desiredRevision: 'rev-1' }));
       await expect(poller.pollOnce()).resolves.toBeUndefined();
       expect(onRevisionMismatch).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('sources catalog', () => {
+    const ENTRY = { id: 'louise-1', name: 'Louise', url: 'https://louise.example/stream?id=1' };
+
+    it('absent sourcesHash (old daemon) -> known-empty catalog, no sources fetch', async () => {
+      const { cache, status, sources, poller } = setup();
+      status.mockResolvedValue(nodeStatus()); // no sourcesHash field at all
+      await poller.pollOnce();
+      expect(sources).not.toHaveBeenCalled();
+      expect(cache.get('i1').restreamers[0]).toMatchObject({ sourcesHash: null, sources: [] });
+    });
+
+    it('null sourcesHash (no sourcesM3u configured) -> known-empty catalog, no fetch', async () => {
+      const { cache, status, sources, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sourcesHash: null }));
+      await poller.pollOnce();
+      expect(sources).not.toHaveBeenCalled();
+      expect(cache.get('i1').restreamers[0]).toMatchObject({ sourcesHash: null, sources: [] });
+    });
+
+    it('a string hash triggers ONE sources fetch; an unchanged hash does not re-fetch', async () => {
+      const { cache, status, sources, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h1' }));
+      sources.mockResolvedValue(catalog('h1', [ENTRY]));
+
+      await poller.pollOnce();
+      await poller.pollOnce();
+
+      expect(sources).toHaveBeenCalledTimes(1);
+      expect(cache.get('i1').restreamers[0]).toMatchObject({
+        sourcesHash: 'h1',
+        sources: [ENTRY],
+      });
+    });
+
+    it('a changed hash re-fetches and replaces the catalog', async () => {
+      const { cache, status, sources, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h1' }));
+      sources.mockResolvedValue(catalog('h1', [ENTRY]));
+      await poller.pollOnce();
+
+      const entry2 = { id: 'nhk-g', name: 'NHK G', url: 'https://other.example/s2', chno: '9.1' };
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h2' }));
+      sources.mockResolvedValue(catalog('h2', [entry2]));
+      await poller.pollOnce();
+
+      expect(sources).toHaveBeenCalledTimes(2);
+      expect(cache.get('i1').restreamers[0]).toMatchObject({
+        sourcesHash: 'h2',
+        sources: [entry2],
+      });
+    });
+
+    it('a failed sources fetch keeps the last-known catalog and retries next tick', async () => {
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { cache, status, sources, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h1' }));
+      sources.mockResolvedValue(catalog('h1', [ENTRY]));
+      await poller.pollOnce();
+
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h2' }));
+      sources.mockRejectedValue(new Error('sources down'));
+      await poller.pollOnce();
+      // last-known kept, hash NOT advanced (so the next tick retries)
+      expect(cache.get('i1').restreamers[0]).toMatchObject({
+        reachable: true,
+        sourcesHash: 'h1',
+        sources: [ENTRY],
+      });
+      expect(err).toHaveBeenCalled();
+
+      sources.mockResolvedValue(catalog('h2', []));
+      await poller.pollOnce();
+      expect(sources).toHaveBeenCalledTimes(3);
+      expect(cache.get('i1').restreamers[0]).toMatchObject({ sourcesHash: 'h2', sources: [] });
+      err.mockRestore();
+    });
+
+    it('a first-ever fetch failure leaves sources null (never fetched)', async () => {
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { cache, status, sources, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h1' }));
+      sources.mockRejectedValue(new Error('sources down'));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]).toMatchObject({ sourcesHash: null, sources: null });
+      err.mockRestore();
+    });
+
+    it('an unreachable tick carries the last-known catalog forward', async () => {
+      const { cache, status, sources, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h1' }));
+      sources.mockResolvedValue(catalog('h1', [ENTRY]));
+      await poller.pollOnce();
+
+      status.mockRejectedValue(new Error('ECONNREFUSED'));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]).toMatchObject({
+        reachable: false,
+        sourcesHash: 'h1',
+        sources: [ENTRY],
+      });
+    });
+
+    it('a catalog change publishes an SSE event; an unchanged catalog does not', async () => {
+      const { events, status, sources, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h1' }));
+      sources.mockResolvedValue(catalog('h1', [ENTRY]));
+      await poller.pollOnce();
+      await poller.pollOnce();
+      expect(events).toHaveLength(1);
+
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h2' }));
+      sources.mockResolvedValue(catalog('h2', []));
+      await poller.pollOnce();
+      expect(events).toHaveLength(2);
+    });
+
+    it('onSourcesChanged fires only when the hash actually changed, and a rejecting hook is swallowed', async () => {
+      const onSourcesChanged = vi.fn(() => Promise.reject(new Error('push failed')));
+      const { status, sources, poller } = setup({ onSourcesChanged });
+
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h1' }));
+      sources.mockResolvedValue(catalog('h1', [ENTRY]));
+      await poller.pollOnce();
+      expect(onSourcesChanged).toHaveBeenCalledTimes(1);
+      expect(onSourcesChanged).toHaveBeenCalledWith('i1', 'n1');
+
+      await poller.pollOnce(); // unchanged hash
+      expect(onSourcesChanged).toHaveBeenCalledTimes(1);
+
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h2' }));
+      sources.mockResolvedValue(catalog('h2', []));
+      await poller.pollOnce();
+      expect(onSourcesChanged).toHaveBeenCalledTimes(2);
+
+      // catalog removed (hash string -> null) is also a change
+      status.mockResolvedValue(nodeStatus({ sourcesHash: null }));
+      await poller.pollOnce();
+      expect(onSourcesChanged).toHaveBeenCalledTimes(3);
+      await poller.pollOnce();
+      expect(onSourcesChanged).toHaveBeenCalledTimes(3);
+    });
+
+    it('does not fire onSourcesChanged when the fetch failed (hash not advanced)', async () => {
+      const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const onSourcesChanged = vi.fn();
+      const { status, sources, poller } = setup({ onSourcesChanged });
+      status.mockResolvedValue(nodeStatus({ sourcesHash: 'h1' }));
+      sources.mockRejectedValue(new Error('sources down'));
+      await poller.pollOnce();
+      expect(onSourcesChanged).not.toHaveBeenCalled();
+      err.mockRestore();
     });
   });
 

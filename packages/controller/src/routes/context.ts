@@ -24,6 +24,7 @@ import type { RestreamerService } from '../restreamer/service.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { SyncEngine } from '../sync/engine.js';
+import type { TvhClient } from '../tvh/client.js';
 import type { InstancePoller } from '../tvh/poller.js';
 import type { UploadDispatcher } from '../uploads/dispatcher.js';
 import type { UploadLedger } from '../uploads/ledger.js';
@@ -36,6 +37,8 @@ export interface AppContext {
   cache: InstanceCache;
   bus: EventBus;
   pollers: Map<string, InstancePoller>;
+  /** one authenticated HTTP client per configured tvheadend instance (logo proxy) */
+  tvhHttp: Map<string, TvhClient>;
   sync: SyncEngine | null;
   ledger: UploadLedger | null;
   dispatcher: UploadDispatcher | null;

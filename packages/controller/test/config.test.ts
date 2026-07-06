@@ -165,6 +165,38 @@ restreamer:
     expect(cfg.restreamer?.switchers).toEqual([
       { id: 'main', url: 'http://switcher.internal:5581', publicUrl: 'https://tv.example.com' },
     ]);
+    // switchers-only block: no controller publicUrl
+    expect(cfg.restreamer?.publicUrl).toBeUndefined();
+  });
+
+  it('parses restreamer.publicUrl (trailing slash trimmed) alongside switchers', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+restreamer:
+  publicUrl: https://ctrl.example.com/
+  switchers:
+    - id: main
+      url: http://switcher.internal:5581
+      publicUrl: https://tv.example.com
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.restreamer?.publicUrl).toBe('https://ctrl.example.com');
+    expect(cfg.restreamer?.switchers).toHaveLength(1);
+  });
+
+  it('accepts a restreamer block with only publicUrl (no switchers)', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+restreamer:
+  publicUrl: https://ctrl.example.com
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.restreamer?.publicUrl).toBe('https://ctrl.example.com');
+    expect(cfg.restreamer?.switchers).toEqual([]);
   });
 
   it('leaves restreamer undefined when the blocks are absent', () => {

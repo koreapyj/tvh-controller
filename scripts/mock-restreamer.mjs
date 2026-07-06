@@ -20,10 +20,13 @@
 // without real nodes.
 //   node scripts/mock-restreamer.mjs --port 15801 [--name node1]
 //
-// Contract endpoints: GET /v1/status, GET/PUT /v1/desired,
+// Contract endpoints: GET /v1/status, GET/PUT /v1/desired, GET /v1/sources,
 // POST /v1/sessions/:name/restart, GET /v1/sessions/:name/log?lines=N,
 // GET /v1/healthz. Desired state is kept in memory only; every enabled
-// session of the last accepted doc reports state 'running'.
+// session of the last accepted doc reports state 'running'. The sources
+// catalog (external {url} sources) is in-memory too: null = no sourcesM3u
+// configured (status sourcesHash null); mutate it via the test hook
+//   POST /__sources   body {"entries":[{id,name,url,logo?,chno?},…]} | null
 //
 // It also serves fake-but-ADVANCING HLS playlists at the paths a real node's
 // nginx would (any slug works, no desired doc required; segment URIs 404 by
@@ -57,6 +60,13 @@ const SESSION_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
 let desired = null;
 /** while set, playlists stop advancing (frozen wall clock for HLS output) */
 let frozenAtMs = null;
+/** sources.m3u catalog entries; null = no sourcesM3u configured */
+let sources = null;
+/** ISO 8601 of the last catalog mutation; null while no catalog */
+let sourcesUpdatedAt = null;
+
+const sourcesHash = () =>
+  sources === null ? null : createHash('sha256').update(JSON.stringify(sources)).digest('hex').slice(0, 16);
 
 const nowMs = () => frozenAtMs ?? Date.now();
 const configHash = (session) => createHash('sha256').update(JSON.stringify(session)).digest('hex').slice(0, 16);
@@ -70,7 +80,14 @@ function validateDesired(doc) {
     if (typeof s !== 'object' || s === null) return 'sessions[] must be objects';
     if (typeof s.name !== 'string' || !SESSION_NAME.test(s.name)) return `invalid session name ${JSON.stringify(s.name)}`;
     if (typeof s.source !== 'object' || s.source === null) return `session "${s.name}": source is required`;
-    if (typeof s.tsreadex !== 'object' || s.tsreadex === null || !Number.isInteger(s.tsreadex.programNumber) || s.tsreadex.programNumber < 0) {
+    if (typeof s.source.channelUuid !== 'string' && typeof s.source.url !== 'string') {
+      return `session "${s.name}": source must carry channelUuid or url`;
+    }
+    if (typeof s.tsreadex !== 'object' || s.tsreadex === null) {
+      return `session "${s.name}": tsreadex is required`;
+    }
+    // absent = the daemon PAT-probes; present must be a non-negative integer
+    if (s.tsreadex.programNumber !== undefined && (!Number.isInteger(s.tsreadex.programNumber) || s.tsreadex.programNumber < 0)) {
       return `session "${s.name}": tsreadex.programNumber must be a non-negative integer`;
     }
     if (typeof s.pipeline !== 'object' || s.pipeline === null || typeof s.pipeline.template !== 'string') {
@@ -179,7 +196,17 @@ createServer((req, res) => {
         capabilities: ['qsv'],
         templates: [{ id: 'arib-hls', version: 1 }],
         desiredRevision: desired?.revision ?? null,
+        sourcesHash: sourcesHash(),
         sessions: sessionStatuses(),
+      });
+    }
+    if (path === '/v1/sources' && req.method === 'GET') {
+      log(200);
+      return send(res, 200, {
+        apiVersion: 1,
+        catalogHash: sourcesHash(),
+        updatedAt: sourcesUpdatedAt,
+        entries: sources ?? [],
       });
     }
     if (path === '/v1/desired' && req.method === 'GET') {
@@ -220,6 +247,26 @@ createServer((req, res) => {
     if (path === '/__unfreeze' && req.method === 'POST') {
       frozenAtMs = null;
       return log(200, 'playlists advancing'), send(res, 200, { frozen: false });
+    }
+    if (path === '/__sources' && req.method === 'POST') {
+      let body;
+      try {
+        body = chunks ? JSON.parse(chunks) : null;
+      } catch {
+        return log(400, 'bad json'), send(res, 400, { error: 'invalid JSON' });
+      }
+      const entries = body === null ? null : (body.entries ?? null);
+      if (entries !== null) {
+        if (!Array.isArray(entries)) return log(400), send(res, 400, { error: 'entries must be an array or null' });
+        for (const e of entries) {
+          if (typeof e?.id !== 'string' || typeof e?.name !== 'string' || typeof e?.url !== 'string') {
+            return log(400), send(res, 400, { error: 'entries[] need string id, name and url' });
+          }
+        }
+      }
+      sources = entries;
+      sourcesUpdatedAt = entries === null ? null : new Date().toISOString();
+      return log(200, `catalog=${entries === null ? 'none' : `${entries.length} entries`}`), send(res, 200, { catalogHash: sourcesHash() });
     }
 
     // ---- fake HLS at the nginx-served paths ----

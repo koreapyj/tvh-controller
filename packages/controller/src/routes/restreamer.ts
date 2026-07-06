@@ -21,6 +21,7 @@ import { chanNumberOrder } from '@tvhc/shared';
 import type { RestreamChannelWithStatus } from '@tvhc/shared';
 import type { AppConfig } from '../config.js';
 import {
+  AvailabilityError,
   nodeKey,
   resolveTvhChannel,
   type ChannelBatchAction,
@@ -93,7 +94,16 @@ function parsePlacementInput(raw: unknown): PlacementInput {
     }
     input.programNumber = p.programNumber;
   }
+  if (p.force !== undefined) input.force = !!p.force;
   return input;
+}
+
+/** 'tvh' | 'external', 400 on anything else */
+function parseSourceType(v: unknown, field: string): 'tvh' | 'external' {
+  if (v !== 'tvh' && v !== 'external') {
+    throw httpError(400, `${field} must be "tvh" or "external"`);
+  }
+  return v;
 }
 
 function parseChannelPatch(raw: unknown): ChannelPatch {
@@ -101,13 +111,34 @@ function parseChannelPatch(raw: unknown): ChannelPatch {
   const patch: ChannelPatch = {};
   if (b.channelName !== undefined) patch.channelName = requireString(b.channelName, 'channelName');
   if (b.channelNumber !== undefined) patch.channelNumber = parseChannelNumber(b.channelNumber, 'channelNumber');
+  if (b.sourceType !== undefined) patch.sourceType = parseSourceType(b.sourceType, 'sourceType');
+  if (b.sourceKey !== undefined) {
+    patch.sourceKey = b.sourceKey == null ? null : requireString(b.sourceKey, 'sourceKey');
+  }
   if (b.profileId !== undefined) patch.profileId = requireString(b.profileId, 'profileId');
   if (b.slug !== undefined) patch.slug = requireString(b.slug, 'slug');
   if (b.enabled !== undefined) patch.enabled = !!b.enabled;
   if (b.comment !== undefined) patch.comment = b.comment == null ? null : String(b.comment);
   const playlistIds = optionalStringArray(b.playlistIds, 'playlistIds');
   if (playlistIds !== undefined) patch.playlistIds = playlistIds;
+  if (b.force !== undefined) patch.force = !!b.force;
   return patch;
+}
+
+/**
+ * Availability rejections carry the per-node detail the UI renders — Fastify's
+ * default error shape would drop `unavailable`, so mutating handlers send it
+ * explicitly.
+ */
+async function withAvailability<T>(reply: FastifyReply, fn: () => Promise<T>): Promise<T | FastifyReply> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof AvailabilityError) {
+      return reply.code(409).send({ error: err.message, unavailable: err.unavailable });
+    }
+    throw err;
+  }
 }
 
 /** node/session passthrough failures: node-side 4xx keeps its status, everything else is a 502 */
@@ -131,18 +162,14 @@ function nodeServeUrl(config: AppConfig, instanceId: string, nodeId: string): st
 }
 
 /**
- * Viewer-facing entry URL (mirrors the plan's playlist URL rule): one enabled
- * placement → straight at that node's serveUrl; several (redundant channel) →
- * the first configured switcher's publicUrl, falling back to the first
- * placement whose node has a serveUrl when no switcher is configured.
+ * Viewer-facing entry URL: with a switcher configured EVERY channel with ≥1
+ * enabled placement points at the first switcher's publicUrl (uniform viewer
+ * URLs — adding a second placement later never changes the entry). Without a
+ * switcher: direct at the first enabled placement whose node has a serveUrl.
  */
 function entryUrl(config: AppConfig, channel: RestreamChannelWithStatus): string | null {
   const enabled = channel.placements.filter((p) => p.enabled);
   if (enabled.length === 0) return null;
-  if (enabled.length === 1) {
-    const serveUrl = nodeServeUrl(config, enabled[0]!.instanceId, enabled[0]!.nodeId);
-    return serveUrl ? `${serveUrl}/${channel.slug}/playlist.m3u8` : null;
-  }
   const sw = config.restreamer?.switchers[0];
   if (sw) return `${sw.publicUrl}/hls/${channel.slug}/playlist.m3u8`;
   for (const p of enabled) {
@@ -152,10 +179,39 @@ function entryUrl(config: AppConfig, channel: RestreamChannelWithStatus): string
   return null;
 }
 
-/** `imagecache/32736`-style icon paths become absolute against the instance url */
-function absolutizeIcon(icon: string, instanceUrl: string): string {
+/** first value of a possibly comma-joined / repeated forwarded header */
+function firstForwarded(value: string | string[] | undefined): string | null {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const first = raw?.split(',')[0]?.trim();
+  return first ? first : null;
+}
+
+/**
+ * Viewer-facing base URL for controller-hosted links (the logo proxy):
+ * `restreamer.publicUrl` from the config when set, else the reverse proxy's
+ * X-Forwarded-Proto/Host (first value each), else the request itself.
+ */
+export function publicBaseUrl(
+  req: Pick<FastifyRequest, 'protocol' | 'headers'>,
+  config: AppConfig,
+): string {
+  if (config.restreamer?.publicUrl) return config.restreamer.publicUrl;
+  const proto = firstForwarded(req.headers['x-forwarded-proto']) ?? req.protocol;
+  const host = firstForwarded(req.headers['x-forwarded-host']) ?? req.headers.host ?? 'localhost';
+  return `${proto}://${host}`;
+}
+
+/**
+ * tvg-logo URL rule: absolute icon URLs pass through verbatim; tvheadend's
+ * relative `imagecache/N` paths are rewritten to the controller's
+ * authenticated logo proxy (internal instance URLs are not publicly
+ * reachable). Any other relative shape cannot be proxied safely — only the
+ * imagecache namespace is exposed — so the logo is omitted.
+ */
+function proxiedLogoUrl(icon: string, instanceId: string, baseUrl: string): string | null {
   if (/^https?:\/\//i.test(icon)) return icon;
-  return `${instanceUrl.replace(/\/+$/, '')}/${icon.replace(/^\/+/, '')}`;
+  const m = /^\/?imagecache\/(\d+)$/.exec(icon);
+  return m ? `${baseUrl}/logos/${instanceId}/imagecache/${m[1]}` : null;
 }
 
 interface EntryIdentity {
@@ -169,22 +225,41 @@ interface EntryIdentity {
  * against a live topology — first enabled placement (priority order) whose
  * instance resolves wins. Same (name, exact-string number | pin-lowest)
  * identity rules as the desired-doc computation.
+ *
+ * External channels resolve against the first enabled placement whose node's
+ * cached sources catalog has the entry: tvg-id = the sourceKey, tvg-chno =
+ * the catalog `chno`, tvg-logo = the catalog `logo` VERBATIM (external logos
+ * are already public URLs — never routed through the controller proxy).
  */
-function resolveEntryIdentity(ctx: AppContext, channel: RestreamChannelWithStatus): EntryIdentity {
+function resolveEntryIdentity(
+  ctx: AppContext,
+  channel: RestreamChannelWithStatus,
+  baseUrl: string,
+): EntryIdentity {
+  if (channel.sourceType === 'external') {
+    for (const p of channel.placements) {
+      if (!p.enabled || !ctx.cache.has(p.instanceId)) continue;
+      const sources = ctx.cache
+        .get(p.instanceId)
+        .restreamers.find((r) => r.nodeId === p.nodeId)?.sources;
+      const entry = sources?.find((e) => e.id === channel.sourceKey);
+      if (entry) {
+        return { uuid: channel.sourceKey, number: entry.chno ?? null, logo: entry.logo ?? null };
+      }
+    }
+    return { uuid: channel.sourceKey, number: null, logo: null };
+  }
   for (const p of channel.placements) {
     if (!p.enabled || !ctx.cache.has(p.instanceId)) continue;
     const topo = ctx.cache.get(p.instanceId).topology;
     if (!topo) continue;
     const resolved = resolveTvhChannel(topo.channels, channel.channelName, channel.channelNumber);
     if (!resolved) continue;
-    const instanceUrl =
-      ctx.config.instances.find((i) => i.id === p.instanceId)?.url ??
-      ctx.cache.get(p.instanceId).summary.url;
     const icon = resolved.iconPublicUrl ?? resolved.icon_public_url ?? null;
     return {
       uuid: resolved.uuid,
       number: channel.channelNumber ?? resolved.number ?? null,
-      logo: icon ? absolutizeIcon(icon, instanceUrl) : null,
+      logo: icon ? proxiedLogoUrl(icon, p.instanceId, baseUrl) : null,
     };
   }
   return { uuid: null, number: channel.channelNumber, logo: null };
@@ -195,7 +270,7 @@ function resolveEntryIdentity(ctx: AppContext, channel: RestreamChannelWithStatu
  * format: members that are enabled and currently RUNNING on at least one
  * enabled placement's node, sorted by chanNumberOrder.
  */
-async function renderPlaylistM3u(ctx: AppContext, slug: string): Promise<string> {
+async function renderPlaylistM3u(ctx: AppContext, slug: string, baseUrl: string): Promise<string> {
   const service = requireDb(ctx.restreamer, 'restream playlists');
   const playlist = (await service.listPlaylists()).find((p) => p.slug === slug);
   if (!playlist) throw httpError(404, `playlist "${slug}" not found`);
@@ -208,7 +283,7 @@ async function renderPlaylistM3u(ctx: AppContext, slug: string): Promise<string>
   );
 
   const entries = members
-    .map((channel) => ({ channel, url: entryUrl(ctx.config, channel), identity: resolveEntryIdentity(ctx, channel) }))
+    .map((channel) => ({ channel, url: entryUrl(ctx.config, channel), identity: resolveEntryIdentity(ctx, channel, baseUrl) }))
     .filter((e): e is typeof e & { url: string } => e.url !== null);
   entries.sort(
     (a, b) =>
@@ -326,6 +401,10 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
       profileId: requireString(b.profileId, 'profileId'),
     };
     if (b.channelNumber !== undefined) input.channelNumber = parseChannelNumber(b.channelNumber, 'channelNumber');
+    if (b.sourceType !== undefined) input.sourceType = parseSourceType(b.sourceType, 'sourceType');
+    if (b.sourceKey !== undefined) {
+      input.sourceKey = b.sourceKey == null ? null : requireString(b.sourceKey, 'sourceKey');
+    }
     if (b.slug !== undefined) input.slug = requireString(b.slug, 'slug');
     if (b.enabled !== undefined) input.enabled = !!b.enabled;
     if (b.comment !== undefined) input.comment = b.comment == null ? null : String(b.comment);
@@ -335,9 +414,12 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
       if (!Array.isArray(b.placements)) throw httpError(400, 'placements must be an array');
       input.placements = b.placements.map((p) => parsePlacementInput(p));
     }
-    const channel = await svc().createChannel(input);
-    reply.code(201);
-    return channel;
+    if (b.force !== undefined) input.force = !!b.force;
+    return withAvailability(reply, async () => {
+      const channel = await svc().createChannel(input);
+      reply.code(201);
+      return channel;
+    });
   });
 
   app.get<{ Params: { id: string } }>('/api/restreamer/channels/:id', async (req) => {
@@ -346,8 +428,9 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     return channel;
   });
 
-  app.put<{ Params: { id: string } }>('/api/restreamer/channels/:id', async (req) => {
-    return svc().updateChannel(req.params.id, parseChannelPatch(req.body));
+  app.put<{ Params: { id: string } }>('/api/restreamer/channels/:id', async (req, reply) => {
+    const patch = parseChannelPatch(req.body);
+    return withAvailability(reply, () => svc().updateChannel(req.params.id, patch));
   });
 
   app.delete<{ Params: { id: string } }>('/api/restreamer/channels/:id', async (req) => {
@@ -386,12 +469,15 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
   // ---------- placements ----------
 
   app.post<{ Params: { id: string } }>('/api/restreamer/channels/:id/placements', async (req, reply) => {
-    const placement = await svc().addPlacement(req.params.id, parsePlacementInput(req.body));
-    reply.code(201);
-    return placement;
+    const input = parsePlacementInput(req.body);
+    return withAvailability(reply, async () => {
+      const placement = await svc().addPlacement(req.params.id, input);
+      reply.code(201);
+      return placement;
+    });
   });
 
-  app.put<{ Params: { id: string } }>('/api/restreamer/placements/:id', async (req) => {
+  app.put<{ Params: { id: string } }>('/api/restreamer/placements/:id', async (req, reply) => {
     const b = asObject(req.body, 'request body');
     const patch: PlacementPatch = {};
     if (b.instanceId !== undefined) patch.instanceId = requireString(b.instanceId, 'instanceId');
@@ -413,7 +499,8 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
       }
       patch.programNumber = b.programNumber;
     }
-    return svc().updatePlacement(req.params.id, patch);
+    if (b.force !== undefined) patch.force = !!b.force;
+    return withAvailability(reply, () => svc().updatePlacement(req.params.id, patch));
   });
 
   app.delete<{ Params: { id: string } }>('/api/restreamer/placements/:id', async (req) => {
@@ -461,15 +548,24 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     return { ok: true };
   });
 
-  // ---------- manual switch ----------
+  // ---------- manual switch / reset ----------
   // Passthrough to POST /v1/channels/:slug/switch on the switcher: the
   // switcher's own state file is authoritative for the active selection (the
   // controller mirrors it via the status poll), and its lastSwitch timestamp
   // is what the sticky-1h rebalance window keys on — nothing to persist here.
+  // Body: {placementId} = explicit switch; {reset: true} = back to the
+  // highest-priority healthy upstream (service-resolved, 409 if none).
 
   app.post<{ Params: { id: string } }>('/api/restreamer/channels/:id/switch', async (req) => {
     const service = svc(); // 503 without a database, like every other mutation
     const b = asObject(req.body, 'request body');
+    if ((b.placementId !== undefined) === (b.reset !== undefined)) {
+      throw httpError(400, 'body must be exactly one of {placementId} or {reset: true}');
+    }
+    if (b.reset !== undefined) {
+      if (b.reset !== true) throw httpError(400, 'reset must be true');
+      return service.resetChannelSwitch(req.params.id);
+    }
     const placementId = requireString(b.placementId, 'placementId');
 
     const channel = (await service.listChannels()).find((c) => c.id === req.params.id);
@@ -507,10 +603,60 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     req: FastifyRequest<{ Params: { slug: string } }>,
     reply: FastifyReply,
   ): Promise<string> => {
-    const body = await renderPlaylistM3u(ctx, req.params.slug);
+    const body = await renderPlaylistM3u(ctx, req.params.slug, publicBaseUrl(req, ctx.config));
     void reply.header('content-type', 'audio/x-mpegurl');
     return body;
   };
   app.get<{ Params: { slug: string } }>('/playlists/:slug.m3u', m3uHandler);
   app.get<{ Params: { slug: string } }>('/api/restreamer/playlists/:slug.m3u', m3uHandler);
+
+  // ---------- logo proxy ----------
+  // Authenticated passthrough to tvheadend's /imagecache so tvg-logo URLs are
+  // publicly reachable without exposing instance credentials. Registered as
+  // an explicit route so it wins over the SPA not-found fallback in main.ts.
+  // Deliberately NO in-app cache: the controller always sits behind a reverse
+  // proxy — the 30-day Cache-Control below is for it (and browsers) to honor.
+
+  const LOGO_CACHE_CONTROL = 'public, max-age=2592000, immutable'; // 30 days — logos never change
+
+  app.get<{ Params: { instanceId: string; iconId: string } }>(
+    '/logos/:instanceId/imagecache/:iconId',
+    async (req, reply) => {
+      const { instanceId, iconId } = req.params;
+      // open-proxy guard: only numeric imagecache ids may reach the upstream
+      if (!/^\d+$/.test(iconId)) throw httpError(404, 'not found');
+      const client = ctx.tvhHttp.get(instanceId);
+      if (!client) throw httpError(404, `unknown instance "${instanceId}"`);
+
+      // pass conditional-request validators through so tvheadend can 304
+      const cond: Record<string, string> = {};
+      const ifNoneMatch = req.headers['if-none-match'];
+      if (typeof ifNoneMatch === 'string') cond['if-none-match'] = ifNoneMatch;
+      const ifModifiedSince = req.headers['if-modified-since'];
+      if (typeof ifModifiedSince === 'string') cond['if-modified-since'] = ifModifiedSince;
+
+      let res: Response;
+      try {
+        res = await client.getRaw(`/imagecache/${iconId}`, cond);
+      } catch (err) {
+        throw httpError(
+          502,
+          `tvheadend unreachable: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+
+      if (res.status === 200 || res.status === 304) {
+        void reply.header('cache-control', LOGO_CACHE_CONTROL);
+        const etag = res.headers.get('etag');
+        if (etag) void reply.header('etag', etag);
+        const lastModified = res.headers.get('last-modified');
+        if (lastModified) void reply.header('last-modified', lastModified);
+        if (res.status === 304) return reply.code(304).send();
+        void reply.header('content-type', res.headers.get('content-type') ?? 'image/png');
+        return reply.send(Buffer.from(await res.arrayBuffer()));
+      }
+      // upstream 401/403/404/…: never mirror an auth failure to the viewer
+      throw httpError(404, `icon ${iconId} not found on instance "${instanceId}"`);
+    },
+  );
 }

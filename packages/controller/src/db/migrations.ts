@@ -287,6 +287,27 @@ migrations['008_restreamer'] = {
   },
 };
 
+migrations['009_external_sources'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // non-tvheadend sources: a channel either targets a tvheadend channel
+    // ('tvh', name+number identity) or an entry of a restreamer node's local
+    // sources.m3u catalog ('external', keyed by the entry id / tvg-id)
+    await db.schema
+      .alterTable('restream_channels')
+      .addColumn('source_type', 'varchar(16)', (c) => c.notNull().defaultTo('tvh'))
+      .execute();
+    // catalog entry id for external channels; NULL for tvh channels
+    await db.schema
+      .alterTable('restream_channels')
+      .addColumn('source_key', 'varchar(255)')
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('restream_channels').dropColumn('source_key').execute();
+    await db.schema.alterTable('restream_channels').dropColumn('source_type').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

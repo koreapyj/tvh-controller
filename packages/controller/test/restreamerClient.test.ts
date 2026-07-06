@@ -6,7 +6,13 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { DesiredState, StatusResponse, SwitcherDesiredState, SwitcherStatus } from '@tvhc/shared';
+import type {
+  DesiredState,
+  SourcesResponse,
+  StatusResponse,
+  SwitcherDesiredState,
+  SwitcherStatus,
+} from '@tvhc/shared';
 import {
   RestreamerClient,
   RestreamerError,
@@ -75,6 +81,40 @@ describe('RestreamerClient endpoints', () => {
     const client = new RestreamerClient({ id: 'n1', url: 'http://node1:5580/' }, fetchImpl);
     await client.status();
     expect(calls[0]?.url).toBe('http://node1:5580/v1/status');
+  });
+
+  it('sources(): GET /v1/sources and parses the catalog', async () => {
+    const catalog: SourcesResponse = {
+      apiVersion: 1,
+      catalogHash: 'h1',
+      updatedAt: '2026-07-06T00:00:00Z',
+      entries: [{ id: 'louise-1', name: 'Louise', url: 'https://louise.example/stream?id=1' }],
+    };
+    const { fetchImpl, calls } = fakeFetch(json(catalog));
+    const client = new RestreamerClient(NODE, fetchImpl);
+    expect(await client.sources()).toEqual(catalog);
+    expect(calls).toEqual([
+      { url: 'http://node1:5580/v1/sources', method: 'GET', body: null, contentType: null },
+    ]);
+  });
+
+  it('sources(): 404 (old daemon) -> empty no-catalog response', async () => {
+    const { fetchImpl } = fakeFetch(new Response('not found', { status: 404 }));
+    const client = new RestreamerClient(NODE, fetchImpl);
+    expect(await client.sources()).toEqual({
+      apiVersion: 1,
+      catalogHash: null,
+      updatedAt: null,
+      entries: [],
+    });
+  });
+
+  it('sources(): non-404 errors still throw', async () => {
+    const { fetchImpl } = fakeFetch(new Response('boom', { status: 500 }));
+    const client = new RestreamerClient(NODE, fetchImpl);
+    const err = await client.sources().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RestreamerError);
+    expect((err as RestreamerError).status).toBe(500);
   });
 
   it('getDesired(): GET /v1/desired returns the persisted doc', async () => {

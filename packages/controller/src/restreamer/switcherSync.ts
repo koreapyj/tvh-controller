@@ -17,8 +17,8 @@
  */
 
 /**
- * Switcher-side sync: computes the global switcher desired doc (redundant
- * channels → upstream lists from placements × node serveUrls), pushes it with
+ * Switcher-side sync: computes the global switcher desired doc (every enabled
+ * channel → upstream lists from placements × node serveUrls), pushes it with
  * the same hash-skip/upsert/error semantics as node pushes
  * (`restream_switcher_state` parallel to `restream_node_state`), and runs the
  * slow rebalance driver over the pure policy in ./rebalance.ts.
@@ -56,7 +56,7 @@ export type SwitcherNodeClient = Pick<SwitcherClient, 'putDesired' | 'switchChan
 export interface SwitcherBlockedEntry {
   channelId: string;
   slug: string;
-  /** null = whole-channel reason (fewer than 2 usable upstreams) */
+  /** null = whole-channel reason (no usable upstreams) */
   placementId: string | null;
   reason: string;
 }
@@ -73,7 +73,7 @@ export interface SwitcherPushResult {
   blocked: SwitcherBlockedEntry[];
 }
 
-interface RedundantGroup {
+interface ChannelGroup {
   channelId: string;
   slug: string;
   profilePayload: string;
@@ -105,10 +105,13 @@ export class SwitcherSync {
   }
 
   /**
-   * Enabled channels with ≥2 enabled placements (the "redundant" set), with
-   * placements in (priority, id) order — the switcher's failover order.
+   * Enabled channels with ≥1 enabled placement, with placements in
+   * (priority, id) order — the switcher's failover order. With a switcher
+   * configured EVERY channel is fronted by it (uniform viewer URLs), so
+   * single-placement channels are included too — they simply mirror their one
+   * node.
    */
-  private async redundantGroups(): Promise<RedundantGroup[]> {
+  private async channelGroups(): Promise<ChannelGroup[]> {
     const rows = await this.db
       .selectFrom('restream_placements as p')
       .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
@@ -129,7 +132,7 @@ export class SwitcherSync {
       .orderBy('p.id')
       .execute();
 
-    const byChannel = new Map<string, RedundantGroup>();
+    const byChannel = new Map<string, ChannelGroup>();
     for (const r of rows) {
       let group = byChannel.get(r.channel_id);
       if (!group) {
@@ -148,19 +151,24 @@ export class SwitcherSync {
         priority: r.priority,
       });
     }
-    return [...byChannel.values()].filter((g) => g.placements.length >= 2);
+    return [...byChannel.values()];
   }
 
   /**
    * Global switcher desired doc (one doc, pushed to every configured
-   * switcher). Channels = enabled channels with ≥2 enabled placements;
+   * switcher). Channels = enabled channels with ≥1 enabled placement;
    * upstreams = placements in priority order at `<node serveUrl>/<slug>`.
    * Placements on unknown or serveUrl-less nodes are skipped with a reason; a
-   * channel needs ≥2 usable upstreams or it is skipped with a reason too.
+   * channel needs ≥1 usable upstream or it is skipped with a reason too.
    * Unlike node docs this never defers — no topology resolution is involved.
+   *
+   * NOTE: the ≥2→≥1 rule change (single-placement channels now included)
+   * changes the doc hash on upgrade — harmless: the hash-skip push notices the
+   * drift and re-pushes once, and the switcher's reconcile keeps running
+   * channels untouched while adding the new ones.
    */
   async computeDoc(): Promise<ComputedSwitcherDoc> {
-    const groups = await this.redundantGroups();
+    const groups = await this.channelGroups();
     const channels: SwitcherChannel[] = [];
     const blocked: SwitcherBlockedEntry[] = [];
 
@@ -192,12 +200,12 @@ export class SwitcherSync {
           priority: p.priority,
         });
       }
-      if (upstreams.length < 2) {
+      if (upstreams.length < 1) {
         blocked.push({
           channelId: g.channelId,
           slug: g.slug,
           placementId: null,
-          reason: `fewer than 2 usable upstreams (${upstreams.length}) — channel left out of the switcher doc`,
+          reason: 'no usable upstreams — channel left out of the switcher doc',
         });
         continue;
       }
@@ -331,17 +339,19 @@ export class SwitcherSync {
 
   /**
    * One rebalance evaluation: build the pure-policy input from the DB
-   * (redundant channels + profile bitrates), the switchers' polled status
-   * (active upstream, per-upstream health, last switch) and the config egress
-   * budgets, then execute the proposed move (at most one per pass) via the
-   * switcher's switch endpoint. Channels the switcher does not report yet are
-   * never rebalanced. Failures are logged, never thrown.
+   * (switcher-fronted channels + profile bitrates), the switchers' polled
+   * status (active upstream, per-upstream health, last switch) and the config
+   * egress budgets, then execute the proposed move (at most one per pass) via
+   * the switcher's switch endpoint. Channels the switcher does not report yet
+   * are never rebalanced; single-upstream channels contribute load to their
+   * node's utilization but have no alternative targets, so planRebalance
+   * never proposes a move for them. Failures are logged, never thrown.
    */
   async rebalanceTickInner(nowDate = new Date()): Promise<void> {
     const switchers = this.config.restreamer?.switchers ?? [];
     if (!switchers.length) return;
 
-    const groups = await this.redundantGroups();
+    const groups = await this.channelGroups();
     const channels: RebalanceChannelInput[] = [];
     const switcherBySlug = new Map<string, string>();
     for (const g of groups) {

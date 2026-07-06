@@ -55,8 +55,13 @@ rclone:
 
 # Standalone HLS switcher service(s) for redundant restream channels
 # (multi-placement failover). Omit when no channel is placed on more than
-# one instance. publicUrl is the viewer-facing base used in M3U playlists.
+# one instance. Each switcher's publicUrl is the viewer-facing base used in
+# M3U playlists. The top-level publicUrl is the CONTROLLER's own viewer-facing
+# base, used for controller-hosted M3U links (the channel-logo proxy); when
+# omitted it is derived per request from X-Forwarded-Proto/Host set by the
+# reverse proxy (or from the request itself).
 # restreamer:
+#   publicUrl: https://ctrl.example.com
 #   switchers:
 #     - id: main
 #       url: http://switcher.internal:5581

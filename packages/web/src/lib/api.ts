@@ -59,6 +59,8 @@ export interface RestreamPlacementInput {
   weight?: number | null;
   /** manual program-number (service SID) override; null = derived */
   programNumber?: number | null;
+  /** write even when the target node cannot serve the channel right now (pre-provisioning) */
+  force?: boolean;
 }
 
 /** restream channel create body */
@@ -66,6 +68,10 @@ export interface RestreamChannelInput {
   channelName: string;
   /** STRING identity ("9.1" ≠ "9.10"); absent/null = pin the lowest-numbered channel at write time */
   channelNumber?: string | null;
+  /** 'tvh' (default) = tvheadend channel; 'external' = a node's sources.m3u catalog entry */
+  sourceType?: 'tvh' | 'external';
+  /** catalog entry id — required when sourceType is 'external', cleared for 'tvh' */
+  sourceKey?: string | null;
   profileId: string;
   /** derived from channelName when absent */
   slug?: string;
@@ -73,6 +79,8 @@ export interface RestreamChannelInput {
   comment?: string | null;
   playlistIds?: string[];
   placements?: RestreamPlacementInput[];
+  /** write even when a target node cannot serve the identity right now (pre-provisioning) */
+  force?: boolean;
 }
 
 /** restream channel update / batch-edit patch (placements have their own endpoints) */
@@ -103,6 +111,37 @@ export interface RuleInput {
   overlay?: Partial<MasterRulePayload> | null;
 }
 
+/**
+ * Non-2xx API response. `body` keeps the parsed JSON error payload (null when
+ * the response wasn't JSON) so callers can read structured detail beyond the
+ * message — e.g. the 409 `unavailable` list from write-time availability.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: unknown,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+/** one node that cannot serve the requested identity (409 `unavailable` payload) */
+export interface UnavailableTarget {
+  instanceId: string;
+  nodeId: string;
+  reason: string;
+}
+
+/** per-node detail of a write-time availability 409, or null for any other error */
+export function unavailableDetail(err: unknown): UnavailableTarget[] | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const u = (err.body as { unavailable?: unknown } | null)?.unavailable;
+  if (!Array.isArray(u) || u.length === 0) return null;
+  return u as UnavailableTarget[];
+}
+
 async function http<T>(method: string, url: string, body?: unknown): Promise<T> {
   const res = await fetch(url, {
     method,
@@ -112,13 +151,15 @@ async function http<T>(method: string, url: string, body?: unknown): Promise<T> 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     let message = `${res.status} ${res.statusText}`;
+    let parsedBody: unknown = null;
     try {
       const parsed = JSON.parse(text) as { message?: string; error?: string };
+      parsedBody = parsed;
       message = parsed.message ?? parsed.error ?? message;
     } catch {
       if (text) message = text.slice(0, 300);
     }
-    throw new Error(message);
+    throw new ApiError(message, res.status, parsedBody);
   }
   return (await res.json()) as T;
 }
@@ -257,8 +298,9 @@ export const api = {
     }),
   setRestreamChannelPlaylists: (id: string, playlistIds: string[]) =>
     http<{ ok: boolean }>('POST', `/api/restreamer/channels/${id}/playlists`, { playlistIds }),
-  switchRestreamChannel: (id: string, placementId: string) =>
-    http<{ ok: boolean }>('POST', `/api/restreamer/channels/${id}/switch`, { placementId }),
+  /** {placementId} = explicit switch; {reset: true} = back to the highest-priority healthy placement */
+  switchRestreamChannel: (id: string, body: { placementId: string } | { reset: true }) =>
+    http<{ ok: boolean; already?: boolean }>('POST', `/api/restreamer/channels/${id}/switch`, body),
 
   addRestreamPlacement: (channelId: string, input: RestreamPlacementInput) =>
     http<RestreamPlacement>('POST', `/api/restreamer/channels/${channelId}/placements`, input),

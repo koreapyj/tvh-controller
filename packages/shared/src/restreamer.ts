@@ -25,6 +25,7 @@
 import type {
   PipelineParams,
   SessionStatus,
+  SourceCatalogEntry,
   SwitchReason,
   SwitcherChannelStatus,
 } from './restreamer-contract.js';
@@ -68,6 +69,13 @@ export interface RestreamChannel {
    * null = the LOWEST-numbered channel with that name on each instance.
    */
   channelNumber: string | null;
+  /**
+   * 'tvh' = tvheadend channel (name+number identity); 'external' = entry of a
+   * restreamer node's local sources.m3u catalog (keyed by `sourceKey`)
+   */
+  sourceType: 'tvh' | 'external';
+  /** catalog entry id (`tvg-id`) for external channels; null for tvh channels */
+  sourceKey: string | null;
   profileId: string;
   enabled: boolean;
   comment: string | null;
@@ -123,6 +131,16 @@ export interface RestreamerNodeStatus {
   /** the controller has a desired doc for this node that isn't confirmed pushed */
   pendingPush: boolean;
   sessions: SessionStatus[];
+  /**
+   * fingerprint of the node's local sources.m3u catalog; null = the node has
+   * no catalog (no `sourcesM3u` configured / old daemon) or it is unknown yet
+   */
+  sourcesHash: string | null;
+  /**
+   * the node's sources catalog entries; null = never fetched / unknown,
+   * [] = known-empty (no catalog configured or an empty file)
+   */
+  sources: SourceCatalogEntry[] | null;
 }
 
 /** one switcher's polled status (SSE `restreamer-switcher` events) */

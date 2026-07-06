@@ -153,6 +153,47 @@ describe('migration 008_restreamer', () => {
     ).rejects.toThrow(/FOREIGN KEY/i);
   });
 
+  describe('009_external_sources', () => {
+    it('defaults source_type to tvh with a null source_key', async () => {
+      await seed();
+      const channel = await t.db
+        .selectFrom('restream_channels')
+        .selectAll()
+        .executeTakeFirstOrThrow();
+      expect(channel.source_type).toBe('tvh');
+      expect(channel.source_key).toBeNull();
+    });
+
+    it('stores and reads back an external-source channel row', async () => {
+      await seed();
+      await t.db
+        .insertInto('restream_channels')
+        .values({
+          id: 'chan-ext',
+          slug: 'louise',
+          channel_name: 'Louise',
+          channel_number: null,
+          source_type: 'external',
+          source_key: 'louise-1',
+          profile_id: 'prof-1',
+          enabled: 1,
+          comment: null,
+          updated_at: NOW,
+        })
+        .execute();
+      const row = await t.db
+        .selectFrom('restream_channels')
+        .selectAll()
+        .where('id', '=', 'chan-ext')
+        .executeTakeFirstOrThrow();
+      expect(row).toMatchObject({
+        source_type: 'external',
+        source_key: 'louise-1',
+        channel_number: null,
+      });
+    });
+  });
+
   it('enforces UNIQUE(channel_id, instance_id, node_id) on placements', async () => {
     await seed();
     await expect(
