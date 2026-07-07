@@ -415,11 +415,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                     {#if n.serveUrl}
                       <a href="{n.serveUrl}/{s.name}/playlist.m3u8" target="_blank" title="open the HLS playlist">{s.name}</a>
                     {:else}{s.name}{/if}
-                    {#if s.lastError}
-                      <div class="small muted" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={s.lastError}>
-                        {s.lastError}
-                      </div>
-                    {/if}
                   </td>
                   <td>
                     <span
@@ -429,7 +424,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                       {s.state}
                     </span>
                   </td>
-                  <td class="small">{s.restarts}</td>
+                  <td class="small">
+                    <span
+                      title={s.lastError ? s.lastError : ''}
+                    >
+                      {s.restarts}
+                    </span>
+                  </td>
                   <td class="small">
                     {#if s.playlistLagSec !== undefined}{Math.round(s.playlistLagSec)}s{:else}<span class="muted">—</span>{/if}
                   </td>
