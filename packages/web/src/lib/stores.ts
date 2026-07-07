@@ -35,6 +35,9 @@ export const instName = derived(
   instances,
   (list) => (id: string) => list.find((i) => i.id === id)?.name ?? id,
 );
+/** instances that actually run a tvheadend — recording/rule-scope UI must
+ *  enumerate this, never the raw fleet (a tvh-less zone can't hold a copy) */
+export const tvhInstances = derived(instances, (list) => list.filter((i) => i.hasTvh));
 /** channels merged across instances, incl. per-channel EIT offsets from tvheadend */
 export const channelOptions = writable<ChannelOption[]>([]);
 export const conflictsByInstance = writable<Record<string, ConflictWindow[]>>({});

@@ -20,11 +20,13 @@ import type { FastifyInstance } from 'fastify';
 import {
   compareRecordings,
   type RecordingIdentity,
+  type RuleInstances,
   type UnifiedCopy,
   type UnifiedGroup,
   type UnifiedItem,
 } from '@tvhc/shared';
 import type { AppContext } from './context.js';
+import { materializeScope } from '../sync/resolve.js';
 
 interface ItemAcc extends UnifiedItem {
   label: string;
@@ -52,7 +54,10 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
       // controller rule names take precedence over the instance-side names:
       // a bound rule may not have received a rename yet (e.g. right after a
       // split-into-clone), and filters must match the controller's names
-      const masterByBinding = new Map<string, { name: string; comment: string }>();
+      const masterByBinding = new Map<
+        string,
+        { name: string; comment: string; instances: RuleInstances }
+      >();
       if (ctx.db && ctx.sync) {
         const [bindings, resolved] = await Promise.all([
           ctx.db
@@ -68,6 +73,7 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
             masterByBinding.set(`${b.instance_id}:${b.tvh_uuid}`, {
               name: master.name,
               comment: master.effective?.comment ?? '',
+              instances: master.instances,
             });
           }
         }
@@ -127,6 +133,9 @@ export function registerUnifiedRoutes(app: FastifyInstance, ctx: AppContext): vo
               start: e.start,
               stop: e.stop,
               copies: [],
+              scopeInstanceIds: master
+                ? materializeScope(master.instances, ctx.cache.tvhIds())
+                : undefined,
               label: e.autorec
                 ? master?.name || rule?.name || e.autorec_caption || 'Unnamed rule'
                 : 'Manual / other',

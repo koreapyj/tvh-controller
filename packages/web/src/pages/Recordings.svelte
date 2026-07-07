@@ -22,7 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { bytes, duration, ts } from '../lib/format.js';
   import { parseListParam } from '../lib/query.js';
   import { route } from '../lib/router.js';
-  import { instName, instances, recordingsTick } from '../lib/stores.js';
+  import { instName, recordingsTick, tvhInstances } from '../lib/stores.js';
   import { notify } from '../lib/notifications.js';
   import BatchEditModal from '../components/BatchEditModal.svelte';
   import MultiSelectDropdown from '../components/MultiSelectDropdown.svelte';
@@ -413,7 +413,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         states.set(c.instanceId, list);
       }
     }
-    return $instances
+    return $tvhInstances
       .filter((i) => states.has(i.id))
       .map((i) => {
         const en = states.get(i.id)!;
@@ -446,15 +446,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     const item = editRow.item;
     const copyById = new Map(item.copies.map((c) => [c.instanceId, c]));
     const addById = new Map(addTargets.map((t) => [t.instanceId, t.eventId]));
-    return $instances.map((inst): Item => {
+    return $tvhInstances.map((inst): Item => {
       const copy = copyById.get(inst.id);
       if (copy) return { id: inst.id, name: inst.name, initial: copy.enabled };
       if (tab !== 'upcoming')
         return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'already recorded' };
       if (addLoading)
         return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'checking…' };
-      if (!inst.hasTvh)
-        return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'no tvheadend' };
       if (!inst.reachable)
         return { id: inst.id, name: inst.name, initial: false, disabled: true, reason: 'unreachable' };
       const eventId = addById.get(inst.id);
@@ -731,7 +729,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <th>Status</th>
         <th title="stream errors · data (TS) errors">errors</th>
       {:else}
-        {#each $instances as inst (inst.id)}
+        {#each $tvhInstances as inst (inst.id)}
           <th>{inst.name}</th>
           <th title="stream errors · data (TS) errors on {inst.name}">errors</th>
         {/each}
@@ -800,12 +798,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             {/if}
           </td>
         {:else}
-          {#each $instances as inst (inst.id)}
+          {#each $tvhInstances as inst (inst.id)}
             {@const c = copyFor(item, inst.id)}
             <td style="white-space:nowrap" class="m-inline">
               <span class="m-only">{inst.name}</span>
               {#if !c}
-                <span class="rec-dot bad" title="this broadcast is not {tab} on {inst.name}"></span>
+                {#if item.scopeInstanceIds && !item.scopeInstanceIds.includes(inst.id)}
+                  <span class="rec-dot off" title="not configured to record on {inst.name}"></span>
+                {:else}
+                  <span class="rec-dot bad" title="this broadcast is not {tab} on {inst.name}"></span>
+                {/if}
               {:else if tab === 'upcoming'}
                 {#if c.schedStatus === 'recording'}
                   <span

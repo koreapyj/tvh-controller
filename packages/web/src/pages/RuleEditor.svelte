@@ -22,7 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { parseChannelInput, resolveChannelPick } from '../lib/channelPick.js';
   import { conversionFor, toEitTime } from '../lib/eit.js';
   import { buildRulePatch, formatFieldValue, needsOverrideToggle, RULE_FIELD_SPECS, RULE_PAYLOAD_DEFAULTS, type FieldSpec } from '../lib/ruleFields.js';
-  import { channelOptions, instances } from '../lib/stores.js';
+  import { channelOptions, instances, tvhInstances } from '../lib/stores.js';
 
   let {
     initialName,
@@ -72,7 +72,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     name = initialName;
     allInstances = initialInstances === 'all';
     selectedInstances =
-      initialInstances === 'all' ? $instances.map((i) => i.id) : [...initialInstances];
+      initialInstances === 'all' ? $tvhInstances.map((i) => i.id) : [...initialInstances];
     const source: Partial<MasterRulePayload> | null = overlayMode
       ? (initialOverlay ?? {})
       : initialPayload;
@@ -202,7 +202,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         : null),
   );
   const matchedInstances = $derived(effectiveChannel?.instances ?? []);
-  const scopeIds = $derived(allInstances ? $instances.map((i) => i.id) : selectedInstances);
+  const scopeIds = $derived(allInstances ? $tvhInstances.map((i) => i.id) : selectedInstances);
   const missingOn = $derived(
     matchedChannels.length ? scopeIds.filter((id) => !matchedInstances.includes(id)) : [],
   );
@@ -274,7 +274,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             All (includes instances added later)
           </label>
           {#if !allInstances}
-            {#each $instances as inst (inst.id)}
+            {#each $tvhInstances as inst (inst.id)}
               <label style="display:flex;gap:6px;align-items:center;margin:0">
                 <input
                   type="checkbox"

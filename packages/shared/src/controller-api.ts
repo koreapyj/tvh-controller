@@ -153,6 +153,14 @@ export interface UnifiedItem {
   stop: number;
   copies: UnifiedCopy[];
   upload?: { uploadId: string; status: UploadStatus; byInstanceId: string };
+  /**
+   * tvh-capable instance ids covered by the owning autorec rule's scope,
+   * with 'all' already materialized to concrete ids — an instance NOT in
+   * this list deliberately has no copy ("off"), not a missing recording.
+   * Absent when no master rule is known (manual entry, unbound autorec):
+   * red-dot behavior unchanged.
+   */
+  scopeInstanceIds?: string[];
 }
 
 export interface UnifiedGroup {

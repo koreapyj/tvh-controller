@@ -16,16 +16,18 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { get } from 'svelte/store';
-import type { RestreamerNodeStatus, SwitcherNodeStatus } from '@tvhc/shared';
+import type { InstanceSummary, RestreamerNodeStatus, SwitcherNodeStatus } from '@tvhc/shared';
 import {
   applyRestreamerNode,
   applyRestreamerSwitcher,
+  instances,
   restreamerNodeKey,
   restreamerNodes,
   restreamerSwitchers,
   seedRestreamers,
+  tvhInstances,
 } from './stores.js';
 
 function node(over: Partial<RestreamerNodeStatus> = {}): RestreamerNodeStatus {
@@ -110,5 +112,46 @@ describe('restreamer store event merge', () => {
     seedRestreamers([node(), node({ nodeId: 'node-b' })], [switcher()]);
     expect(Object.keys(get(restreamerNodes)).sort()).toEqual(['tokyo/node-a', 'tokyo/node-b']);
     expect(Object.keys(get(restreamerSwitchers))).toEqual(['sw1']);
+  });
+});
+
+function instance(over: Partial<InstanceSummary> = {}): InstanceSummary {
+  return {
+    id: 'tyo1',
+    name: 'Tokyo 1',
+    url: 'http://tyo1',
+    hasTvh: true,
+    reachable: true,
+    version: '4.3',
+    lastPollAt: null,
+    error: null,
+    serverOffsetMinutes: null,
+    ...over,
+  };
+}
+
+describe('tvhInstances', () => {
+  afterEach(() => {
+    instances.set([]);
+  });
+
+  it('filters out instances with hasTvh: false', () => {
+    instances.set([
+      instance({ id: 'tyo1', hasTvh: true }),
+      instance({ id: 'rs1', hasTvh: false, url: null }),
+      instance({ id: 'osk1', hasTvh: true }),
+    ]);
+    expect(get(tvhInstances).map((i) => i.id)).toEqual(['tyo1', 'osk1']);
+  });
+
+  it('is reactive to instances.set()', () => {
+    instances.set([instance({ id: 'tyo1', hasTvh: true })]);
+    expect(get(tvhInstances).map((i) => i.id)).toEqual(['tyo1']);
+
+    instances.set([
+      instance({ id: 'tyo1', hasTvh: true }),
+      instance({ id: 'rs1', hasTvh: false, url: null }),
+    ]);
+    expect(get(tvhInstances).map((i) => i.id)).toEqual(['tyo1']);
   });
 });

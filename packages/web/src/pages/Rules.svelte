@@ -20,7 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { api, type RuleInput } from '../lib/api.js';
   import { dateTime, weekdays } from '../lib/format.js';
   import { parseListParam } from '../lib/query.js';
-  import { channelOptions, instances } from '../lib/stores.js';
+  import { channelOptions, instances, tvhInstances } from '../lib/stores.js';
   import { route } from '../lib/router.js';
   import { conversionFor, offsetLabel, toEitTime } from '../lib/eit.js';
   import { notify } from '../lib/notifications.js';
@@ -395,7 +395,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       // scope-shrink confirm: removing a bound instance deletes the rule there
       const rule = rules.find((r) => r.id === e.id);
       if (rule) {
-        const all = $instances.map((i) => i.id);
+        const all = $tvhInstances.map((i) => i.id);
         const oldScope = rule.instances === 'all' ? all : rule.instances;
         const newScope = out.instances === 'all' ? all : out.instances;
         const removedBound = oldScope.filter(
@@ -509,7 +509,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   const batchInstanceSelector = $derived.by(() => {
     const sel = ordered.filter((r) => selected[r.id]);
     return {
-      instances: $instances.map((inst) => {
+      instances: $tvhInstances.map((inst) => {
         const n = sel.filter((r) => r.instances === 'all' || r.instances.includes(inst.id)).length;
         return {
           id: inst.id,
@@ -666,7 +666,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   {#if rules.length === 0}
     <select bind:value={importInstance} style="width:auto">
       <option value="" disabled selected>Bootstrap: import from…</option>
-      {#each $instances as inst}
+      {#each $tvhInstances as inst}
         <option value={inst.id}>{inst.name}</option>
       {/each}
     </select>
@@ -711,7 +711,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       <th class="sortable" onclick={() => clickSort('weekdays')}>Days of week{arrow('weekdays')}</th>
       <th class="sortable" onclick={() => clickSort('comment')}>Comment{arrow('comment')}</th>
       <th class="sortable" onclick={() => clickSort('instances')}>Instances{arrow('instances')}</th>
-      {#each $instances as inst}
+      {#each $tvhInstances as inst}
         <th>{inst.name}</th>
       {/each}
       <th></th>
@@ -782,7 +782,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <span class="m-only">on</span>
           <span class="badge {rule.instances === 'all' ? 'neutral' : 'info'}">{instancesLabel(rule)}</span>
         </td>
-        {#each $instances as inst}
+        {#each $tvhInstances as inst}
           {@const st = rule.perInstance[inst.id]}
           <td style="white-space:nowrap" class="m-inline">
             {#if st}
@@ -1013,7 +1013,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <table>
           <thead><tr><th>Instance</th><th>State</th><th>tvh uuid</th></tr></thead>
           <tbody>
-            {#each $instances as inst}
+            {#each $tvhInstances as inst}
               {@const st = viewing.perInstance[inst.id]}
               <tr>
                 <td>{inst.name}</td>

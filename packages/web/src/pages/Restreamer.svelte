@@ -107,7 +107,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   const placementNodeLabel = $derived.by(() => {
     const m = new Map<string, string>();
     for (const c of channels) {
-      for (const p of c.placements) m.set(p.id, `${$instName(p.instanceId)} / ${p.nodeId}`);
+      for (const p of c.placements) m.set(p.id, `${p.nodeId}`);
     }
     return m;
   });
@@ -218,7 +218,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     p: RestreamChannelWithStatus['placements'][number],
   ): string {
     const parts = [
-      `${$instName(p.instanceId)} / ${p.nodeId} — ${p.session?.state ?? 'no session'}`,
+      `${p.nodeId} — ${p.session?.state ?? 'no session'}`,
     ];
     if (!p.enabled) parts.push('placement disabled');
     if (p.mode === 'cold') parts.push(p.coldActive ? 'cold backup — active' : 'cold backup — standby');
@@ -333,10 +333,61 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <p class="muted">No restreamer nodes configured — add a <code>restreamer:</code> block to an instance in config.yaml.</p>
 {:else}
   <div class="cards">
+    {#each switcherList as sw (sw.switcherId)}
+      <div class="card">
+        <h3>
+          switcher {sw.switcherId}
+          {#if sw.reachable}<span class="badge ok">reachable</span>{:else}<span class="badge bad">unreachable</span>{/if}
+          {#if sw.pendingPush}<span class="badge warn" title="the controller's desired doc is not confirmed pushed to this switcher">pending push</span>{/if}
+        </h3>
+        <div class="muted small">
+          {sw.url}
+          {#if sw.version}&nbsp;· v{sw.version}{/if}
+        </div>
+        {#if sw.error}<div class="small" style="color:var(--bad)">{sw.error}</div>{/if}
+        {#if sw.channels.length}
+          <table>
+            <thead>
+              <tr><th>Channel</th><th>Active</th><th>Upstreams</th><th>Last switch</th></tr>
+            </thead>
+            <tbody>
+              {#each sw.channels as c (c.slug)}
+                <tr>
+                  <td class="small">{c.slug}</td>
+                  <td class="small">
+                    {#if c.activeUpstreamId}
+                      {placementNodeLabel.get(c.activeUpstreamId) ?? c.activeUpstreamId}
+                    {:else}<span class="muted">none</span>{/if}
+                  </td>
+                  <td style="white-space:nowrap">
+                    {#each c.upstreams as u (u.id)}
+                      <span
+                        class="rec-dot {u.healthy ? 'ok' : ''}"
+                        title="{placementNodeLabel.get(u.id) ?? u.id} — {u.healthy ? 'healthy' : 'unhealthy'}{u.playlistLagSec !== undefined ? `, lag ${Math.round(u.playlistLagSec)}s` : ''}"
+                      ></span>
+                    {/each}
+                  </td>
+                  <td class="small muted">
+                    {#if c.lastSwitch}
+                      <span title="from {c.lastSwitch.from ? (placementNodeLabel.get(c.lastSwitch.from) ?? c.lastSwitch.from) : '(none)'} to {placementNodeLabel.get(c.lastSwitch.to) ?? c.lastSwitch.to}">
+                        {c.lastSwitch.reason} · {dateTime(c.lastSwitch.at)}
+                      </span>
+                    {:else}—{/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        {:else}
+          <div class="muted small">no redundant channels pushed</div>
+        {/if}
+      </div>
+    {/each}
+
     {#each nodeList as n (restreamerNodeKey(n))}
       <div class="card">
         <h3>
-          {$instName(n.instanceId)} / {n.nodeId}
+          {n.nodeId}
           {#if n.reachable}<span class="badge ok">reachable</span>{:else}<span class="badge bad">unreachable</span>{/if}
           {#if n.pendingPush}<span class="badge warn" title="the controller's desired doc is not confirmed pushed to this node">pending push</span>{/if}
           {#if !n.apiVersionSupported}<span class="badge bad" title="node reports an apiVersion the controller doesn't speak">api?</span>{/if}
@@ -397,57 +448,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           </table>
         {:else}
           <div class="muted small">no sessions</div>
-        {/if}
-      </div>
-    {/each}
-
-    {#each switcherList as sw (sw.switcherId)}
-      <div class="card">
-        <h3>
-          switcher {sw.switcherId}
-          {#if sw.reachable}<span class="badge ok">reachable</span>{:else}<span class="badge bad">unreachable</span>{/if}
-          {#if sw.pendingPush}<span class="badge warn" title="the controller's desired doc is not confirmed pushed to this switcher">pending push</span>{/if}
-        </h3>
-        <div class="muted small">
-          {sw.url}
-          {#if sw.version}&nbsp;· v{sw.version}{/if}
-        </div>
-        {#if sw.error}<div class="small" style="color:var(--bad)">{sw.error}</div>{/if}
-        {#if sw.channels.length}
-          <table>
-            <thead>
-              <tr><th>Channel</th><th>Active</th><th>Upstreams</th><th>Last switch</th></tr>
-            </thead>
-            <tbody>
-              {#each sw.channels as c (c.slug)}
-                <tr>
-                  <td class="small">{c.slug}</td>
-                  <td class="small">
-                    {#if c.activeUpstreamId}
-                      {placementNodeLabel.get(c.activeUpstreamId) ?? c.activeUpstreamId}
-                    {:else}<span class="muted">none</span>{/if}
-                  </td>
-                  <td style="white-space:nowrap">
-                    {#each c.upstreams as u (u.id)}
-                      <span
-                        class="rec-dot {u.healthy ? 'ok' : ''}"
-                        title="{placementNodeLabel.get(u.id) ?? u.id} — {u.healthy ? 'healthy' : 'unhealthy'}{u.playlistLagSec !== undefined ? `, lag ${Math.round(u.playlistLagSec)}s` : ''}"
-                      ></span>
-                    {/each}
-                  </td>
-                  <td class="small muted">
-                    {#if c.lastSwitch}
-                      <span title="from {c.lastSwitch.from ? (placementNodeLabel.get(c.lastSwitch.from) ?? c.lastSwitch.from) : '(none)'} to {placementNodeLabel.get(c.lastSwitch.to) ?? c.lastSwitch.to}">
-                        {c.lastSwitch.reason} · {dateTime(c.lastSwitch.at)}
-                      </span>
-                    {:else}—{/if}
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        {:else}
-          <div class="muted small">no redundant channels pushed</div>
         {/if}
       </div>
     {/each}
@@ -577,11 +577,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               title={placementTitle(c, p)}
               onclick={() => forceSwitch(c, p.id, `${$instName(p.instanceId)} / ${p.nodeId}`)}
             >
-              {p.nodeId}{#if p.resolvedVia === 'catalog'}<span class="muted" title="resolved from the node's sources catalog">&nbsp;ext</span>{/if}{#if p.blockedReason}&nbsp;⚠{/if}
+              {#if c.activePlacementId === p.id && c.placements.length > 1}✓&nbsp;{/if}{p.nodeId}{#if p.blockedReason}&nbsp;⚠{/if}
             </button>
-            {#if c.activePlacementId === p.id && c.placements.length > 1}
-              <span class="badge ok" title="the switcher currently serves this placement">active</span>
-            {/if}
           {:else}
             <span class="muted small m-hide">no placements</span>
           {/each}
