@@ -1450,7 +1450,7 @@ describe('failover state placements', () => {
     await h.destroy();
   });
 
-  it('listChannels surfaces placement.indicator/lagProbe/underrunProbe and channel.failover shape', async () => {
+  it('listChannels surfaces placement.indicator/lagProbe and channel.failover shape', async () => {
     const h = await setup();
     const { chan, hot, cold } = await seedColdChannel(h);
     let [listed] = await h.service.listChannels();
@@ -1460,7 +1460,6 @@ describe('failover state placements', () => {
     expect(hotBefore.mode).toBe('hot');
     expect(hotBefore.indicator).toBe('idle');
     expect(hotBefore.lagProbe).toBeNull();
-    expect(hotBefore.underrunProbe).toBeNull();
     const coldBefore = listed!.placements.find((x) => x.id === cold.id)!;
     expect(coldBefore.mode).toBe('cold');
     expect(coldBefore.indicator).toBe('idle');

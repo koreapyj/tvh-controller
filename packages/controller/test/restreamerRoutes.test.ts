@@ -1844,7 +1844,6 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/probes', () => {
       liveness: { timeoutSeconds: 3, periodSeconds: 8, successThreshold: 1, failureThreshold: 2 },
       underspeed: { timeoutSeconds: 15, periodSeconds: 30, successThreshold: 2, failureThreshold: 4 },
       lag: { timeoutSeconds: 20, periodSeconds: 12, successThreshold: 2, failureThreshold: 2 },
-      underrun: { minSpeed: 0.9, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
     };
     const put = await app.inject({
       method: 'PUT',
@@ -1859,6 +1858,25 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/probes', () => {
     // a different node is unaffected
     const other = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n2/probes' });
     expect(other.json()).toEqual(NODE_PROBE_DEFAULTS);
+  });
+
+  it('PUT with an underrun key in the body is accepted and simply ignored', async () => {
+    const { app } = await harness();
+    const custom: NodeProbeSettings = {
+      liveness: { timeoutSeconds: 3, periodSeconds: 8, successThreshold: 1, failureThreshold: 2 },
+      underspeed: { timeoutSeconds: 15, periodSeconds: 30, successThreshold: 2, failureThreshold: 4 },
+      lag: { timeoutSeconds: 20, periodSeconds: 12, successThreshold: 2, failureThreshold: 2 },
+    };
+    const put = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/probes',
+      payload: { ...custom, underrun: { minSpeed: 0.9, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 } },
+    });
+    expect(put.statusCode).toBe(200);
+    expect(put.json()).toEqual(custom);
+
+    const get = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n1/probes' });
+    expect(get.json()).toEqual(custom);
   });
 
   it('PUT with an invalid body -> 400', async () => {

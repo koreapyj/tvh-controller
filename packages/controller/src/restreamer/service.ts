@@ -403,14 +403,6 @@ export class RestreamerService {
     this.probeEngine = new ProbeEngine(
       () => this.probeTargets(),
       () => this.allProbeSettings(),
-      (instanceId, nodeId, slug) => {
-        const session = this.cachedNodeStatus(instanceId, nodeId)?.sessions.find(
-          (s) => s.name === slug,
-        );
-        return session?.progress
-          ? { speed: session.progress.speed, updatedAt: session.progress.updatedAt }
-          : null;
-      },
       (channelId) => {
         void this.publishChannelStatus(channelId).catch(() => {});
       },
@@ -711,7 +703,6 @@ export class RestreamerService {
           session: nodeStatus?.sessions.find((s) => s.name === c.slug) ?? null,
           indicator: indicators.get(p.id) ?? ('idle' as const),
           lagProbe: this.probeEngine.lagStatus(p.id),
-          underrunProbe: this.probeEngine.underrunStatus(p.id),
         };
       });
       const { activePlacementId, lastSwitch } = this.switcherView(c.slug);
@@ -2309,11 +2300,9 @@ export class RestreamerService {
           const placementId = placementBySlug.get(s.name);
           if (!placementId) return s;
           const lagProbe = this.probeEngine.lagStatus(placementId);
-          const underrunProbe = this.probeEngine.underrunStatus(placementId);
           return {
             ...s,
             ...(lagProbe ? { lagProbe } : {}),
-            ...(underrunProbe ? { underrunProbe } : {}),
           };
         });
       },
@@ -2561,7 +2550,6 @@ export class RestreamerService {
         blockedReason: p.blockedReason,
         state: p.session?.state ?? null,
         lag: [p.lagProbe?.failed ?? false, p.lagProbe?.consecutiveFailures ?? 0],
-        run: [p.underrunProbe?.failed ?? false, p.underrunProbe?.consecutiveFailures ?? 0],
       })),
     });
     if (this.lastChannelPublishKey.get(channelId) === key) return;

@@ -540,9 +540,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                     {#if s.lagProbe?.consecutiveFailures}
                       <span class="badge warn" title="channel-level lag probe failing">lag:{s.lagProbe.consecutiveFailures}</span>
                     {/if}
-                    {#if s.underrunProbe?.consecutiveFailures}
-                      <span class="badge warn" title="encoder-underrun probe failing">underrun:{s.underrunProbe.consecutiveFailures}</span>
-                    {/if}
                   </td>
                   <td class="small">
                     <span

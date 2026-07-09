@@ -384,7 +384,8 @@ migrations['013_probe_settings'] = {
     // per-node probe thresholds (UI-editable); absent row ⇒ code defaults.
     // Nodes live in config.yaml (no FK target exists) — a row whose
     // (instance_id, node_id) no longer matches config is simply ignored.
-    // underrun has min_speed (a speed-ratio threshold) instead of a timeout.
+    // (this migration originally also added underrun_* columns, a
+    // speed-ratio-threshold probe retired by 015_drop_underrun)
     await db.schema
       .createTable('restream_node_probes')
       .addColumn('instance_id', 'varchar(64)', (c) => c.notNull())
@@ -434,7 +435,8 @@ migrations['014_failover_state'] = {
         c.notNull().references('restream_placements.id').onDelete('cascade'),
       )
       .addColumn('phase', 'varchar(24)', (c) => c.notNull())
-      // 'liveness' | 'underspeed' | 'underrun' | 'lag' | 'manual' | 'reset' | 'rebalance'
+      // 'liveness' | 'underspeed' | 'lag' | 'manual' | 'reset' | 'rebalance'
+      // (historically also 'underrun', retired in 015_drop_underrun)
       .addColumn('trigger_reason', 'varchar(16)', (c) => c.notNull())
       // set for instance-level triggers (liveness/underspeed) — reset re-checks it
       .addColumn('trigger_node_id', 'varchar(64)')
@@ -506,6 +508,48 @@ migrations['014_failover_state'] = {
       .addColumn('updated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
       .execute();
     await db.schema.dropTable('restream_failover_state').execute();
+  },
+};
+
+migrations['015_drop_underrun'] = {
+  // the underrun probe (passive, read ffmpeg progress.speed per placement) is
+  // retired: ffmpeg's -progress speed/out_time freezes whenever the sparse
+  // ARIB subtitle stream stops receiving packets, so the metric reads
+  // 0.8x/0x on perfectly healthy encoders. The lag probe covers real encoder
+  // stalls/slowdowns. No 'underrun' trigger_reason rows exist in prod (the
+  // trigger was never enabled), so dropping the columns is safe.
+  async up(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('restream_node_probes').dropColumn('underrun_min_speed').execute();
+    await db.schema
+      .alterTable('restream_node_probes')
+      .dropColumn('underrun_period_seconds')
+      .execute();
+    await db.schema
+      .alterTable('restream_node_probes')
+      .dropColumn('underrun_success_threshold')
+      .execute();
+    await db.schema
+      .alterTable('restream_node_probes')
+      .dropColumn('underrun_failure_threshold')
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .alterTable('restream_node_probes')
+      .addColumn('underrun_min_speed', 'real', (c) => c.notNull().defaultTo(0.98))
+      .execute();
+    await db.schema
+      .alterTable('restream_node_probes')
+      .addColumn('underrun_period_seconds', 'integer', (c) => c.notNull().defaultTo(15))
+      .execute();
+    await db.schema
+      .alterTable('restream_node_probes')
+      .addColumn('underrun_success_threshold', 'integer', (c) => c.notNull().defaultTo(2))
+      .execute();
+    await db.schema
+      .alterTable('restream_node_probes')
+      .addColumn('underrun_failure_threshold', 'integer', (c) => c.notNull().defaultTo(3))
+      .execute();
   },
 };
 

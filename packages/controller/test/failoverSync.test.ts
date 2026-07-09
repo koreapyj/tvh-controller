@@ -167,8 +167,6 @@ interface CounterLike {
   detail: string;
   lastLagSec?: number | null;
   firstMeasuredAt?: string | null;
-  lastSpeed?: number | null;
-  lastSampleAt?: string | null;
   lastSpeedRatio?: number | null;
 }
 
@@ -176,11 +174,10 @@ interface MutableSnapshot {
   liveness: Map<string, CounterLike>;
   underspeed: Map<string, CounterLike>;
   lag: Map<string, CounterLike>;
-  underrun: Map<string, CounterLike>;
 }
 
 function emptySnapshot(): MutableSnapshot {
-  return { liveness: new Map(), underspeed: new Map(), lag: new Map(), underrun: new Map() };
+  return { liveness: new Map(), underspeed: new Map(), lag: new Map() };
 }
 
 function failing(detail = 'failing'): CounterLike {

@@ -52,21 +52,12 @@ export interface ProbeThresholds {
   failureThreshold: number;
 }
 
-/** underrun swaps the timeout for a minimum ffmpeg progress.speed ratio */
-export interface UnderrunThresholds {
-  minSpeed: number;
-  periodSeconds: number;
-  successThreshold: number;
-  failureThreshold: number;
-}
-
-export type ProbeName = 'liveness' | 'underspeed' | 'underrun' | 'lag';
+export type ProbeName = 'liveness' | 'underspeed' | 'lag';
 
 export interface NodeProbeSettings {
   liveness: ProbeThresholds;
   underspeed: ProbeThresholds;
   lag: ProbeThresholds;
-  underrun: UnderrunThresholds;
 }
 
 /**
@@ -86,11 +77,6 @@ export interface ProbeStatus {
 export interface UnderspeedProbeStatus extends ProbeStatus {
   /** measured segment download speed as a multiple of realtime; null = never measured */
   lastSpeedRatio: number | null;
-}
-
-export interface UnderrunProbeStatus extends ProbeStatus {
-  /** last ffmpeg progress.speed sample; null = never sampled */
-  lastSpeed: number | null;
 }
 
 export interface LagProbeStatus extends ProbeStatus {
@@ -124,7 +110,6 @@ export type FailoverPhase =
 export type FailoverTriggerReason =
   | 'liveness'
   | 'underspeed'
-  | 'underrun'
   | 'lag'
   | 'manual'
   | 'reset'
@@ -212,8 +197,6 @@ export interface RestreamChannelWithStatus extends RestreamChannel {
       indicator: PlacementIndicator;
       /** channel-level lag probe state for this placement; null = not probed */
       lagProbe: LagProbeStatus | null;
-      /** channel-level encoder-underrun probe state; null = not probed */
-      underrunProbe: UnderrunProbeStatus | null;
     }
   >;
   /** persisted failover procedure/result for this channel; null = none (Reset hidden) */
@@ -239,7 +222,6 @@ export interface RestreamPlaylist {
 /** SessionStatus enriched with the controller's channel-level probe state */
 export type EnrichedSessionStatus = SessionStatus & {
   lagProbe?: LagProbeStatus;
-  underrunProbe?: UnderrunProbeStatus;
 };
 
 /** one restreamer node's polled status (SSE `restreamer` events) */

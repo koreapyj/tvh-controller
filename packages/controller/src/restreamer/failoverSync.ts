@@ -21,10 +21,10 @@
  * the persisted per-channel procedure of failoverPolicy.ts.
  *
  * - Triggers: instance-level (liveness / underspeed probe `failed` on the
- *   node hosting a channel's ACTIVE placement) and channel-level (lag /
- *   underrun probe `failed` on the active placement itself), plus manual
- *   placement selection, reset (fail-back) and rebalance moves — ALL enter
- *   the same queue and run the identical procedure.
+ *   node hosting a channel's ACTIVE placement) and channel-level (lag probe
+ *   `failed` on the active placement itself), plus manual placement
+ *   selection, reset (fail-back) and rebalance moves — ALL enter the same
+ *   queue and run the identical procedure.
  * - Strict global FIFO: one procedure (hence at most one ffmpeg bring-up)
  *   in flight at any moment. Latency is recovered inside a procedure: each
  *   tick() advances through every phase whose precondition already holds.
@@ -523,7 +523,6 @@ export class FailoverSync {
       const live = snap.liveness.get(key);
       const speed = snap.underspeed.get(key);
       const lag = snap.lag.get(active.id);
-      const run = snap.underrun.get(active.id);
       if (live?.failed) {
         reason = 'liveness';
         detail = live.detail;
@@ -535,9 +534,6 @@ export class FailoverSync {
       } else if (lag?.failed) {
         reason = 'lag';
         detail = lag.detail;
-      } else if (run?.failed) {
-        reason = 'underrun';
-        detail = run.detail;
       }
       if (!reason) {
         // trigger cleared — forget the backoff so a future incident is fresh
@@ -624,7 +620,6 @@ export class FailoverSync {
       const fromFailing =
         !!from &&
         (snap.lag.get(from.id)?.failed === true ||
-          snap.underrun.get(from.id)?.failed === true ||
           snap.liveness.get(nk(from.instance_id, from.node_id))?.failed === true ||
           snap.underspeed.get(nk(from.instance_id, from.node_id))?.failed === true);
       suppressFrom = from && (from.mode === 'cold' || fromFailing) ? 1 : 0;
@@ -1013,10 +1008,6 @@ export class FailoverSync {
       }
       case 'lag': {
         const s = row.from_placement_id ? snap.lag.get(row.from_placement_id) : undefined;
-        return s?.failed ? s.detail : null;
-      }
-      case 'underrun': {
-        const s = row.from_placement_id ? snap.underrun.get(row.from_placement_id) : undefined;
         return s?.failed ? s.detail : null;
       }
       default:

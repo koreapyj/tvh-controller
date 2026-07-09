@@ -74,7 +74,7 @@ export interface RestreamerPollerHooks {
    * fact would be wiped by the next poll). Default: null (no probes).
    */
   getProbes?: (instanceId: string, nodeId: string) => NodeProbeStatus | null;
-  /** fold channel-level probe state (lag/underrun) into the polled sessions */
+  /** fold channel-level probe state (lag) into the polled sessions */
   enrichSessions?: (
     instanceId: string,
     nodeId: string,

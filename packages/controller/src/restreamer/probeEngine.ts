@@ -17,7 +17,7 @@
  */
 
 /**
- * The probe engine: four independently-paced probe kinds over the delivery
+ * The probe engine: three independently-paced probe kinds over the delivery
  * path (successor to deliveryProbe.ts, which it retires).
  *
  * Instance-level (per restreamer node, via its serveUrl — the path viewers
@@ -35,9 +35,12 @@
  *             error is a SKIP (no fail count, no discovery) — a just-brought-
  *             up placement has no playlist yet, while a crashed session is
  *             still caught because its retained playlist goes stale.
- * - underrun: PASSIVE — reads the polled daemon `progress.speed` sample per
- *             session (deduped by progress.updatedAt); speed < minSpeed =
- *             fail; stale/absent progress = skip.
+ *
+ * (A fourth probe, underrun, passively read the polled daemon
+ * `progress.speed` sample per session. It was retired: ffmpeg's -progress
+ * speed/out_time freezes whenever the sparse ARIB subtitle stream stops
+ * receiving packets, so the metric read 0.8x/0x on perfectly healthy
+ * encoders. The lag probe above covers real encoder stalls/slowdowns.)
  *
  * Counters use k8s-style sticky semantics (probeState.ts). Probe state is
  * PULLED by RestreamerPoller when building node status (single source of
@@ -48,12 +51,7 @@
  * nextDueAt, so per-node cadences vary without N timers.
  */
 
-import type {
-  LagProbeStatus,
-  NodeProbeSettings,
-  NodeProbeStatus,
-  UnderrunProbeStatus,
-} from '@tvhc/shared';
+import type { LagProbeStatus, NodeProbeSettings, NodeProbeStatus } from '@tvhc/shared';
 import { parseLastPdtEndMs, parseMasterVariant, parseNewestSegment } from './hlsParse.js';
 import { applyProbeResult, toProbeStatus, type ProbeCounterState } from './probeState.js';
 
@@ -87,20 +85,8 @@ export interface ProbeTargets {
   placements: PlacementProbeTarget[];
 }
 
-/** last polled ffmpeg progress sample for one session (for the underrun probe) */
-export type ProgressSource = (
-  instanceId: string,
-  nodeId: string,
-  slug: string,
-) => { speed: number; updatedAt: string } | null;
-
 interface UnderspeedCounter extends ProbeCounterState {
   lastSpeedRatio: number | null;
-}
-interface UnderrunCounter extends ProbeCounterState {
-  lastSpeed: number | null;
-  /** progress.updatedAt of the last counted sample (dedupe) */
-  lastSampleAt: string | null;
 }
 interface LagCounter extends ProbeCounterState {
   lastLagSec: number | null;
@@ -113,7 +99,6 @@ export interface ProbeSnapshot {
   underspeed: ReadonlyMap<string, UnderspeedCounter>;
   /** keyed by placementId */
   lag: ReadonlyMap<string, LagCounter>;
-  underrun: ReadonlyMap<string, UnderrunCounter>;
 }
 
 function nk(instanceId: string, nodeId: string): string {
@@ -124,7 +109,6 @@ export class ProbeEngine {
   private readonly liveness = new Map<string, ProbeCounterState>();
   private readonly underspeed = new Map<string, UnderspeedCounter>();
   private readonly lag = new Map<string, LagCounter>();
-  private readonly underrun = new Map<string, UnderrunCounter>();
   /** nextDueAt (ms) per probe kind+target key */
   private readonly due = new Map<string, number>();
   /** round-robin slug cursor per node */
@@ -135,7 +119,6 @@ export class ProbeEngine {
   constructor(
     private readonly getTargets: () => Promise<ProbeTargets>,
     private readonly getSettings: () => Promise<Map<string, NodeProbeSettings>>,
-    private readonly getProgress: ProgressSource,
     /** placement-level probe state changed meaningfully — publish channel status */
     private readonly onPlacementChange: (channelId: string) => void = () => {},
     private readonly fetchImpl: typeof fetch = fetch,
@@ -161,7 +144,6 @@ export class ProbeEngine {
       liveness: this.liveness,
       underspeed: this.underspeed,
       lag: this.lag,
-      underrun: this.underrun,
     };
   }
 
@@ -181,12 +163,6 @@ export class ProbeEngine {
     const s = this.lag.get(placementId);
     if (!s) return null;
     return { ...toProbeStatus(s), lastLagSec: s.lastLagSec, firstMeasuredAt: s.firstMeasuredAt };
-  }
-
-  underrunStatus(placementId: string): UnderrunProbeStatus | null {
-    const s = this.underrun.get(placementId);
-    if (!s) return null;
-    return { ...toProbeStatus(s), lastSpeed: s.lastSpeed };
   }
 
   /** one round; runs only the targets whose period elapsed. Exported for tests. */
@@ -227,12 +203,6 @@ export class ProbeEngine {
         } else if (this.isDue(`lag:${p.placementId}`, cfg.lag.periodSeconds, nowMs)) {
           work.push(this.runLag(p, cfg));
         }
-        if (cfg.underrun.periodSeconds <= 0) {
-          this.underrun.delete(p.placementId);
-          this.due.delete(`run:${p.placementId}`);
-        } else if (this.isDue(`run:${p.placementId}`, cfg.underrun.periodSeconds, nowMs)) {
-          this.runUnderrun(p, cfg);
-        }
       }
       await Promise.all(work.map((w) => w.catch(() => {})));
     } finally {
@@ -254,7 +224,6 @@ export class ProbeEngine {
     for (const key of [...this.liveness.keys()]) if (!nodeKeys.has(key)) this.liveness.delete(key);
     for (const key of [...this.underspeed.keys()]) if (!nodeKeys.has(key)) this.underspeed.delete(key);
     for (const key of [...this.lag.keys()]) if (!placementIds.has(key)) this.lag.delete(key);
-    for (const key of [...this.underrun.keys()]) if (!placementIds.has(key)) this.underrun.delete(key);
     for (const key of [...this.rr.keys()]) if (!nodeKeys.has(key)) this.rr.delete(key);
   }
 
@@ -457,30 +426,6 @@ export class ProbeEngine {
       firstMeasuredAt: prev?.firstMeasuredAt ?? now.toISOString(),
     };
     this.lag.set(p.placementId, merged);
-    if (this.meaningfulChange(prev, merged)) this.onPlacementChange(p.channelId);
-  }
-
-  // ---------- underrun (channel-level, passive) ----------
-
-  private runUnderrun(p: PlacementProbeTarget, cfg: NodeProbeSettings): void {
-    const progress = this.getProgress(p.instanceId, p.nodeId, p.slug);
-    const prev = this.underrun.get(p.placementId);
-    if (!progress) return; // SKIP — no data ≠ fail (dead sessions are lag/stall territory)
-    // ffmpeg emits `speed=N/A` for some sources; the daemon coerces that to 0
-    // (the wire contract requires a number) — 0 is "unknown", never underrun
-    if (progress.speed <= 0) return;
-    if (prev?.lastSampleAt === progress.updatedAt) return; // SKIP — same poll sample
-    const speed = Math.round(progress.speed * 100) / 100;
-    const result: 'ok' | 'fail' = speed < cfg.underrun.minSpeed ? 'fail' : 'ok';
-    const next = applyProbeResult(
-      prev,
-      result,
-      cfg.underrun,
-      this.now(),
-      `speed ${speed.toFixed(2)}× (min ${cfg.underrun.minSpeed}×)`,
-    );
-    const merged: UnderrunCounter = { ...next, lastSpeed: speed, lastSampleAt: progress.updatedAt };
-    this.underrun.set(p.placementId, merged);
     if (this.meaningfulChange(prev, merged)) this.onPlacementChange(p.channelId);
   }
 

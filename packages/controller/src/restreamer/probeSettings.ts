@@ -22,7 +22,7 @@
  * defaults in migration 013) and validation for the PUT endpoint.
  */
 
-import type { NodeProbeSettings, ProbeThresholds, UnderrunThresholds } from '@tvhc/shared';
+import type { NodeProbeSettings, ProbeThresholds } from '@tvhc/shared';
 import type { RestreamNodeProbesTable } from '../db/schema.js';
 import { httpError } from '../util/httpError.js';
 
@@ -30,7 +30,6 @@ export const NODE_PROBE_DEFAULTS: NodeProbeSettings = {
   liveness: { timeoutSeconds: 5, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
   underspeed: { timeoutSeconds: 20, periodSeconds: 45, successThreshold: 2, failureThreshold: 3 },
   lag: { timeoutSeconds: 30, periodSeconds: 10, successThreshold: 3, failureThreshold: 3 },
-  underrun: { minSpeed: 0.98, periodSeconds: 15, successThreshold: 2, failureThreshold: 3 },
 };
 
 type ProbeRow = Omit<RestreamNodeProbesTable, 'updated_at'>;
@@ -55,12 +54,6 @@ export function rowToProbeSettings(r: ProbeRow): NodeProbeSettings {
       successThreshold: r.lag_success_threshold,
       failureThreshold: r.lag_failure_threshold,
     },
-    underrun: {
-      minSpeed: r.underrun_min_speed,
-      periodSeconds: r.underrun_period_seconds,
-      successThreshold: r.underrun_success_threshold,
-      failureThreshold: r.underrun_failure_threshold,
-    },
   };
 }
 
@@ -84,10 +77,6 @@ export function probeSettingsToRow(
     lag_period_seconds: s.lag.periodSeconds,
     lag_success_threshold: s.lag.successThreshold,
     lag_failure_threshold: s.lag.failureThreshold,
-    underrun_min_speed: s.underrun.minSpeed,
-    underrun_period_seconds: s.underrun.periodSeconds,
-    underrun_success_threshold: s.underrun.successThreshold,
-    underrun_failure_threshold: s.underrun.failureThreshold,
   };
 }
 
@@ -116,8 +105,8 @@ function assertNumber(
  * - failureThreshold 0 = probe measures (badges / lag discovery) but never
  *   reports failed, so it never triggers a failover
  * - successThreshold 0 = a tripped probe recovers on the first success
- * timeoutSeconds / minSpeed stay strictly positive — they parameterize the
- * measurement itself, not whether it runs.
+ * timeoutSeconds stays strictly positive — it parameterizes the measurement
+ * itself, not whether it runs.
  */
 export function parseProbeSettings(raw: unknown): NodeProbeSettings {
   if (typeof raw !== 'object' || raw === null) throw httpError(400, 'body must be an object');
@@ -145,28 +134,9 @@ export function parseProbeSettings(raw: unknown): NodeProbeSettings {
       }),
     };
   };
-  const g = body.underrun;
-  if (typeof g !== 'object' || g === null) throw httpError(400, 'underrun must be an object');
-  const o = g as Record<string, unknown>;
-  const underrun: UnderrunThresholds = {
-    minSpeed: assertNumber(o.minSpeed, 'underrun.minSpeed', { integer: false, allowZero: false }),
-    periodSeconds: assertNumber(o.periodSeconds, 'underrun.periodSeconds', {
-      integer: false,
-      allowZero: true,
-    }),
-    successThreshold: assertNumber(o.successThreshold, 'underrun.successThreshold', {
-      integer: true,
-      allowZero: true,
-    }),
-    failureThreshold: assertNumber(o.failureThreshold, 'underrun.failureThreshold', {
-      integer: true,
-      allowZero: true,
-    }),
-  };
   return {
     liveness: thresholds('liveness'),
     underspeed: thresholds('underspeed'),
     lag: thresholds('lag'),
-    underrun,
   };
 }

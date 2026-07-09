@@ -17,8 +17,8 @@
  */
 
 // Pure field layer for ProbeConfigModal (the profileFields/ruleFields
-// pattern): one group per probe (liveness/underspeed/underrun/lag), each with
-// its own threshold fields, and the string<->NodeProbeSettings conversions.
+// pattern): one group per probe (liveness/underspeed/lag), each with its own
+// threshold fields, and the string<->NodeProbeSettings conversions.
 // No Svelte imports — everything here is node-testable.
 
 import type { NodeProbeSettings, ProbeName } from '@tvhc/shared';
@@ -29,16 +29,15 @@ export interface ProbeGroupSpec {
   help: string;
 }
 
-/** display order + labels for the 4 probe groups (mirrors NodeProbeSettings) */
+/** display order + labels for the 3 probe groups (mirrors NodeProbeSettings) */
 export const PROBE_GROUPS: ProbeGroupSpec[] = [
   { key: 'liveness', label: 'Liveness', help: 'delivery-path reachability' },
   { key: 'underspeed', label: 'Underspeed', help: 'segment download vs realtime' },
-  { key: 'underrun', label: 'Underrun', help: 'ffmpeg encode speed' },
   { key: 'lag', label: 'Lag', help: 'playlist wall-clock lag' },
 ];
 
 export interface ProbeFieldSpec {
-  /** key within the group's threshold object (ProbeThresholds/UnderrunThresholds) */
+  /** key within the group's threshold object (ProbeThresholds) */
   key: string;
   label: string;
   /** 'int' = integer only; 'float' = number (decimals ok) */
@@ -46,7 +45,7 @@ export interface ProbeFieldSpec {
   /**
    * probes are OPTIONAL via zeros: period 0 = probe off, failure threshold
    * 0 = measure but never trigger, success threshold 0 = recover on first
-   * success. timeout/minSpeed parameterize the measurement and stay positive.
+   * success. timeout parameterizes the measurement and stays positive.
    */
   allowZero?: boolean;
 }
@@ -62,7 +61,6 @@ export const PROBE_FIELDS: Record<ProbeName, ProbeFieldSpec[]> = {
   liveness: [{ key: 'timeoutSeconds', label: 'Timeout (s)', kind: 'float' }, ...COMMON_TAIL],
   underspeed: [{ key: 'timeoutSeconds', label: 'Timeout (s)', kind: 'float' }, ...COMMON_TAIL],
   lag: [{ key: 'timeoutSeconds', label: 'Timeout (s)', kind: 'float' }, ...COMMON_TAIL],
-  underrun: [{ key: 'minSpeed', label: 'Min speed (×)', kind: 'float' }, ...COMMON_TAIL],
 };
 
 /** form value key for one group+field pair (group keys collide otherwise: periodSeconds etc.) */

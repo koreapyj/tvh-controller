@@ -25,13 +25,12 @@ function settings(): NodeProbeSettings {
     liveness: { timeoutSeconds: 5, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
     underspeed: { timeoutSeconds: 8, periodSeconds: 15, successThreshold: 2, failureThreshold: 3 },
     lag: { timeoutSeconds: 4.5, periodSeconds: 20, successThreshold: 2, failureThreshold: 5 },
-    underrun: { minSpeed: 0.9, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
   };
 }
 
 describe('PROBE_GROUPS / PROBE_FIELDS', () => {
   it('has one group per NodeProbeSettings key, in a stable display order', () => {
-    expect(PROBE_GROUPS.map((g) => g.key)).toEqual(['liveness', 'underspeed', 'underrun', 'lag']);
+    expect(PROBE_GROUPS.map((g) => g.key)).toEqual(['liveness', 'underspeed', 'lag']);
   });
 
   it('liveness/underspeed/lag share the same field shape (timeout/period/success/failure)', () => {
@@ -43,15 +42,6 @@ describe('PROBE_GROUPS / PROBE_FIELDS', () => {
         'failureThreshold',
       ]);
     }
-  });
-
-  it('underrun swaps timeout for minSpeed', () => {
-    expect(PROBE_FIELDS.underrun.map((f) => f.key)).toEqual([
-      'minSpeed',
-      'periodSeconds',
-      'successThreshold',
-      'failureThreshold',
-    ]);
   });
 });
 
@@ -65,7 +55,7 @@ describe('probesToVals / buildProbesPayload round trip', () => {
   it('every field is stringified', () => {
     const vals = probesToVals(settings());
     expect(vals['liveness.timeoutSeconds']).toBe('5');
-    expect(vals['underrun.minSpeed']).toBe('0.9');
+    expect(vals['underspeed.timeoutSeconds']).toBe('8');
     expect(vals['lag.failureThreshold']).toBe('5');
   });
 });
@@ -94,16 +84,13 @@ describe('buildProbesPayload validation', () => {
     }
   });
 
-  it('still rejects negative values and zero for timeout/minSpeed', () => {
+  it('still rejects negative values and zero for timeout', () => {
     const vals = probesToVals(settings());
     vals['underspeed.periodSeconds'] = '-5';
     expect(buildProbesPayload(vals).ok).toBe(false);
     const vals2 = probesToVals(settings());
     vals2['liveness.timeoutSeconds'] = '0';
     expect(buildProbesPayload(vals2).ok).toBe(false);
-    const vals3 = probesToVals(settings());
-    vals3['underrun.minSpeed'] = '0';
-    expect(buildProbesPayload(vals3).ok).toBe(false);
   });
 
   it('rejects a non-integer for int-kind fields', () => {
@@ -115,17 +102,17 @@ describe('buildProbesPayload validation', () => {
     });
   });
 
-  it('allows a decimal for float-kind fields (timeout, minSpeed)', () => {
+  it('allows a decimal for float-kind fields (timeout)', () => {
     const vals = probesToVals(settings());
-    vals['underrun.minSpeed'] = '1.25';
+    vals['lag.timeoutSeconds'] = '1.25';
     const built = buildProbesPayload(vals);
     expect(built.ok).toBe(true);
-    if (built.ok) expect(built.payload.underrun.minSpeed).toBe(1.25);
+    if (built.ok) expect(built.payload.lag.timeoutSeconds).toBe(1.25);
   });
 
   it('rejects a non-numeric value', () => {
     const vals = probesToVals(settings());
-    vals['underrun.minSpeed'] = 'fast';
+    vals['lag.timeoutSeconds'] = 'fast';
     expect(buildProbesPayload(vals).ok).toBe(false);
   });
 });

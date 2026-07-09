@@ -25,7 +25,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { sessionStateBadge } from '../lib/restreamFields.js';
   import { appendLogLine, sessionLogStreamUrl } from '../lib/sessionLog.js';
 
-  // One session's detail: live info (lag/speed/memory/restarts), restart /
+  // One session's detail: live info (lag/memory/restarts), restart /
   // reset-restarts controls, and a live-tailing log pane. The log pane opens
   // its own EventSource (no one-shot REST seed — the stream itself replays a
   // ring tail on connect) and re-seeds `lines` on every 'open' so an
@@ -129,11 +129,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         {:else}—{/if}
       </div>
       <div>Lag: {session.playlistLagSec !== undefined ? `${Math.round(session.playlistLagSec)}s` : '—'}</div>
-      <div>
-        Encoder speed:
-        <!-- ffmpeg reports speed=N/A for some pipelines; the daemon coerces it to 0 = unknown -->
-        {session.progress && session.progress.speed > 0 ? `${session.progress.speed.toFixed(2)}×` : '—'}
-      </div>
       <div>
         Memory: {session.memoryRssMb !== undefined ? `${Math.round(session.memoryRssMb)} MB` : '—'}
       </div>

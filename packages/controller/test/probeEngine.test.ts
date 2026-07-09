@@ -1,12 +1,12 @@
 /*
- * ProbeEngine tests: constructed directly with stub getTargets/getSettings/
- * getProgress and an injectable fetchImpl (real Response/ReadableStream
- * objects, no real network — same style as the retired deliveryProbe.test.ts).
- * Settings use a tiny periodSeconds (0.001) and threshold 1 throughout, and
- * the harness tick() auto-advances the injected clock 10s after each round so
- * every probe is due on every tick — periodSeconds 0 now means DISABLED (see
- * the dedicated test). Streak semantics live in probeState.test.ts — this
- * file is about the engine's I/O and target plumbing.
+ * ProbeEngine tests: constructed directly with stub getTargets/getSettings
+ * and an injectable fetchImpl (real Response/ReadableStream objects, no real
+ * network — same style as the retired deliveryProbe.test.ts). Settings use a
+ * tiny periodSeconds (0.001) and threshold 1 throughout, and the harness
+ * tick() auto-advances the injected clock 10s after each round so every
+ * probe is due on every tick — periodSeconds 0 now means DISABLED (see the
+ * dedicated test). Streak semantics live in probeState.test.ts — this file
+ * is about the engine's I/O and target plumbing.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -16,7 +16,6 @@ import {
   type NodeProbeTarget,
   type PlacementProbeTarget,
   type ProbeTargets,
-  type ProgressSource,
 } from '../src/restreamer/probeEngine.js';
 
 type FetchImpl = typeof fetch;
@@ -50,7 +49,6 @@ function cfg(overrides: Partial<NodeProbeSettings> = {}): NodeProbeSettings {
     liveness: { timeoutSeconds: 5, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 },
     underspeed: { timeoutSeconds: 5, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 },
     lag: { timeoutSeconds: 30, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 },
-    underrun: { minSpeed: 0.98, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 },
     ...overrides,
   };
 }
@@ -112,7 +110,6 @@ interface Setup {
   set: (url: string, h: Handler) => void;
   setTargets: (t: ProbeTargets) => void;
   setSettings: (m: Map<string, NodeProbeSettings>) => void;
-  setProgress: (fn: ProgressSource) => void;
   setNow: (d: Date) => void;
   /** one engine round, then advance the injected clock 10s so the next round is due */
   tick: () => Promise<void>;
@@ -123,13 +120,11 @@ function setup(): Setup {
   const { fetchImpl, calls, set } = makeFetch();
   let targets: ProbeTargets = { nodes: [], placements: [] };
   let settings = new Map<string, NodeProbeSettings>();
-  let progress: ProgressSource = () => null;
   let now = new Date('2026-01-01T00:00:00.000Z');
   const changes: string[] = [];
   const engine = new ProbeEngine(
     async () => targets,
     async () => settings,
-    (instanceId, nodeId, slug) => progress(instanceId, nodeId, slug),
     (channelId) => changes.push(channelId),
     fetchImpl,
     () => now,
@@ -143,9 +138,6 @@ function setup(): Setup {
     },
     setSettings: (m) => {
       settings = m;
-    },
-    setProgress: (fn) => {
-      progress = fn;
     },
     setNow: (d) => {
       now = d;
@@ -397,62 +389,6 @@ describe('ProbeEngine: lag', () => {
   });
 });
 
-// ---------- underrun ----------
-
-describe('ProbeEngine: underrun (passive, from ffmpeg progress)', () => {
-  function seedPlacement(s: Setup): void {
-    s.setTargets({
-      nodes: [],
-      placements: [placementTarget('chan1', 'plc1', 'z1', 'n1', 'ch1', null)],
-    });
-    s.setSettings(
-      new Map([
-        [
-          nk('z1', 'n1'),
-          cfg({ underrun: { minSpeed: 0.98, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 } }),
-        ],
-      ]),
-    );
-  }
-
-  it('speed below minSpeed fails', async () => {
-    const s = setup();
-    seedPlacement(s);
-    s.setProgress(() => ({ speed: 0.5, updatedAt: '2026-01-01T00:00:00.000Z' }));
-    await s.tick();
-    expect(s.engine.underrunStatus('plc1')).toMatchObject({ failed: true, lastSpeed: 0.5 });
-  });
-
-  it('the same progress.updatedAt sample is never double-counted', async () => {
-    const s = setup();
-    seedPlacement(s);
-    s.setProgress(() => ({ speed: 0.5, updatedAt: 'same-sample' }));
-    await s.tick();
-    const c1 = s.engine.underrunStatus('plc1')!.consecutiveFailures;
-    await s.tick();
-    const c2 = s.engine.underrunStatus('plc1')!.consecutiveFailures;
-    expect(c2).toBe(c1);
-  });
-
-  it('absent progress is a skip, not a fail', async () => {
-    const s = setup();
-    seedPlacement(s);
-    s.setProgress(() => null);
-    await s.tick();
-    expect(s.engine.underrunStatus('plc1')).toBeNull();
-  });
-
-  it("speed 0 (the daemon's coercion of ffmpeg speed=N/A) is a skip, not underrun", async () => {
-    const s = setup();
-    seedPlacement(s);
-    // observed in prod: a perfectly healthy session reporting speed=0 forever
-    s.setProgress(() => ({ speed: 0, updatedAt: '2026-01-01T00:00:00.000Z' }));
-    await s.tick();
-    await s.tick();
-    expect(s.engine.underrunStatus('plc1')).toBeNull();
-  });
-});
-
 // ---------- period gating / pruning ----------
 
 describe('ProbeEngine: per-target period gating and pruning', () => {
@@ -498,13 +434,11 @@ describe('ProbeEngine: per-target period gating and pruning', () => {
       placements: [placementTarget('chan1', 'plc1', 'z1', 'n1', 'ch1', PLAYLIST_URL)],
     });
     s.setSettings(new Map([[nk('z1', 'n1'), cfg()]]));
-    s.setProgress(() => ({ speed: 1, updatedAt: 't1' }));
     s.set(PLAYLIST_URL, () => new Response(mediaPlaylist([{ uri: 'seg1.ts', durationSec: 0, pdtIso: '2026-01-01T00:00:00.000Z' }])));
     s.set(SEG_URL, () => segmentResponse({ bytes: 10 }));
     await s.tick();
     expect(s.engine.nodeProbeStatus('z1', 'n1')).not.toBeNull();
     expect(s.engine.lagStatus('plc1')).not.toBeNull();
-    expect(s.engine.underrunStatus('plc1')).not.toBeNull();
 
     // disable everything via periodSeconds 0 — state drops, no more fetches
     s.setSettings(
@@ -515,7 +449,6 @@ describe('ProbeEngine: per-target period gating and pruning', () => {
             liveness: { timeoutSeconds: 5, periodSeconds: 0, successThreshold: 1, failureThreshold: 1 },
             underspeed: { timeoutSeconds: 5, periodSeconds: 0, successThreshold: 1, failureThreshold: 1 },
             lag: { timeoutSeconds: 30, periodSeconds: 0, successThreshold: 1, failureThreshold: 1 },
-            underrun: { minSpeed: 0.98, periodSeconds: 0, successThreshold: 1, failureThreshold: 1 },
           },
         ],
       ]),
@@ -524,7 +457,6 @@ describe('ProbeEngine: per-target period gating and pruning', () => {
     await s.tick();
     expect(s.engine.nodeProbeStatus('z1', 'n1')).toBeNull();
     expect(s.engine.lagStatus('plc1')).toBeNull();
-    expect(s.engine.underrunStatus('plc1')).toBeNull();
     expect(s.calls.length).toBe(callsBefore); // no fetch left the building
   });
 
@@ -535,18 +467,15 @@ describe('ProbeEngine: per-target period gating and pruning', () => {
       placements: [placementTarget('chan1', 'plc1', 'z1', 'n1', 'ch1', PLAYLIST_URL)],
     });
     s.setSettings(new Map([[nk('z1', 'n1'), cfg()]]));
-    s.setProgress(() => ({ speed: 1, updatedAt: 't1' }));
     s.set(PLAYLIST_URL, () => new Response(mediaPlaylist([{ uri: 'seg1.ts', durationSec: 0, pdtIso: '2026-01-01T00:00:00.000Z' }])));
 
     await s.tick();
     expect(s.engine.nodeProbeStatus('z1', 'n1')).not.toBeNull();
     expect(s.engine.lagStatus('plc1')).not.toBeNull();
-    expect(s.engine.underrunStatus('plc1')).not.toBeNull();
 
     s.setTargets({ nodes: [], placements: [] });
     await s.tick();
     expect(s.engine.nodeProbeStatus('z1', 'n1')).toBeNull();
     expect(s.engine.lagStatus('plc1')).toBeNull();
-    expect(s.engine.underrunStatus('plc1')).toBeNull();
   });
 });

@@ -147,7 +147,7 @@ export interface RestreamFailoverStateTable {
   to_placement_id: string;
   /** FailoverPhase — 'bringing-up' … 'complete' | 'draining' */
   phase: string;
-  /** 'liveness' | 'underspeed' | 'underrun' | 'lag' | 'manual' | 'reset' | 'rebalance' */
+  /** 'liveness' | 'underspeed' | 'lag' | 'manual' | 'reset' | 'rebalance' */
   trigger_reason: string;
   /** set for instance-level triggers — reset re-checks this node's probes */
   trigger_node_id: string | null;
@@ -176,11 +176,6 @@ export interface RestreamNodeProbesTable {
   lag_period_seconds: number;
   lag_success_threshold: number;
   lag_failure_threshold: number;
-  /** ffmpeg progress.speed below this = underrun fail (in place of a timeout) */
-  underrun_min_speed: number;
-  underrun_period_seconds: number;
-  underrun_success_threshold: number;
-  underrun_failure_threshold: number;
   updated_at: ColumnType<Date, string, string>;
 }
 

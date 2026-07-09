@@ -295,7 +295,7 @@ describe('migration 008_restreamer', () => {
     });
   });
 
-  describe('013_probe_settings', () => {
+  describe('013_probe_settings (015_drop_underrun already dropped the underrun_* columns)', () => {
     function probeRow(overrides: Partial<Record<string, unknown>> = {}) {
       return {
         instance_id: 'tyo1',
@@ -312,10 +312,6 @@ describe('migration 008_restreamer', () => {
         lag_period_seconds: 10,
         lag_success_threshold: 3,
         lag_failure_threshold: 3,
-        underrun_min_speed: 0.98,
-        underrun_period_seconds: 15,
-        underrun_success_threshold: 2,
-        underrun_failure_threshold: 3,
         updated_at: NOW,
         ...overrides,
       };
@@ -328,7 +324,6 @@ describe('migration 008_restreamer', () => {
         instance_id: 'tyo1',
         node_id: 'node1',
         liveness_timeout_seconds: 5,
-        underrun_min_speed: 0.98,
       });
       expect(row.updated_at).toBeInstanceOf(Date);
     });
@@ -451,6 +446,116 @@ describe('migration 008_restreamer', () => {
         await expect(
           oldDb.selectFrom('restream_cold_activations').selectAll().execute(),
         ).rejects.toThrow(/no such table/i);
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
+  describe('015_drop_underrun', () => {
+    it('after migrateToLatest, a row inserted without underrun_* columns succeeds and reads back none of them', async () => {
+      await t.db
+        .insertInto('restream_node_probes')
+        .values({
+          instance_id: 'tyo1',
+          node_id: 'node1',
+          liveness_timeout_seconds: 5,
+          liveness_period_seconds: 10,
+          liveness_success_threshold: 2,
+          liveness_failure_threshold: 3,
+          underspeed_timeout_seconds: 20,
+          underspeed_period_seconds: 45,
+          underspeed_success_threshold: 2,
+          underspeed_failure_threshold: 3,
+          lag_timeout_seconds: 30,
+          lag_period_seconds: 10,
+          lag_success_threshold: 3,
+          lag_failure_threshold: 3,
+          updated_at: NOW,
+        })
+        .execute();
+      const row = await t.db.selectFrom('restream_node_probes').selectAll().executeTakeFirstOrThrow();
+      expect(row).not.toHaveProperty('underrun_min_speed');
+      expect(row).not.toHaveProperty('underrun_period_seconds');
+      expect(row).not.toHaveProperty('underrun_success_threshold');
+      expect(row).not.toHaveProperty('underrun_failure_threshold');
+    });
+
+    it('migrating stepwise to 013 (with underrun_* columns) then to latest drops them while preserving the rest', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '013_probe_settings');
+
+        // 013-era row shape: underrun_* columns still exist at this point
+        interface OldProbeRow {
+          instance_id: string;
+          node_id: string;
+          liveness_timeout_seconds: number;
+          liveness_period_seconds: number;
+          liveness_success_threshold: number;
+          liveness_failure_threshold: number;
+          underspeed_timeout_seconds: number;
+          underspeed_period_seconds: number;
+          underspeed_success_threshold: number;
+          underspeed_failure_threshold: number;
+          lag_timeout_seconds: number;
+          lag_period_seconds: number;
+          lag_success_threshold: number;
+          lag_failure_threshold: number;
+          underrun_min_speed: number;
+          underrun_period_seconds: number;
+          underrun_success_threshold: number;
+          underrun_failure_threshold: number;
+          updated_at: string;
+        }
+        const oldDb = db as unknown as Kysely<{ restream_node_probes: OldProbeRow }>;
+        await oldDb
+          .insertInto('restream_node_probes')
+          .values({
+            instance_id: 'tyo1',
+            node_id: 'node1',
+            liveness_timeout_seconds: 9,
+            liveness_period_seconds: 11,
+            liveness_success_threshold: 2,
+            liveness_failure_threshold: 3,
+            underspeed_timeout_seconds: 20,
+            underspeed_period_seconds: 45,
+            underspeed_success_threshold: 2,
+            underspeed_failure_threshold: 3,
+            lag_timeout_seconds: 30,
+            lag_period_seconds: 10,
+            lag_success_threshold: 3,
+            lag_failure_threshold: 3,
+            underrun_min_speed: 0.98,
+            underrun_period_seconds: 15,
+            underrun_success_threshold: 2,
+            underrun_failure_threshold: 3,
+            updated_at: NOW,
+          })
+          .execute();
+
+        await migrateToLatest(db);
+
+        const rows = await db.selectFrom('restream_node_probes').selectAll().execute();
+        expect(rows).toHaveLength(1);
+        // the pre-existing columns survive with their seeded values
+        expect(rows[0]).toMatchObject({
+          instance_id: 'tyo1',
+          node_id: 'node1',
+          liveness_timeout_seconds: 9,
+          liveness_period_seconds: 11,
+          underspeed_timeout_seconds: 20,
+          lag_timeout_seconds: 30,
+        });
+        expect(rows[0]).not.toHaveProperty('underrun_min_speed');
+        expect(rows[0]).not.toHaveProperty('underrun_period_seconds');
+        expect(rows[0]).not.toHaveProperty('underrun_success_threshold');
+        expect(rows[0]).not.toHaveProperty('underrun_failure_threshold');
       } finally {
         await db.destroy();
       }

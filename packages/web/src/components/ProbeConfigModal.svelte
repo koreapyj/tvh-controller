@@ -20,7 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { buildProbesPayload, PROBE_FIELDS, PROBE_GROUPS, probesToVals } from '../lib/probeFields.js';
 
   // Per-node probe threshold editor: one bordered group per probe (liveness /
-  // underspeed / underrun / lag), mirroring RestreamProfileModal's section
+  // underspeed / lag), mirroring RestreamProfileModal's section
   // styling. Pure form — no fetching in here; the page loads `initial` and
   // performs the PUT after onsave.
 

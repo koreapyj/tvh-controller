@@ -16,7 +16,6 @@ const SETTINGS: NodeProbeSettings = {
   liveness: { timeoutSeconds: 5, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
   underspeed: { timeoutSeconds: 20, periodSeconds: 45, successThreshold: 2, failureThreshold: 3 },
   lag: { timeoutSeconds: 30, periodSeconds: 10, successThreshold: 3, failureThreshold: 3 },
-  underrun: { minSpeed: 0.98, periodSeconds: 15, successThreshold: 2, failureThreshold: 3 },
 };
 
 describe('row <-> NodeProbeSettings round-trip', () => {
@@ -31,7 +30,6 @@ describe('row <-> NodeProbeSettings round-trip', () => {
       liveness: { timeoutSeconds: 3, periodSeconds: 7, successThreshold: 1, failureThreshold: 5 },
       underspeed: { timeoutSeconds: 15, periodSeconds: 30, successThreshold: 4, failureThreshold: 2 },
       lag: { timeoutSeconds: 60, periodSeconds: 20, successThreshold: 2, failureThreshold: 4 },
-      underrun: { minSpeed: 0.9, periodSeconds: 25, successThreshold: 3, failureThreshold: 6 },
     };
     const row = probeSettingsToRow('zone2', 'n2', custom);
     expect(rowToProbeSettings(row)).toEqual(custom);
@@ -40,12 +38,12 @@ describe('row <-> NodeProbeSettings round-trip', () => {
 
 describe('NODE_PROBE_DEFAULTS', () => {
   // must match migration 013_probe_settings's column defaults exactly
+  // (013 also added underrun_* columns, dropped by 015_drop_underrun)
   it('matches the 013_probe_settings column defaults', () => {
     expect(NODE_PROBE_DEFAULTS).toEqual({
       liveness: { timeoutSeconds: 5, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
       underspeed: { timeoutSeconds: 20, periodSeconds: 45, successThreshold: 2, failureThreshold: 3 },
       lag: { timeoutSeconds: 30, periodSeconds: 10, successThreshold: 3, failureThreshold: 3 },
-      underrun: { minSpeed: 0.98, periodSeconds: 15, successThreshold: 2, failureThreshold: 3 },
     });
   });
 });
@@ -84,7 +82,6 @@ describe('parseProbeSettings', () => {
     const disabled = {
       ...SETTINGS,
       liveness: { timeoutSeconds: 5, periodSeconds: 0, successThreshold: 0, failureThreshold: 0 },
-      underrun: { minSpeed: 0.98, periodSeconds: 0, successThreshold: 0, failureThreshold: 0 },
     };
     expect(parseProbeSettings(disabled)).toEqual(disabled);
   });
@@ -94,14 +91,9 @@ describe('parseProbeSettings', () => {
     expect(() => parseProbeSettings(bad)).toThrow(/liveness\.failureThreshold must be a non-negative integer/);
   });
 
-  it('rejects a missing underrun group', () => {
-    const bad = { ...SETTINGS, underrun: undefined };
-    expect(() => parseProbeSettings(bad)).toThrow(/underrun must be an object/);
-  });
-
-  it('rejects a non-positive underrun.minSpeed, naming the field', () => {
-    const bad = { ...SETTINGS, underrun: { ...SETTINGS.underrun, minSpeed: 0 } };
-    expect(() => parseProbeSettings(bad)).toThrow(/underrun\.minSpeed must be a positive number/);
+  it('an underrun key in the body is ignored (no error)', () => {
+    const withUnderrun = { ...SETTINGS, underrun: { minSpeed: 0.98, periodSeconds: 15, successThreshold: 2, failureThreshold: 3 } };
+    expect(parseProbeSettings(withUnderrun)).toEqual(SETTINGS);
   });
 
   it('rejects NaN/non-numeric values the same as missing ones', () => {
