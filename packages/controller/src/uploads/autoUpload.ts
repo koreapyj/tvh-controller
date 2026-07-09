@@ -137,6 +137,9 @@ const COVERED_STATUSES: UploadStatus[] = [
  *   the upload `incomplete_pick`; once every instance is reachable again the
  *   pick is re-evaluated and a strictly better copy supersedes the upload
  *   (the old remote object is deleted only after the new one verifies).
+ *   Tvh-less zones (config `url: null`) never poll and so never report
+ *   reachable; they are excluded from this reachability accounting entirely
+ *   rather than being permanently treated as an unreachable instance;
  *
  * Evaluation is triggered by recordings/instance-status events; a recording
  * deferred by the grace window arms a one-shot re-check timer for when the
@@ -236,7 +239,10 @@ export class AutoUploader {
 
   private async evaluate(): Promise<void> {
     const threshold = this.cfg.overlapThreshold;
-    const snaps = this.cache.all();
+    // tvh-less zones (url: null) never get a poller, so their reachable flag
+    // stays false forever — exclude them entirely rather than let their
+    // permanent absence poison every auto-upload as an "incomplete pick".
+    const snaps = this.cache.all().filter((s) => s.summary.hasTvh);
     const reachable = snaps.filter((s) => s.summary.reachable);
     if (!reachable.length) return;
     const anyUnreachable = reachable.length < snaps.length;

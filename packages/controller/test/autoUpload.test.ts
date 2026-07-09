@@ -142,9 +142,14 @@ describe('pickBestCopy / strictlyBetter', () => {
 
 const DEBOUNCE_MS = 3_000;
 
-function snap(id: string, finished: TvhDvrEntry[], upcoming: TvhDvrEntry[] = []) {
+function snap(
+  id: string,
+  finished: TvhDvrEntry[],
+  upcoming: TvhDvrEntry[] = [],
+  opts: { reachable?: boolean; hasTvh?: boolean } = {},
+) {
   return {
-    summary: { id, reachable: true },
+    summary: { id, reachable: opts.reachable ?? true, hasTvh: opts.hasTvh ?? true },
     finished,
     upcoming,
     topology: { dvrConfigs: [] },
@@ -231,6 +236,47 @@ describe('AutoUploader grace re-check (Part 1)', () => {
     await vi.advanceTimersByTimeAsync(61_000 + DEBOUNCE_MS + 100);
     expect(dispatcher.enqueue).toHaveBeenCalledTimes(1);
     expect(dispatcher.enqueue.mock.calls[0]![0]).toBe('tyo1');
+    auto.stop();
+  });
+});
+
+describe('AutoUploader reachability accounting (tvh-less zones)', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('excludes a tvh-less zone (hasTvh: false) entirely, so the pick is complete and pass 2 runs', async () => {
+    vi.setSystemTime((2800 + 1000) * 1000); // well past the 120s grace window
+    const { auto, dispatcher, ledger, bus } = makeAuto(
+      [
+        snap('tyo1', [entry({ uuid: 'a1' })]),
+        snap('tyo2', []),
+        snap('ext1', [], [], { reachable: false, hasTvh: false }), // tvh-less zone: no poller, ever
+      ],
+      [],
+    );
+
+    fireRecordings(bus);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
+
+    expect(dispatcher.enqueue).toHaveBeenCalledTimes(1);
+    expect(dispatcher.enqueue.mock.calls[0]![3]).toMatchObject({ incompletePick: false });
+    expect(ledger.listIncompletePicks).toHaveBeenCalled(); // pass 2 must not short-circuit
+    auto.stop();
+  });
+
+  it('a genuinely unreachable tvh instance (hasTvh: true) still marks the pick incomplete and skips pass 2', async () => {
+    vi.setSystemTime((2800 + 1000) * 1000);
+    const { auto, dispatcher, ledger, bus } = makeAuto(
+      [snap('tyo1', [entry({ uuid: 'a1' })]), snap('tyo2', [], [], { reachable: false })],
+      [],
+    );
+
+    fireRecordings(bus);
+    await vi.advanceTimersByTimeAsync(DEBOUNCE_MS + 50);
+
+    expect(dispatcher.enqueue).toHaveBeenCalledTimes(1);
+    expect(dispatcher.enqueue.mock.calls[0]![3]).toMatchObject({ incompletePick: true });
+    expect(ledger.listIncompletePicks).not.toHaveBeenCalled(); // pass 2 skipped
     auto.stop();
   });
 });
