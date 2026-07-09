@@ -19,33 +19,46 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import {
     chanLabel,
     type AribHlsParams,
+    type NodeProbeSettings,
     type RestreamChannelWithStatus,
     type RestreamPlaylist,
     type RestreamProfile,
+    type RestreamerNodeStatus,
   } from '@tvhc/shared';
-  import { api } from '../lib/api.js';
+  import { api, classifyResetError } from '../lib/api.js';
   import { lowestNumberFor } from '../lib/channelPick.js';
   import { errText } from '../lib/fetchGuard.js';
   import { dateTime } from '../lib/format.js';
+  import {
+    channelHasFailoverState,
+    placementBadgeClass,
+    resetUnavailableReason,
+    showActiveCheck,
+  } from '../lib/failoverIndicator.js';
   import { notify } from '../lib/notifications.js';
   import {
     CHANNEL_BATCH_FIELDS,
-    coldActivationLabel,
     compareChannels,
+    failingProbeBadges,
+    probeMeasurementLabel,
     sessionStateBadge,
     uptimeLabel,
   } from '../lib/restreamFields.js';
   import {
     channelOptions,
+    clearRestreamChannelLive,
     instName,
+    restreamChannelLive,
     restreamerNodeKey,
     restreamerNodes,
     restreamerSwitchers,
     seedRestreamers,
   } from '../lib/stores.js';
   import BatchEditModal from '../components/BatchEditModal.svelte';
+  import ProbeConfigModal from '../components/ProbeConfigModal.svelte';
   import RestreamChannelModal from '../components/RestreamChannelModal.svelte';
   import RestreamProfileModal from '../components/RestreamProfileModal.svelte';
+  import SessionModal from '../components/SessionModal.svelte';
 
   let profiles: RestreamProfile[] = $state([]);
   let channels: RestreamChannelWithStatus[] = $state([]);
@@ -59,6 +72,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         api.restreamChannels(),
         api.restreamPlaylists(),
       ]);
+      // a REST refetch is always fresher than any buffered SSE overlay
+      clearRestreamChannelLive();
       notify.dismiss('restreamer-load');
     } catch (err) {
       notify.error(errText(err), { key: 'restreamer-load' });
@@ -112,10 +127,56 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return m;
   });
 
-  function restartSession(instanceId: string, nodeId: string, name: string): void {
-    if (!confirm(`Restart session "${name}" on ${nodeId}? Playback glitches briefly.`)) return;
-    void run(() => api.restartRestreamSession(instanceId, nodeId, name));
+  /** node card muted line: version / uptime / last measurement, in order, only the pieces we have */
+  function nodeMutedLine(n: RestreamerNodeStatus): string {
+    const parts: string[] = [];
+    if (n.version) parts.push(`v${n.version}`);
+    if (n.uptimeSec !== null) parts.push(`up ${uptimeLabel(n.uptimeSec)}`);
+    const measured = probeMeasurementLabel(n);
+    if (measured) parts.push(measured);
+    return parts.join(' · ');
   }
+
+  // ---------- per-node probe settings ----------
+
+  let probeModal: {
+    instanceId: string;
+    nodeId: string;
+    nodeLabel: string;
+    initial: NodeProbeSettings;
+  } | null = $state(null);
+
+  async function openProbeModal(n: RestreamerNodeStatus): Promise<void> {
+    try {
+      const initial = await api.restreamerNodeProbes(n.instanceId, n.nodeId);
+      probeModal = { instanceId: n.instanceId, nodeId: n.nodeId, nodeLabel: n.nodeId, initial };
+    } catch (err) {
+      notify.error(errText(err));
+    }
+  }
+
+  async function saveProbes(payload: NodeProbeSettings): Promise<void> {
+    const m = probeModal;
+    if (!m) return;
+    probeModal = null;
+    try {
+      await api.updateRestreamerNodeProbes(m.instanceId, m.nodeId, payload);
+      notify.success(`Probe settings saved for ${m.nodeLabel}`);
+    } catch (err) {
+      notify.error(errText(err));
+    }
+  }
+
+  // ---------- session detail modal ----------
+
+  let sessionModal: { instanceId: string; nodeId: string; name: string } | null = $state(null);
+
+  const sessionModalNode = $derived(
+    sessionModal ? $restreamerNodes[restreamerNodeKey(sessionModal)] : undefined,
+  );
+  const sessionModalSession = $derived(
+    sessionModal ? sessionModalNode?.sessions.find((s) => s.name === sessionModal!.name) : undefined,
+  );
 
   // ---------- channels ----------
 
@@ -144,7 +205,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 
   let batchEditing = $state(false);
-  let batchPlaylist = $state('');
 
   async function runChannelBatch(
     action: 'edit' | 'delete' | 'enable' | 'disable' | 'add-playlist' | 'remove-playlist',
@@ -200,17 +260,44 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     if (c.placements.filter((p) => p.enabled).length < 2) return; // not redundant — nothing to switch
     if (c.activePlacementId === placementId) return;
     if (!confirm(`Switch "${c.slug}" to ${label}? Viewers see one discontinuity.`)) return;
-    void run(() => api.switchRestreamChannel(c.id, { placementId }));
+    void run(async () => {
+      const res = await api.switchRestreamChannel(c.id, { placementId });
+      if (res.queued) notify.info(`Switch to ${label} queued`);
+      else if (res.already) notify.info(`"${c.slug}" is already on ${label}`);
+    });
   }
 
   /** undo manual switching: back to the highest-priority HEALTHY placement */
   function resetSwitch(c: RestreamChannelWithStatus): void {
     if (!confirm(`Reset "${c.slug}" to its highest-priority healthy placement? Viewers may see one discontinuity.`)) return;
-    void run(async () => {
-      const res = await api.switchRestreamChannel(c.id, { reset: true });
-      if (res.already) notify.info(`"${c.slug}" is already on its priority upstream`);
+    void doResetSwitch(c, false);
+  }
+
+  async function doResetSwitch(c: RestreamChannelWithStatus, force: boolean): Promise<void> {
+    busy = true;
+    try {
+      const res = await api.switchRestreamChannel(c.id, force ? { reset: true, force: true } : { reset: true });
+      if (res.cleared) notify.success(`"${c.slug}" failover state cleared`);
+      else if (res.already) notify.info(`"${c.slug}" is already on its priority upstream`);
+      else if (res.aborted) notify.success(`"${c.slug}" failover procedure reverted`);
+      else if (res.queued) notify.success(`"${c.slug}" reset queued`);
       else notify.success(`"${c.slug}" reset to its priority upstream`);
-    });
+      await refreshAll();
+    } catch (err) {
+      const cls = classifyResetError(err);
+      if (cls?.kind === 'rejected-mid-procedure') {
+        alert(cls.message);
+      } else if (cls?.kind === 'requires-confirm') {
+        if (confirm(`${cls.message} Reset anyway?`)) {
+          await doResetSwitch(c, true);
+          return;
+        }
+      } else {
+        notify.error(errText(err));
+      }
+    } finally {
+      busy = false;
+    }
   }
 
   function placementTitle(
@@ -221,7 +308,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       `${p.nodeId} — ${p.session?.state ?? 'no session'}`,
     ];
     if (!p.enabled) parts.push('placement disabled');
-    if (p.mode === 'cold') parts.push(p.coldActive ? 'cold backup — active' : 'cold backup — standby');
+    if (p.indicator && p.indicator !== 'idle') parts.push(`failover: ${p.indicator}`);
     if (p.blockedReason) parts.push(`blocked: ${p.blockedReason}`);
     if (p.session?.lastError) parts.push(p.session.lastError);
     if (c.activePlacementId === p.id && c.placements.length > 1) {
@@ -263,6 +350,26 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   function removeProfile(p: RestreamProfile): void {
     if (!confirm(`Delete profile "${p.name}"?`)) return;
     void run(() => api.deleteRestreamProfile(p.id)); // 409 while referenced surfaces as a toast
+  }
+
+  interface ProfileCloneState {
+    source: RestreamProfile;
+    name: string;
+  }
+  let profileCloning: ProfileCloneState | null = $state(null);
+
+  function openProfileClone(p: RestreamProfile): void {
+    profileCloning = { source: p, name: `${p.name} (copy)` };
+  }
+
+  async function doProfileClone(): Promise<void> {
+    const c = profileCloning;
+    if (!c) return;
+    profileCloning = null;
+    await run(async () => {
+      await api.cloneRestreamProfile(c.source.id, c.name.trim());
+      notify.success(`Cloned profile "${c.source.name}"`);
+    });
   }
 
   // ---------- playlists ----------
@@ -392,29 +499,36 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {#if n.pendingPush}<span class="badge warn" title="the controller's desired doc is not confirmed pushed to this node">pending push</span>{/if}
           {#if !n.apiVersionSupported}<span class="badge bad" title="node reports an apiVersion the controller doesn't speak">api?</span>{/if}
         </h3>
-        <div class="muted small">
-          {n.url}
-          {#if n.version}&nbsp;· v{n.version}{/if}
-          {#if n.uptimeSec !== null}&nbsp;· up {uptimeLabel(n.uptimeSec)}{/if}
-        </div>
+        {#if failingProbeBadges(n).length}
+          <div style="margin:4px 0">
+            {#each failingProbeBadges(n) as fb (fb.name)}
+              <span class="badge warn">{fb.name}:{fb.count}</span>
+            {/each}
+          </div>
+        {/if}
+        <div class="muted small">{nodeMutedLine(n)}</div>
         {#if n.error}<div class="small" style="color:var(--bad)">{n.error}</div>{/if}
-        <div style="margin:8px 0">
+        <div style="margin:8px 0;display:flex;gap:8px">
           <button disabled={busy} onclick={() => run(() => api.pushRestreamerNode(n.instanceId, n.nodeId))}>
             Push now
           </button>
+          <button disabled={busy} onclick={() => openProbeModal(n)}>Probes…</button>
         </div>
         {#if n.sessions.length}
           <table>
             <thead>
-              <tr><th>Session</th><th>State</th><th>Restarts</th><th>Lag</th><th></th></tr>
+              <tr><th>Session</th><th>State</th><th>Restarts</th><th>Lag</th></tr>
             </thead>
             <tbody>
               {#each n.sessions as s (s.name)}
                 <tr>
                   <td class="small">
-                    {#if n.serveUrl}
-                      <a href="{n.serveUrl}/{s.name}/playlist.m3u8" target="_blank" title="open the HLS playlist">{s.name}</a>
-                    {:else}{s.name}{/if}
+                    <button
+                      class="linklike"
+                      onclick={() => (sessionModal = { instanceId: n.instanceId, nodeId: n.nodeId, name: s.name })}
+                    >
+                      {s.name}
+                    </button>
                   </td>
                   <td>
                     <span
@@ -423,6 +537,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                     >
                       {s.state}
                     </span>
+                    {#if s.lagProbe?.consecutiveFailures}
+                      <span class="badge warn" title="channel-level lag probe failing">lag:{s.lagProbe.consecutiveFailures}</span>
+                    {/if}
+                    {#if s.underrunProbe?.consecutiveFailures}
+                      <span class="badge warn" title="encoder-underrun probe failing">underrun:{s.underrunProbe.consecutiveFailures}</span>
+                    {/if}
                   </td>
                   <td class="small">
                     <span
@@ -433,15 +553,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                   </td>
                   <td class="small">
                     {#if s.playlistLagSec !== undefined}{Math.round(s.playlistLagSec)}s{:else}<span class="muted">—</span>{/if}
-                  </td>
-                  <td style="text-align:right">
-                    <button
-                      disabled={busy}
-                      title="kill + respawn, reset backoff"
-                      onclick={() => restartSession(n.instanceId, n.nodeId, s.name)}
-                    >
-                      Restart
-                    </button>
                   </td>
                 </tr>
               {/each}
@@ -466,27 +577,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <div class="toolbar">
     <span class="muted small">{selectedIds.length} selected</span>
     <button disabled={busy} onclick={() => (batchEditing = true)}>Edit…</button>
-    <button disabled={busy} onclick={() => runChannelBatch('enable', selectedIds)}>Enable</button>
-    <button disabled={busy} onclick={() => runChannelBatch('disable', selectedIds)}>Disable</button>
     <button class="danger" disabled={busy} onclick={batchDelete}>Delete</button>
-    <select style="width:auto" bind:value={batchPlaylist} aria-label="playlist for batch add/remove">
-      <option value="" disabled>playlist…</option>
-      {#each playlists as pl (pl.id)}
-        <option value={pl.id}>{pl.title}</option>
-      {/each}
-    </select>
-    <button
-      disabled={busy || !batchPlaylist}
-      onclick={() => runChannelBatch('add-playlist', selectedIds, { playlistId: batchPlaylist })}
-    >
-      Add to playlist
-    </button>
-    <button
-      disabled={busy || !batchPlaylist}
-      onclick={() => runChannelBatch('remove-playlist', selectedIds, { playlistId: batchPlaylist })}
-    >
-      Remove from playlist
-    </button>
     <button onclick={() => (selected = {})}>Clear selection</button>
   </div>
 {/if}
@@ -513,6 +604,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   </thead>
   <tbody>
     {#each orderedChannels as c (c.id)}
+      {@const live = $restreamChannelLive[c.id] ?? c}
       <tr class="m-card">
         <td>
           <input
@@ -530,17 +622,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             {/if}
           {/if}
           {chanLabel(c.channelName, c.channelNumber)}
-          {#if c.coldActivation}
-            {@const ca = c.coldActivation}
-            <span
-              class="badge warn"
-              title="cold backup active — {coldActivationLabel(ca.reason)} since {dateTime(ca.activatedAt)}"
-            >
-              failover
-            </span>
-          {/if}
-          {#if c.coldBlocked}
-            <span class="muted small" title="cold backup could not activate: {c.coldBlocked}">⚠</span>
+          {#if live.failoverBlocked}
+            <span class="badge warn" title="failover blocked: {live.failoverBlocked}">blocked</span>
           {/if}
           {#if c.comment}<div class="muted small">{c.comment}</div>{/if}
         </td>
@@ -572,27 +655,33 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {/each}
         </td>
         <td class="m-inline" style="white-space:nowrap">
-          {#each [...c.placements].sort((a, b) => a.priority - b.priority) as p (p.id)}
+          {#each [...live.placements].sort((a, b) => a.priority - b.priority) as p (p.id)}
+            {@const cls = placementBadgeClass(p.indicator, { enabled: p.enabled, sessionState: p.session?.state ?? null })}
+            {@const redundant = live.placements.filter((x) => x.enabled).length > 1}
+            {@const showCheck = showActiveCheck(p.indicator, live.activePlacementId === p.id, redundant)}
             <button
-              class="badge badge-button {p.enabled ? (p.session ? sessionStateBadge(p.session.state) : 'neutral') : 'neutral'}"
-              title={placementTitle(c, p)}
-              onclick={() => forceSwitch(c, p.id, `${$instName(p.instanceId)} / ${p.nodeId}`)}
+              class="badge badge-button {cls}"
+              title={placementTitle(live, p)}
+              onclick={() => forceSwitch(live, p.id, `${$instName(p.instanceId)} / ${p.nodeId}`)}
             >
-              {#if c.activePlacementId === p.id && c.placements.length > 1}✓&nbsp;{/if}{p.nodeId}{#if p.blockedReason}&nbsp;⚠{/if}
+              {#if showCheck}✓&nbsp;{/if}{p.nodeId}{#if p.blockedReason}&nbsp;⚠{/if}
             </button>
           {:else}
             <span class="muted small m-hide">no placements</span>
           {/each}
         </td>
         <td style="white-space:nowrap;text-align:right">
-          <button
-            disabled={busy}
-            title="switch back to the highest-priority healthy placement"
-            onclick={() => resetSwitch(c)}
-          >
-            Reset
-          </button>
-          <button disabled={busy} onclick={() => (channelModal = { channel: c })}>Edit</button>
+          {#if channelHasFailoverState(live.failover)}
+            {@const resetBlocked = resetUnavailableReason(live.failover)}
+            <button
+              disabled={busy || resetBlocked !== null}
+              title={resetBlocked ?? 'fail back to the natural placement (first hot)'}
+              onclick={() => resetSwitch(live)}
+            >
+              Reset
+            </button>
+          {/if}
+          <button disabled={busy} onclick={() => (channelModal = { channel: live })}>Edit</button>
           <button class="danger" disabled={busy} onclick={() => removeChannel(c)}>Delete</button>
         </td>
       </tr>
@@ -623,6 +712,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </td>
         <td style="white-space:nowrap;text-align:right">
           <button disabled={busy} onclick={() => (profileModal = { profile: p })}>Edit</button>
+          <button disabled={busy} onclick={() => openProfileClone(p)}>Clone</button>
           <button class="danger" disabled={busy} onclick={() => removeProfile(p)}>Delete</button>
         </td>
       </tr>
@@ -697,6 +787,22 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   />
 {/if}
 
+{#if profileCloning}
+  <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (profileCloning = null)}>
+    <div class="modal" style="width:480px" role="dialog" aria-modal="true" aria-label={`Clone ${profileCloning.source.name}`}>
+      <h2 style="margin-top:0">Clone profile: {profileCloning.source.name}</h2>
+      <div>
+        <label for="profile-clone-name">Name</label>
+        <input id="profile-clone-name" bind:value={profileCloning.name} />
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+        <button onclick={() => (profileCloning = null)}>Cancel</button>
+        <button class="primary" disabled={!profileCloning.name.trim() || busy} onclick={doProfileClone}>Create</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if playlistModal}
   <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && (playlistModal = null)}>
     <div
@@ -731,11 +837,30 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   <BatchEditModal
     title={`Edit ${selectedIds.length} channel${selectedIds.length === 1 ? '' : 's'}`}
     subtitle="Ticked fields are applied to every selected channel; affected nodes are re-pushed."
-    fields={CHANNEL_BATCH_FIELDS(profiles)}
+    fields={CHANNEL_BATCH_FIELDS(profiles, playlists)}
     onsave={(out) => {
       batchEditing = false;
       void runChannelBatch('edit', selectedIds, { patch: out.fields });
     }}
     oncancel={() => (batchEditing = false)}
+  />
+{/if}
+
+{#if probeModal}
+  <ProbeConfigModal
+    nodeLabel={probeModal.nodeLabel}
+    initial={probeModal.initial}
+    onsave={saveProbes}
+    oncancel={() => (probeModal = null)}
+  />
+{/if}
+
+{#if sessionModal && sessionModalSession}
+  <SessionModal
+    instanceId={sessionModal.instanceId}
+    nodeId={sessionModal.nodeId}
+    session={sessionModalSession}
+    serveUrl={sessionModalNode?.serveUrl ?? null}
+    onclose={() => (sessionModal = null)}
   />
 {/if}

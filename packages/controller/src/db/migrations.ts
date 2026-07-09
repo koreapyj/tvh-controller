@@ -379,6 +379,136 @@ migrations['012_cold_backup_placements'] = {
   },
 };
 
+migrations['013_probe_settings'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // per-node probe thresholds (UI-editable); absent row ⇒ code defaults.
+    // Nodes live in config.yaml (no FK target exists) — a row whose
+    // (instance_id, node_id) no longer matches config is simply ignored.
+    // underrun has min_speed (a speed-ratio threshold) instead of a timeout.
+    await db.schema
+      .createTable('restream_node_probes')
+      .addColumn('instance_id', 'varchar(64)', (c) => c.notNull())
+      .addColumn('node_id', 'varchar(64)', (c) => c.notNull())
+      .addColumn('liveness_timeout_seconds', 'integer', (c) => c.notNull().defaultTo(5))
+      .addColumn('liveness_period_seconds', 'integer', (c) => c.notNull().defaultTo(10))
+      .addColumn('liveness_success_threshold', 'integer', (c) => c.notNull().defaultTo(2))
+      .addColumn('liveness_failure_threshold', 'integer', (c) => c.notNull().defaultTo(3))
+      .addColumn('underspeed_timeout_seconds', 'integer', (c) => c.notNull().defaultTo(20))
+      .addColumn('underspeed_period_seconds', 'integer', (c) => c.notNull().defaultTo(45))
+      .addColumn('underspeed_success_threshold', 'integer', (c) => c.notNull().defaultTo(2))
+      .addColumn('underspeed_failure_threshold', 'integer', (c) => c.notNull().defaultTo(3))
+      .addColumn('lag_timeout_seconds', 'integer', (c) => c.notNull().defaultTo(30))
+      .addColumn('lag_period_seconds', 'integer', (c) => c.notNull().defaultTo(10))
+      .addColumn('lag_success_threshold', 'integer', (c) => c.notNull().defaultTo(3))
+      .addColumn('lag_failure_threshold', 'integer', (c) => c.notNull().defaultTo(3))
+      .addColumn('underrun_min_speed', 'real', (c) => c.notNull().defaultTo(0.98))
+      .addColumn('underrun_period_seconds', 'integer', (c) => c.notNull().defaultTo(15))
+      .addColumn('underrun_success_threshold', 'integer', (c) => c.notNull().defaultTo(2))
+      .addColumn('underrun_failure_threshold', 'integer', (c) => c.notNull().defaultTo(3))
+      .addColumn('updated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .addPrimaryKeyConstraint('pk_restream_node_probes', ['instance_id', 'node_id'])
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.dropTable('restream_node_probes').execute();
+  },
+};
+
+migrations['014_failover_state'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // generalizes restream_cold_activations: one persisted failover procedure
+    // (or its completed result) per channel. Node docs EXCLUDE from_placement
+    // once suppress_from and phase >= stopping-old; switcher docs KEEP it for
+    // the row's whole lifetime so retained seg/<old-id>/ URIs stay resolvable
+    // while the served window drains. drain_until bounds the terminal
+    // 'draining' phase after a reset completes.
+    await db.schema
+      .createTable('restream_failover_state')
+      .addColumn('channel_id', 'varchar(36)', (c) =>
+        c.primaryKey().references('restream_channels.id').onDelete('cascade'),
+      )
+      .addColumn('from_placement_id', 'varchar(36)', (c) =>
+        c.references('restream_placements.id').onDelete('set null'),
+      )
+      .addColumn('to_placement_id', 'varchar(36)', (c) =>
+        c.notNull().references('restream_placements.id').onDelete('cascade'),
+      )
+      .addColumn('phase', 'varchar(24)', (c) => c.notNull())
+      // 'liveness' | 'underspeed' | 'underrun' | 'lag' | 'manual' | 'reset' | 'rebalance'
+      .addColumn('trigger_reason', 'varchar(16)', (c) => c.notNull())
+      // set for instance-level triggers (liveness/underspeed) — reset re-checks it
+      .addColumn('trigger_node_id', 'varchar(64)')
+      .addColumn('trigger_detail', 'text')
+      .addColumn('suppress_from', 'boolean', (c) => c.notNull().defaultTo(0))
+      .addColumn('drain_until', 'timestamp')
+      .addColumn('started_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .addColumn('updated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .execute();
+
+    // carry existing cold activations forward as completed failovers with the
+    // exact same runtime meaning: cold to_placement stays in the docs
+    // (inclusion via to_placement_id), nothing suppressed (suppress_from=0)
+    interface OldColdRow {
+      channel_id: string;
+      placement_id: string;
+      preferred_placement_id: string | null;
+      reason: string;
+      activated_at: Date | string;
+    }
+    const reasonMap: Record<string, string> = {
+      'node-unreachable': 'liveness',
+      'session-unhealthy': 'lag',
+      'delivery-slow': 'underspeed',
+    };
+    const toSqlTs = (v: Date | string): string =>
+      (v instanceof Date ? v : new Date(v)).toISOString().slice(0, 19).replace('T', ' ');
+    const d = db as Kysely<{
+      restream_cold_activations: OldColdRow;
+      restream_failover_state: Record<string, unknown>;
+    }>;
+    const old = await d.selectFrom('restream_cold_activations').selectAll().execute();
+    for (const row of old) {
+      await d
+        .insertInto('restream_failover_state')
+        .values({
+          channel_id: row.channel_id,
+          from_placement_id: row.preferred_placement_id,
+          to_placement_id: row.placement_id,
+          phase: 'complete',
+          trigger_reason: reasonMap[row.reason] ?? 'lag',
+          trigger_node_id: null,
+          trigger_detail: `migrated from cold activation (${row.reason})`,
+          suppress_from: 0,
+          drain_until: null,
+          started_at: toSqlTs(row.activated_at),
+          updated_at: toSqlTs(row.activated_at),
+        })
+        .execute();
+    }
+
+    await db.schema.dropTable('restream_cold_activations').execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    // schema-only reconstruction (matching 012); failover rows are not mapped back
+    await db.schema
+      .createTable('restream_cold_activations')
+      .addColumn('channel_id', 'varchar(36)', (c) =>
+        c.primaryKey().references('restream_channels.id').onDelete('cascade'),
+      )
+      .addColumn('placement_id', 'varchar(36)', (c) =>
+        c.notNull().unique().references('restream_placements.id').onDelete('cascade'),
+      )
+      .addColumn('preferred_placement_id', 'varchar(36)', (c) =>
+        c.references('restream_placements.id').onDelete('set null'),
+      )
+      .addColumn('reason', 'varchar(20)', (c) => c.notNull())
+      .addColumn('activated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .addColumn('updated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .execute();
+    await db.schema.dropTable('restream_failover_state').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;
@@ -388,6 +518,21 @@ const provider: MigrationProvider = {
 export async function migrateToLatest<T>(db: Kysely<T>): Promise<void> {
   const migrator = new Migrator({ db: db as Kysely<unknown>, provider });
   const { error, results } = await migrator.migrateToLatest();
+  if (error) {
+    const failed = results?.find((r) => r.status === 'Error');
+    throw new Error(`migration ${failed?.migrationName ?? ''} failed: ${String(error)}`);
+  }
+}
+
+/**
+ * Test-only stepwise migration: migrate a fresh db up to (and including) a
+ * named migration, no further. Lets tests seed rows under an older schema
+ * revision before migrating the rest of the way forward (migration
+ * carry-over coverage) without duplicating the migration table above.
+ */
+export async function migrateTo<T>(db: Kysely<T>, targetMigrationName: string): Promise<void> {
+  const migrator = new Migrator({ db: db as Kysely<unknown>, provider });
+  const { error, results } = await migrator.migrateTo(targetMigrationName);
   if (error) {
     const failed = results?.find((r) => r.status === 'Error');
     throw new Error(`migration ${failed?.migrationName ?? ''} failed: ${String(error)}`);

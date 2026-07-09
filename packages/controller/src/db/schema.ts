@@ -131,21 +131,57 @@ export interface RestreamPlacementsTable {
 }
 
 /**
- * one active cold backup per channel (PK = channel_id). Row present = the
- * cold placement is included in node/switcher docs; absent = standby. The
- * failover loop's debounce/streak state is in-memory only — this row is the
- * single persisted decision, so a controller restart never orphans a running
- * cold session.
+ * one persisted failover procedure (or its completed result) per channel
+ * (PK = channel_id). Every orchestrator action is re-derivable from this row,
+ * so a controller restart resumes mid-procedure safely. to_placement_id is
+ * included in node/switcher docs (the cold-activation equivalent);
+ * from_placement_id is excluded from its NODE doc once suppress_from and
+ * phase >= 'stopping-old' but stays in SWITCHER docs for the row's lifetime
+ * (retained-window drain). Probe streaks / queue order are in-memory only.
  */
-export interface RestreamColdActivationsTable {
+export interface RestreamFailoverStateTable {
   channel_id: string;
-  placement_id: string;
-  /** the hot placement whose failure triggered this — diagnostics only */
-  preferred_placement_id: string | null;
-  /** 'node-unreachable' | 'session-unhealthy' | 'delivery-slow' */
-  reason: string;
-  activated_at: ColumnType<Date, string | undefined, string>;
+  /** outgoing placement; null = there was none (first activation) or it was deleted */
+  from_placement_id: string | null;
+  /** target placement of the (possibly completed) procedure */
+  to_placement_id: string;
+  /** FailoverPhase — 'bringing-up' … 'complete' | 'draining' */
+  phase: string;
+  /** 'liveness' | 'underspeed' | 'underrun' | 'lag' | 'manual' | 'reset' | 'rebalance' */
+  trigger_reason: string;
+  /** set for instance-level triggers — reset re-checks this node's probes */
+  trigger_node_id: string | null;
+  trigger_detail: string | null;
+  /** 1 = stop from_placement's encode once the switch is confirmed */
+  suppress_from: number;
+  /** terminal 'draining' phase deadline; row deleted once passed */
+  drain_until: ColumnType<Date | null, string | null, string | null>;
+  started_at: ColumnType<Date, string | undefined, string>;
   updated_at: ColumnType<Date, string | undefined, string>;
+}
+
+/** per-node probe thresholds (UI-editable); absent row ⇒ code defaults */
+export interface RestreamNodeProbesTable {
+  instance_id: string;
+  node_id: string;
+  liveness_timeout_seconds: number;
+  liveness_period_seconds: number;
+  liveness_success_threshold: number;
+  liveness_failure_threshold: number;
+  underspeed_timeout_seconds: number;
+  underspeed_period_seconds: number;
+  underspeed_success_threshold: number;
+  underspeed_failure_threshold: number;
+  lag_timeout_seconds: number;
+  lag_period_seconds: number;
+  lag_success_threshold: number;
+  lag_failure_threshold: number;
+  /** ffmpeg progress.speed below this = underrun fail (in place of a timeout) */
+  underrun_min_speed: number;
+  underrun_period_seconds: number;
+  underrun_success_threshold: number;
+  underrun_failure_threshold: number;
+  updated_at: ColumnType<Date, string, string>;
 }
 
 /** last successfully pushed desired-doc hash per node (doc is atomic — one hash) */
@@ -189,7 +225,8 @@ export interface Database {
   restream_profiles: RestreamProfilesTable;
   restream_channels: RestreamChannelsTable;
   restream_placements: RestreamPlacementsTable;
-  restream_cold_activations: RestreamColdActivationsTable;
+  restream_failover_state: RestreamFailoverStateTable;
+  restream_node_probes: RestreamNodeProbesTable;
   restream_node_state: RestreamNodeStateTable;
   restream_playlists: RestreamPlaylistsTable;
   restream_playlist_members: RestreamPlaylistMembersTable;

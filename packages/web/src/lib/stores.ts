@@ -22,6 +22,7 @@ import type {
   ConflictWindow,
   DriftItem,
   InstanceSummary,
+  RestreamChannelWithStatus,
   RestreamerNodeStatus,
   SwitcherNodeStatus,
   TvhInputStatus,
@@ -81,4 +82,23 @@ export function seedRestreamers(
 ): void {
   restreamerNodes.set(Object.fromEntries(nodes.map((n) => [restreamerNodeKey(n), n])));
   restreamerSwitchers.set(Object.fromEntries(switchers.map((s) => [s.switcherId, s])));
+}
+
+/**
+ * Live restream-channel status keyed by channel id — SSE-fed (`restreamer-
+ * channel` events carry the full REST shape, replace-by-id). The Restreamer
+ * page seeds channels from the REST fetch and only overlays this map for
+ * freshness; clearRestreamChannelLive() drops stale entries once a REST
+ * refetch (which is always fresher) lands.
+ */
+export const restreamChannelLive = writable<Record<string, RestreamChannelWithStatus>>({});
+
+/** merge one SSE `restreamer-channel` event into the live map (replace-by-id) */
+export function applyRestreamChannel(ch: RestreamChannelWithStatus): void {
+  restreamChannelLive.update((m) => ({ ...m, [ch.id]: ch }));
+}
+
+/** drop every live overlay — call right after a REST refetch of the channel list */
+export function clearRestreamChannelLive(): void {
+  restreamChannelLive.set({});
 }

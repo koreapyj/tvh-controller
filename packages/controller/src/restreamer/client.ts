@@ -142,10 +142,32 @@ export class RestreamerClient {
     await this.req<unknown>('POST', `/v1/sessions/${encodeURIComponent(name)}/restart`);
   }
 
-  /** stderr ring-buffer tail for one session */
-  sessionLog(name: string, lines?: number): Promise<LogLine[]> {
+  /** zero one session's lifetime restarts counter (the generation is untouched) */
+  async resetSessionRestarts(name: string): Promise<void> {
+    await this.req<unknown>('POST', `/v1/sessions/${encodeURIComponent(name)}/restarts/reset`);
+  }
+
+  /** stderr ring-buffer tail for one session (daemon wraps it as {name, lines}) */
+  async sessionLog(name: string, lines?: number): Promise<LogLine[]> {
     const qs = lines === undefined ? '' : `?lines=${lines}`;
-    return this.req<LogLine[]>('GET', `/v1/sessions/${encodeURIComponent(name)}/log${qs}`);
+    const res = await this.req<{ name: string; lines: LogLine[] }>(
+      'GET',
+      `/v1/sessions/${encodeURIComponent(name)}/log${qs}`,
+    );
+    return res.lines;
+  }
+
+  /**
+   * The daemon's live SSE log stream, as a raw fetch Response: long-lived by
+   * design (no timeout — the caller owns the AbortSignal) and relayed
+   * byte-for-byte to the browser. Non-2xx responses are returned as-is for
+   * the relay to surface.
+   */
+  sessionLogStream(name: string, signal: AbortSignal): Promise<Response> {
+    return this.fetchImpl(`${this.baseUrl}/v1/sessions/${encodeURIComponent(name)}/log/stream`, {
+      method: 'GET',
+      signal,
+    });
   }
 }
 

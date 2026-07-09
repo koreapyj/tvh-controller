@@ -91,7 +91,12 @@ export function recordSnapshot(
   for (const session of status.sessions) {
     const prior = history.perSession.get(session.name) ?? [];
     const sample: AdmissionSample = {
-      speed: session.progress?.speed ?? null,
+      // ffmpeg emits `speed=N/A` for some pipelines (observed in prod: a
+      // healthy session reporting speed=0/out_time=0 indefinitely); the
+      // daemon coerces that to 0 because the wire contract requires a
+      // number. 0 therefore means UNKNOWN, never slowness — map it to null
+      // (absence is not slowness, per degradedReason's rules).
+      speed: session.progress && session.progress.speed > 0 ? session.progress.speed : null,
       playlistLagSec: session.playlistLagSec ?? null,
     };
     const next = [...prior, sample];

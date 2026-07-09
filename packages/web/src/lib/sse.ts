@@ -20,6 +20,7 @@ import type {
   ConflictWindow,
   DriftItem,
   InstanceSummary,
+  RestreamChannelWithStatus,
   RestreamerNodeStatus,
   SwitcherNodeStatus,
   TvhInputStatus,
@@ -27,6 +28,7 @@ import type {
   UploadJob,
 } from '@tvhc/shared';
 import {
+  applyRestreamChannel,
   applyRestreamerNode,
   applyRestreamerSwitcher,
   conflictsByInstance,
@@ -100,5 +102,9 @@ export function connectSse(): void {
 
   source.addEventListener('restreamer-switcher', (e) => {
     applyRestreamerSwitcher(JSON.parse(e.data) as SwitcherNodeStatus);
+  });
+
+  source.addEventListener('restreamer-channel', (e) => {
+    applyRestreamChannel(JSON.parse(e.data) as RestreamChannelWithStatus);
   });
 }

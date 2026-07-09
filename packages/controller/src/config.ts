@@ -79,6 +79,10 @@ export interface SwitcherConfig {
  * slowness is invisible to playlist-level health — this probe downloads one
  * real segment per cache per interval. Absent block = probe off, and the
  * cold-backup delivery-slow trigger never fires.
+ *
+ * @deprecated Superseded by the DB-backed per-node probe settings
+ * (restream_node_probes, edited in the UI). Still parsed so existing
+ * config.yaml files keep loading, but nothing consumes it anymore.
  */
 export interface DeliveryProbeAppConfig {
   intervalSec: number;

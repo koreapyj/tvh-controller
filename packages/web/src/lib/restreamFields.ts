@@ -26,9 +26,10 @@
 import {
   chanNumberOrder,
   type AribHlsParams,
-  type ColdActivationReason,
   type RestreamChannel,
+  type RestreamerNodeStatus,
   type RestreamPlacement,
+  type RestreamPlaylist,
   type RestreamProfile,
   type SessionState,
   type TvhSubscription,
@@ -277,11 +278,13 @@ export function buildProfilePayload(state: ProfileFormState): BuildProfileResult
 // ---------------------------------------------------------------------------
 
 /**
- * Batch-edit fields for restream channels. Profile options are runtime data,
- * so this is a builder rather than a constant. Playlist add/remove are
- * separate batch ACTIONS (own endpoints), not patch fields.
+ * Batch-edit fields for restream channels. Profile/playlist options are
+ * runtime data, so this is a builder rather than a constant.
  */
-export function CHANNEL_BATCH_FIELDS(profiles: RestreamProfile[]): FieldSpec[] {
+export function CHANNEL_BATCH_FIELDS(
+  profiles: RestreamProfile[],
+  playlists: RestreamPlaylist[],
+): FieldSpec[] {
   return [
     { key: 'enabled', label: 'Enabled', type: 'bool' },
     {
@@ -291,6 +294,12 @@ export function CHANNEL_BATCH_FIELDS(profiles: RestreamProfile[]): FieldSpec[] {
       strOptions: profiles.map((p) => ({ value: p.id, label: p.name })),
     },
     { key: 'comment', label: 'Comment', type: 'str' },
+    {
+      key: 'playlistIds',
+      label: 'Playlists',
+      type: 'multiselect',
+      strOptions: playlists.map((p) => ({ value: p.id, label: p.title })),
+    },
   ];
 }
 
@@ -354,25 +363,45 @@ export function sessionStateBadge(state: SessionState): string {
 
 /**
  * Placement mode badge (hot/cold). Hot placements always encode and carry no
- * badge; cold placements show their current activation state.
+ * badge. Cold's active/standby distinction is no longer a placement-local
+ * boolean — it's driven by the failover indicator (see
+ * failoverIndicator.ts#placementBadgeClass) — so this is just the static
+ * "cold" tag.
  */
-export function placementModeBadge(
-  p: Pick<RestreamPlacement, 'mode'> & { coldActive: boolean },
-): { cls: string; label: string } | null {
+export function placementModeBadge(p: Pick<RestreamPlacement, 'mode'>): { cls: string; label: string } | null {
   if (p.mode === 'hot') return null;
-  return p.coldActive ? { cls: 'warn', label: 'cold · active' } : { cls: 'neutral', label: 'cold' };
+  return { cls: 'neutral', label: 'cold' };
 }
 
-/** short human text for why the failover loop activated a cold backup */
-export function coldActivationLabel(reason: ColdActivationReason): string {
-  switch (reason) {
-    case 'node-unreachable':
-      return 'node down';
-    case 'session-unhealthy':
-      return 'session unhealthy';
-    case 'delivery-slow':
-      return 'delivery slow';
+/** liveness/underspeed probes currently below threshold (per-node instance-level probes) */
+export function failingProbeBadges(n: RestreamerNodeStatus): Array<{ name: string; count: number }> {
+  const out: Array<{ name: string; count: number }> = [];
+  const probes = n.probes;
+  if (!probes) return out;
+  if (probes.liveness.consecutiveFailures > 0) {
+    out.push({ name: 'liveness', count: probes.liveness.consecutiveFailures });
   }
+  if (probes.underspeed.consecutiveFailures > 0) {
+    out.push({ name: 'underspeed', count: probes.underspeed.consecutiveFailures });
+  }
+  return out;
+}
+
+/**
+ * Compact "net 1.4× · lag 4s" summary of a node's last measurements: the
+ * node-level underspeed ratio, and the WORST (max) session lag across its
+ * sessions. Either piece is omitted when not measured yet; null when nothing
+ * is measured at all.
+ */
+export function probeMeasurementLabel(n: RestreamerNodeStatus): string | null {
+  const parts: string[] = [];
+  const ratio = n.probes?.underspeed.lastSpeedRatio;
+  if (ratio !== null && ratio !== undefined) parts.push(`net ${ratio.toFixed(1)}×`);
+  const lagValues = n.sessions
+    .map((s) => s.lagProbe?.lastLagSec)
+    .filter((v): v is number => v !== null && v !== undefined);
+  if (lagValues.length) parts.push(`lag ${Math.round(Math.max(...lagValues))}s`);
+  return parts.length ? parts.join(' · ') : null;
 }
 
 /**

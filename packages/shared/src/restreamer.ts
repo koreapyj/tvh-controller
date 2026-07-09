@@ -41,8 +41,117 @@ export interface RestreamProfile {
   updatedAt: string;
 }
 
-/** why a cold backup was activated */
-export type ColdActivationReason = 'node-unreachable' | 'session-unhealthy' | 'delivery-slow';
+// ---------------------------------------------------------------------------
+// Probes (per restreamer node, UI-configurable; k8s-style sticky counters)
+// ---------------------------------------------------------------------------
+
+export interface ProbeThresholds {
+  timeoutSeconds: number;
+  periodSeconds: number;
+  successThreshold: number;
+  failureThreshold: number;
+}
+
+/** underrun swaps the timeout for a minimum ffmpeg progress.speed ratio */
+export interface UnderrunThresholds {
+  minSpeed: number;
+  periodSeconds: number;
+  successThreshold: number;
+  failureThreshold: number;
+}
+
+export type ProbeName = 'liveness' | 'underspeed' | 'underrun' | 'lag';
+
+export interface NodeProbeSettings {
+  liveness: ProbeThresholds;
+  underspeed: ProbeThresholds;
+  lag: ProbeThresholds;
+  underrun: UnderrunThresholds;
+}
+
+/**
+ * Live probe counters. `failed` trips after failureThreshold consecutive
+ * failures and clears only after successThreshold consecutive successes;
+ * the raw counters drive the UI's below-threshold warning badges.
+ */
+export interface ProbeStatus {
+  consecutiveFailures: number;
+  consecutiveSuccesses: number;
+  failed: boolean;
+  lastResult: 'ok' | 'fail' | null;
+  lastCheckedAt: string | null;
+  detail: string | null;
+}
+
+export interface UnderspeedProbeStatus extends ProbeStatus {
+  /** measured segment download speed as a multiple of realtime; null = never measured */
+  lastSpeedRatio: number | null;
+}
+
+export interface UnderrunProbeStatus extends ProbeStatus {
+  /** last ffmpeg progress.speed sample; null = never sampled */
+  lastSpeed: number | null;
+}
+
+export interface LagProbeStatus extends ProbeStatus {
+  /** last measured playlist PDT lag; null = never measured */
+  lastLagSec: number | null;
+  /** first successful lag measurement — gates the failover "lag discovered" wait */
+  firstMeasuredAt: string | null;
+}
+
+/** instance-level probe state carried on RestreamerNodeStatus */
+export interface NodeProbeStatus {
+  liveness: ProbeStatus;
+  underspeed: UnderspeedProbeStatus;
+}
+
+// ---------------------------------------------------------------------------
+// Failover orchestration (controller-driven, serialized)
+// ---------------------------------------------------------------------------
+
+export type FailoverPhase =
+  | 'bringing-up'
+  | 'awaiting-lag'
+  | 'switch-ordered'
+  | 'awaiting-switch-confirm'
+  | 'stopping-old'
+  | 'awaiting-stop-confirm'
+  | 'complete'
+  /** terminal grace after a completed reset while the switcher window drains */
+  | 'draining';
+
+export type FailoverTriggerReason =
+  | 'liveness'
+  | 'underspeed'
+  | 'underrun'
+  | 'lag'
+  | 'manual'
+  | 'reset'
+  | 'rebalance';
+
+/**
+ * UI indicator for one placement badge: yellow transitions
+ * (starting / awaiting-lag / switching / stopping), green active,
+ * gray stopped; 'idle' = not involved — fall back to session-state coloring.
+ */
+export type PlacementIndicator =
+  | 'active'
+  | 'starting'
+  | 'awaiting-lag'
+  | 'switching'
+  | 'stopping'
+  | 'stopped'
+  | 'idle';
+
+export interface ChannelFailoverStatus {
+  fromPlacementId: string | null;
+  toPlacementId: string;
+  phase: FailoverPhase;
+  triggerReason: FailoverTriggerReason;
+  triggerDetail: string | null;
+  startedAt: string;
+}
 
 /** one encode of a logical channel on one restreamer node */
 export interface RestreamPlacement {
@@ -99,18 +208,18 @@ export interface RestreamChannelWithStatus extends RestreamChannel {
       resolvedVia: 'tvh' | 'catalog' | null;
       /** live session status from the node's last poll; null = unknown/absent */
       session: SessionStatus | null;
-      /** true = this cold placement is currently activated by the failover loop */
-      coldActive: boolean;
+      /** failover-procedure indicator driving the badge color; 'idle' = session-state fallback */
+      indicator: PlacementIndicator;
+      /** channel-level lag probe state for this placement; null = not probed */
+      lagProbe: LagProbeStatus | null;
+      /** channel-level encoder-underrun probe state; null = not probed */
+      underrunProbe: UnderrunProbeStatus | null;
     }
   >;
-  /** current cold-backup activation for this channel; null = none */
-  coldActivation: {
-    placementId: string;
-    reason: ColdActivationReason;
-    activatedAt: string;
-  } | null;
-  /** why the failover loop could NOT activate a cold backup last tick; null = n/a */
-  coldBlocked: string | null;
+  /** persisted failover procedure/result for this channel; null = none (Reset hidden) */
+  failover: ChannelFailoverStatus | null;
+  /** why the last trigger could not start a failover (no eligible target); null = n/a */
+  failoverBlocked: string | null;
   /** placement currently served by the switcher (redundant channels); null = n/a or unknown */
   activePlacementId: string | null;
   lastSwitch: { at: string; from: string | null; to: string; reason: SwitchReason } | null;
@@ -126,6 +235,12 @@ export interface RestreamPlaylist {
   title: string;
   updatedAt: string;
 }
+
+/** SessionStatus enriched with the controller's channel-level probe state */
+export type EnrichedSessionStatus = SessionStatus & {
+  lagProbe?: LagProbeStatus;
+  underrunProbe?: UnderrunProbeStatus;
+};
 
 /** one restreamer node's polled status (SSE `restreamer` events) */
 export interface RestreamerNodeStatus {
@@ -145,7 +260,9 @@ export interface RestreamerNodeStatus {
   desiredRevision: string | null;
   /** the controller has a desired doc for this node that isn't confirmed pushed */
   pendingPush: boolean;
-  sessions: SessionStatus[];
+  /** instance-level probe state; null = nothing probeable yet (no desired sessions) */
+  probes: NodeProbeStatus | null;
+  sessions: EnrichedSessionStatus[];
   /**
    * fingerprint of the node's local sources.m3u catalog; null = the node has
    * no catalog (no `sourcesM3u` configured / old daemon) or it is unknown yet

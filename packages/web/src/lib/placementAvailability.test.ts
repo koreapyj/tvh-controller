@@ -50,6 +50,7 @@ function node(
     apiVersionSupported: true,
     desiredRevision: null,
     pendingPush: false,
+    probes: null,
     sessions: [],
     sourcesHash: sources === null ? null : 'hash',
     sources,

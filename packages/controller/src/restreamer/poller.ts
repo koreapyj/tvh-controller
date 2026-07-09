@@ -17,7 +17,14 @@
  */
 
 import { RESTREAMER_API_VERSION } from '@tvhc/shared';
-import type { RestreamerNodeStatus, SourceCatalogEntry, SwitcherNodeStatus } from '@tvhc/shared';
+import type {
+  EnrichedSessionStatus,
+  NodeProbeStatus,
+  RestreamerNodeStatus,
+  SessionStatus,
+  SourceCatalogEntry,
+  SwitcherNodeStatus,
+} from '@tvhc/shared';
 import type { RestreamerNodeConfig, SwitcherConfig } from '../config.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
@@ -61,6 +68,18 @@ export interface RestreamerPollerHooks {
    * a catalog disappeared. B2 wires this to a debounced push.
    */
   onSourcesChanged?: (instanceId: string, nodeId: string) => void | Promise<void>;
+  /**
+   * Instance-level probe state, PULLED at status-build time (the probe engine
+   * is the single source of truth — patching state into the cache after the
+   * fact would be wiped by the next poll). Default: null (no probes).
+   */
+  getProbes?: (instanceId: string, nodeId: string) => NodeProbeStatus | null;
+  /** fold channel-level probe state (lag/underrun) into the polled sessions */
+  enrichSessions?: (
+    instanceId: string,
+    nodeId: string,
+    sessions: SessionStatus[],
+  ) => Promise<EnrichedSessionStatus[]> | EnrichedSessionStatus[];
 }
 
 /** switcher-side twin of RestreamerPollerHooks, keyed by switcherId */
@@ -70,10 +89,15 @@ export interface SwitcherPollerHooks {
   onRevisionMismatch?: (switcherId: string, seenRevision: string | null) => void | Promise<void>;
 }
 
-/** JSON key of the meaningful fields — lastPollAt alone must not re-publish */
+/**
+ * JSON key of the meaningful fields — lastPollAt alone must not re-publish,
+ * and neither must a probe round that only refreshed its lastCheckedAt.
+ */
 function statusKey(status: RestreamerNodeStatus | SwitcherNodeStatus): string {
   const { lastPollAt: _lastPollAt, ...meaningful } = status;
-  return JSON.stringify(meaningful);
+  return JSON.stringify(meaningful, (key, value: unknown) =>
+    key === 'lastCheckedAt' ? undefined : value,
+  );
 }
 
 /**
@@ -124,6 +148,9 @@ export class RestreamerPoller {
   /** one poll tick; never throws (errors become reachable:false status) */
   async pollOnce(): Promise<void> {
     const pendingPush = await this.getPendingPushSafe();
+    // probe state persists across unreachable polls — a dead node's liveness
+    // probe failing is exactly the signal that must stay visible
+    const probes = this.getProbesSafe();
     let status: RestreamerNodeStatus;
     try {
       const res = await this.client.status();
@@ -143,7 +170,8 @@ export class RestreamerPoller {
         apiVersionSupported: (res.apiVersion as number) === RESTREAMER_API_VERSION,
         desiredRevision: res.desiredRevision,
         pendingPush,
-        sessions: res.sessions,
+        probes,
+        sessions: await this.enrichSessionsSafe(res.sessions),
         sourcesHash: this.lastSourcesHash,
         sources: this.lastSources,
       };
@@ -163,6 +191,7 @@ export class RestreamerPoller {
         apiVersionSupported: true,
         desiredRevision: null,
         pendingPush,
+        probes,
         sessions: [],
         // last-known catalog carried across unreachable polls (like topology)
         sourcesHash: this.lastSourcesHash,
@@ -187,6 +216,22 @@ export class RestreamerPoller {
       return (await this.hooks.getPendingPush?.(this.instanceId, this.node.id)) ?? false;
     } catch {
       return false;
+    }
+  }
+
+  private getProbesSafe(): NodeProbeStatus | null {
+    try {
+      return this.hooks.getProbes?.(this.instanceId, this.node.id) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async enrichSessionsSafe(sessions: SessionStatus[]): Promise<EnrichedSessionStatus[]> {
+    try {
+      return (await this.hooks.enrichSessions?.(this.instanceId, this.node.id, sessions)) ?? sessions;
+    } catch {
+      return sessions;
     }
   }
 

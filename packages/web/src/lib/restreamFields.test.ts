@@ -18,24 +18,31 @@
 
 import { describe, expect, it } from 'vitest';
 import { Value } from '@sinclair/typebox/value';
-import { AribHlsParams, type RestreamProfile } from '@tvhc/shared';
+import {
+  AribHlsParams,
+  type ProbeStatus,
+  type RestreamerNodeStatus,
+  type RestreamPlaylist,
+  type RestreamProfile,
+} from '@tvhc/shared';
 import type { AribHlsParams as AribHlsParamsT } from '@tvhc/shared';
 import {
   addAudioRow,
   AUDIO_ENTRY_FIELDS,
   buildProfilePayload,
   CHANNEL_BATCH_FIELDS,
-  coldActivationLabel,
   compareChannels,
   defaultProfilePayload,
   deriveSlug,
   emptyAudioRow,
+  failingProbeBadges,
   getByPath,
   isRestreamSubscription,
   MAX_AUDIO_ENTRIES,
   MIN_AUDIO_ENTRIES,
   parseProfileValue,
   placementModeBadge,
+  probeMeasurementLabel,
   PROFILE_FIELDS,
   profileToVals,
   removeAudioRow,
@@ -205,21 +212,35 @@ describe('CHANNEL_BATCH_FIELDS', () => {
     { id: 'p1', name: 'hevc-3M', payload: defaultProfilePayload(), updatedAt: '' },
     { id: 'p2', name: 'hevc-5M', payload: defaultProfilePayload(), updatedAt: '' },
   ];
+  const playlists: RestreamPlaylist[] = [
+    { id: 'pl1', slug: 'main', title: 'Main channels', updatedAt: '' },
+    { id: 'pl2', slug: 'sports', title: 'Sports', updatedAt: '' },
+  ];
 
-  it('exposes enabled, profileId, comment', () => {
-    expect(CHANNEL_BATCH_FIELDS(profiles).map((f) => f.key)).toEqual([
+  it('exposes enabled, profileId, comment, playlistIds', () => {
+    expect(CHANNEL_BATCH_FIELDS(profiles, playlists).map((f) => f.key)).toEqual([
       'enabled',
       'profileId',
       'comment',
+      'playlistIds',
     ]);
   });
 
   it('builds the profile enum from runtime profiles (ids as opaque strings)', () => {
-    const f = CHANNEL_BATCH_FIELDS(profiles).find((x) => x.key === 'profileId')!;
+    const f = CHANNEL_BATCH_FIELDS(profiles, playlists).find((x) => x.key === 'profileId')!;
     expect(f.type).toBe('strenum');
     expect(f.strOptions).toEqual([
       { value: 'p1', label: 'hevc-3M' },
       { value: 'p2', label: 'hevc-5M' },
+    ]);
+  });
+
+  it('builds the playlist multiselect from runtime playlists', () => {
+    const f = CHANNEL_BATCH_FIELDS(profiles, playlists).find((x) => x.key === 'playlistIds')!;
+    expect(f.type).toBe('multiselect');
+    expect(f.strOptions).toEqual([
+      { value: 'pl1', label: 'Main channels' },
+      { value: 'pl2', label: 'Sports' },
     ]);
   });
 });
@@ -298,28 +319,108 @@ describe('sessionStateBadge', () => {
 });
 
 describe('placementModeBadge', () => {
-  it('hot placements carry no badge, regardless of coldActive', () => {
-    expect(placementModeBadge({ mode: 'hot', coldActive: false })).toBeNull();
-    expect(placementModeBadge({ mode: 'hot', coldActive: true })).toBeNull();
+  it('hot placements carry no badge', () => {
+    expect(placementModeBadge({ mode: 'hot' })).toBeNull();
   });
 
-  it('cold placements show neutral "cold" when inactive, warn "cold · active" when active', () => {
-    expect(placementModeBadge({ mode: 'cold', coldActive: false })).toEqual({
-      cls: 'neutral',
-      label: 'cold',
-    });
-    expect(placementModeBadge({ mode: 'cold', coldActive: true })).toEqual({
-      cls: 'warn',
-      label: 'cold · active',
-    });
+  it('cold placements show a neutral "cold" tag', () => {
+    expect(placementModeBadge({ mode: 'cold' })).toEqual({ cls: 'neutral', label: 'cold' });
   });
 });
 
-describe('coldActivationLabel', () => {
-  it('maps every activation reason to short human text', () => {
-    expect(coldActivationLabel('node-unreachable')).toBe('node down');
-    expect(coldActivationLabel('session-unhealthy')).toBe('session unhealthy');
-    expect(coldActivationLabel('delivery-slow')).toBe('delivery slow');
+function probeStatus(over: Partial<ProbeStatus> = {}): ProbeStatus {
+  return {
+    consecutiveFailures: 0,
+    consecutiveSuccesses: 0,
+    failed: false,
+    lastResult: null,
+    lastCheckedAt: null,
+    detail: null,
+    ...over,
+  };
+}
+
+function node(over: Partial<RestreamerNodeStatus> = {}): RestreamerNodeStatus {
+  return {
+    instanceId: 'tokyo',
+    nodeId: 'node-a',
+    url: 'http://node-a:5580',
+    serveUrl: null,
+    reachable: true,
+    error: null,
+    lastPollAt: null,
+    version: '1.0.0',
+    uptimeSec: 60,
+    apiVersionSupported: true,
+    desiredRevision: null,
+    pendingPush: false,
+    probes: null,
+    sessions: [],
+    sourcesHash: null,
+    sources: null,
+    ...over,
+  };
+}
+
+describe('failingProbeBadges', () => {
+  it('is empty when probes are null (nothing probeable yet)', () => {
+    expect(failingProbeBadges(node({ probes: null }))).toEqual([]);
+  });
+
+  it('is empty when liveness/underspeed have no consecutive failures', () => {
+    const n = node({
+      probes: { liveness: probeStatus(), underspeed: { ...probeStatus(), lastSpeedRatio: null } },
+    });
+    expect(failingProbeBadges(n)).toEqual([]);
+  });
+
+  it('surfaces liveness and underspeed failures with their counts', () => {
+    const n = node({
+      probes: {
+        liveness: probeStatus({ consecutiveFailures: 2 }),
+        underspeed: { ...probeStatus({ consecutiveFailures: 5 }), lastSpeedRatio: 0.4 },
+      },
+    });
+    expect(failingProbeBadges(n)).toEqual([
+      { name: 'liveness', count: 2 },
+      { name: 'underspeed', count: 5 },
+    ]);
+  });
+});
+
+describe('probeMeasurementLabel', () => {
+  it('is null when nothing is measured', () => {
+    expect(probeMeasurementLabel(node())).toBeNull();
+  });
+
+  it('shows the underspeed ratio alone when no session has a lag measurement', () => {
+    const n = node({
+      probes: {
+        liveness: probeStatus(),
+        underspeed: { ...probeStatus(), lastSpeedRatio: 1.4 },
+      },
+    });
+    expect(probeMeasurementLabel(n)).toBe('net 1.4×');
+  });
+
+  it('shows the WORST (max) lag across sessions alone when underspeed is unmeasured', () => {
+    const n = node({
+      sessions: [
+        { name: 'a', lagProbe: { ...probeStatus(), lastLagSec: 2, firstMeasuredAt: null } },
+        { name: 'b', lagProbe: { ...probeStatus(), lastLagSec: 9.6, firstMeasuredAt: null } },
+      ] as unknown as RestreamerNodeStatus['sessions'],
+    });
+    expect(probeMeasurementLabel(n)).toBe('lag 10s');
+  });
+
+  it('combines both pieces when available', () => {
+    const n = node({
+      probes: { liveness: probeStatus(), underspeed: { ...probeStatus(), lastSpeedRatio: 0.9 } },
+      sessions: [
+        { name: 'a', lagProbe: { ...probeStatus(), lastLagSec: 4, firstMeasuredAt: null } },
+      ] as unknown as RestreamerNodeStatus['sessions'],
+    });
+    expect(probeMeasurementLabel(n)).toBe('net 0.9× · lag 4s');
   });
 });
 

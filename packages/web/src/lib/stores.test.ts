@@ -18,11 +18,14 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { get } from 'svelte/store';
-import type { InstanceSummary, RestreamerNodeStatus, SwitcherNodeStatus } from '@tvhc/shared';
+import type { InstanceSummary, RestreamChannelWithStatus, RestreamerNodeStatus, SwitcherNodeStatus } from '@tvhc/shared';
 import {
+  applyRestreamChannel,
   applyRestreamerNode,
   applyRestreamerSwitcher,
+  clearRestreamChannelLive,
   instances,
+  restreamChannelLive,
   restreamerNodeKey,
   restreamerNodes,
   restreamerSwitchers,
@@ -44,6 +47,7 @@ function node(over: Partial<RestreamerNodeStatus> = {}): RestreamerNodeStatus {
     apiVersionSupported: true,
     desiredRevision: null,
     pendingPush: false,
+    probes: null,
     sessions: [],
     sourcesHash: null,
     sources: null,
@@ -112,6 +116,53 @@ describe('restreamer store event merge', () => {
     seedRestreamers([node(), node({ nodeId: 'node-b' })], [switcher()]);
     expect(Object.keys(get(restreamerNodes)).sort()).toEqual(['tokyo/node-a', 'tokyo/node-b']);
     expect(Object.keys(get(restreamerSwitchers))).toEqual(['sw1']);
+  });
+});
+
+function channel(over: Partial<RestreamChannelWithStatus> = {}): RestreamChannelWithStatus {
+  return {
+    id: 'ch1',
+    slug: 'at-x',
+    channelName: 'AT-X',
+    channelNumber: '9.1',
+    profileId: 'p1',
+    enabled: true,
+    comment: null,
+    playlistIds: [],
+    updatedAt: '',
+    profileName: 'hevc-3M',
+    placements: [],
+    failover: null,
+    failoverBlocked: null,
+    activePlacementId: null,
+    lastSwitch: null,
+    playbackUrl: null,
+    ...over,
+  };
+}
+
+describe('restreamChannelLive', () => {
+  beforeEach(() => {
+    restreamChannelLive.set({});
+  });
+
+  it('an SSE channel event inserts under its id and a later one replaces it', () => {
+    applyRestreamChannel(channel({ id: 'ch1' }));
+    applyRestreamChannel(channel({ id: 'ch2' }));
+    expect(Object.keys(get(restreamChannelLive)).sort()).toEqual(['ch1', 'ch2']);
+
+    applyRestreamChannel(channel({ id: 'ch1', enabled: false }));
+    const m = get(restreamChannelLive);
+    expect(Object.keys(m)).toHaveLength(2);
+    expect(m.ch1).toMatchObject({ enabled: false });
+    expect(m.ch2).toMatchObject({ enabled: true });
+  });
+
+  it('clearRestreamChannelLive drops every live overlay', () => {
+    applyRestreamChannel(channel({ id: 'ch1' }));
+    applyRestreamChannel(channel({ id: 'ch2' }));
+    clearRestreamChannelLive();
+    expect(get(restreamChannelLive)).toEqual({});
   });
 });
 

@@ -42,7 +42,8 @@ export type FieldType =
   | 'enum'
   | 'strenum'
   | 'time'
-  | 'weekdays';
+  | 'weekdays'
+  | 'multiselect';
 
 export interface FieldSpec {
   /** keyof MasterRulePayload (or a tvheadend idnode field for recordings) */
@@ -207,6 +208,7 @@ export function formatFieldValue(spec: FieldSpec, v: unknown): string {
     case 'bool':
       return v ? 'yes' : 'no';
     case 'weekdays':
+    case 'multiselect':
       return Array.isArray(v) ? v.join(',') : String(v);
     default:
       return String(v);
@@ -254,6 +256,13 @@ export function parseFieldValue(spec: FieldSpec, raw: string): ParseResult {
         ),
       ].sort((a, b) => a - b);
       return { ok: true, value: days };
+    }
+    case 'multiselect': {
+      const vals = raw
+        .split(',')
+        .map((s) => s.trim())
+        .filter((s) => s !== '');
+      return { ok: true, value: vals };
     }
     default:
       // 'str', 'strenum' and 'channel' pass the string through (channel is

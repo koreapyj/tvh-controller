@@ -28,7 +28,7 @@ import { registerEpgRoutes } from './routes/epg.js';
 import { registerEventRoutes } from './routes/events.js';
 import { registerInstanceRoutes } from './routes/instances.js';
 import { registerRecordingsRoutes } from './routes/recordings.js';
-import { registerRestreamerRoutes } from './routes/restreamer.js';
+import { abortLogRelays, registerRestreamerRoutes } from './routes/restreamer.js';
 import { registerRuleRoutes } from './routes/rules.js';
 import { registerUnifiedRoutes } from './routes/unified.js';
 import { registerUploadRoutes } from './routes/uploads.js';
@@ -145,6 +145,7 @@ async function main(): Promise<void> {
           apiVersionSupported: true,
           desiredRevision: null,
           pendingPush: false,
+          probes: null,
           sessions: [],
           sourcesHash: null,
           sources: null,
@@ -231,15 +232,21 @@ async function main(): Promise<void> {
     });
   }
 
-  // prune cold activations orphaned while the controller was down, before
-  // the pollers/sweep start acting on the persisted state
-  await restreamer?.reconcileColdFailoverOnStartup();
+  // resume persisted failover procedures / prune orphaned rows, before the
+  // pollers/sweep start acting on the persisted state
+  await restreamer?.reconcileFailoverOnStartup();
+  // a just-ordered switch shouldn't wait out the switcher poll interval
+  if (restreamer) {
+    restreamer.onSwitchIssued = () => {
+      for (const poller of switcherPollers) void poller.pollOnce().catch(() => {});
+    };
+  }
   for (const [, poller] of pollers) poller.start();
   for (const poller of restreamerPollers) poller.start();
   for (const poller of switcherPollers) poller.start();
   restreamer?.startSweep();
   restreamer?.startRebalance();
-  restreamer?.startColdFailover();
+  restreamer?.startFailover();
   if (dispatcher) await dispatcher.resume();
   autoUploader?.start();
 
@@ -256,10 +263,13 @@ async function main(): Promise<void> {
       for (const poller of switcherPollers) poller.stop();
       restreamer?.stopSweep();
       restreamer?.stopRebalance();
-      restreamer?.stopColdFailover();
+      restreamer?.stopFailover();
       // give in-flight upload loops a bounded chance to checkpoint before the
       // database goes away; resume() recovers anything still unfinished
       await dispatcher?.stop();
+      // abort open log-stream relays first — app.close() waits for in-flight
+      // responses and would otherwise hang on them into the 10s failsafe
+      abortLogRelays();
       await app.close();
       await db?.destroy();
     } catch (err) {

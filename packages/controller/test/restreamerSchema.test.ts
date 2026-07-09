@@ -6,6 +6,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import BetterSqlite3 from 'better-sqlite3';
+import { Kysely, SqliteDialect } from 'kysely';
+import type { Database } from '../src/db/schema.js';
+import { migrateTo, migrateToLatest } from '../src/db/migrations.js';
+import { SqliteCompatPlugin } from './support/sqliteCompatPlugin.js';
 import { createTestDb, type TestDb } from './support/testDb.js';
 
 const NOW = '2026-07-06 00:00:00';
@@ -199,64 +204,256 @@ describe('migration 008_restreamer', () => {
         .executeTakeFirstOrThrow();
       expect(placement.mode).toBe('hot');
     });
+  });
 
-    it('inserts and reads back a restream_cold_activations row', async () => {
-      await seed();
+  describe('014_failover_state', () => {
+    /** a second placement to serve as the "to" target (plc-1 from seed() is "from") */
+    async function seedSecondPlacement(): Promise<string> {
+      const id = 'plc-2';
       await t.db
-        .insertInto('restream_cold_activations')
+        .insertInto('restream_placements')
         .values({
+          id,
           channel_id: 'chan-1',
-          placement_id: 'plc-1',
-          preferred_placement_id: null,
-          reason: 'node-unreachable',
-          activated_at: NOW,
+          instance_id: 'tyo1',
+          node_id: 'node2',
+          priority: 1,
+          enabled: 1,
+          weight: null,
+          program_number: null,
           updated_at: NOW,
         })
         .execute();
-      const row = await t.db.selectFrom('restream_cold_activations').selectAll().executeTakeFirstOrThrow();
+      return id;
+    }
+
+    async function seedRow(toId: string): Promise<void> {
+      await t.db
+        .insertInto('restream_failover_state')
+        .values({
+          channel_id: 'chan-1',
+          from_placement_id: 'plc-1',
+          to_placement_id: toId,
+          phase: 'complete',
+          trigger_reason: 'manual',
+          trigger_node_id: null,
+          trigger_detail: null,
+          suppress_from: 0,
+          drain_until: null,
+          started_at: NOW,
+          updated_at: NOW,
+        })
+        .execute();
+    }
+
+    it('inserts and reads back a row, including drain_until null', async () => {
+      await seed();
+      const toId = await seedSecondPlacement();
+      await seedRow(toId);
+      const row = await t.db.selectFrom('restream_failover_state').selectAll().executeTakeFirstOrThrow();
       expect(row).toMatchObject({
         channel_id: 'chan-1',
-        placement_id: 'plc-1',
-        preferred_placement_id: null,
-        reason: 'node-unreachable',
+        from_placement_id: 'plc-1',
+        to_placement_id: toId,
+        phase: 'complete',
+        trigger_reason: 'manual',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
       });
-      expect(row.activated_at).toBeInstanceOf(Date);
+      expect(row.drain_until).toBeNull();
+      expect(row.started_at).toBeInstanceOf(Date);
+      expect(row.updated_at).toBeInstanceOf(Date);
     });
 
-    it('deleting the channel cascades to its cold activation row', async () => {
+    it('cascades on channel delete', async () => {
       await seed();
-      await t.db
-        .insertInto('restream_cold_activations')
-        .values({
-          channel_id: 'chan-1',
-          placement_id: 'plc-1',
-          preferred_placement_id: null,
-          reason: 'node-unreachable',
-          activated_at: NOW,
-          updated_at: NOW,
-        })
-        .execute();
+      const toId = await seedSecondPlacement();
+      await seedRow(toId);
       await t.db.deleteFrom('restream_channels').where('id', '=', 'chan-1').execute();
-      expect(await t.db.selectFrom('restream_cold_activations').selectAll().execute()).toHaveLength(0);
+      expect(await t.db.selectFrom('restream_failover_state').selectAll().execute()).toHaveLength(0);
     });
 
-    it('deleting the placement cascades to its cold activation row', async () => {
+    it('cascades on to_placement delete', async () => {
       await seed();
-      await t.db
-        .insertInto('restream_cold_activations')
-        .values({
-          channel_id: 'chan-1',
-          placement_id: 'plc-1',
-          preferred_placement_id: null,
-          reason: 'node-unreachable',
-          activated_at: NOW,
-          updated_at: NOW,
-        })
-        .execute();
-      await t.db.deleteFrom('restream_placements').where('id', '=', 'plc-1').execute();
-      expect(await t.db.selectFrom('restream_cold_activations').selectAll().execute()).toHaveLength(0);
-      // the channel itself survives -- only the activation row is cascaded
+      const toId = await seedSecondPlacement();
+      await seedRow(toId);
+      await t.db.deleteFrom('restream_placements').where('id', '=', toId).execute();
+      expect(await t.db.selectFrom('restream_failover_state').selectAll().execute()).toHaveLength(0);
+      // the channel and its other placement survive
       expect(await t.db.selectFrom('restream_channels').selectAll().execute()).toHaveLength(1);
+    });
+
+    it('nulls from_placement_id on from_placement delete (row itself survives)', async () => {
+      await seed();
+      const toId = await seedSecondPlacement();
+      await seedRow(toId);
+      await t.db.deleteFrom('restream_placements').where('id', '=', 'plc-1').execute();
+      const row = await t.db.selectFrom('restream_failover_state').selectAll().executeTakeFirstOrThrow();
+      expect(row.from_placement_id).toBeNull();
+      expect(row.to_placement_id).toBe(toId);
+    });
+  });
+
+  describe('013_probe_settings', () => {
+    function probeRow(overrides: Partial<Record<string, unknown>> = {}) {
+      return {
+        instance_id: 'tyo1',
+        node_id: 'node1',
+        liveness_timeout_seconds: 5,
+        liveness_period_seconds: 10,
+        liveness_success_threshold: 2,
+        liveness_failure_threshold: 3,
+        underspeed_timeout_seconds: 20,
+        underspeed_period_seconds: 45,
+        underspeed_success_threshold: 2,
+        underspeed_failure_threshold: 3,
+        lag_timeout_seconds: 30,
+        lag_period_seconds: 10,
+        lag_success_threshold: 3,
+        lag_failure_threshold: 3,
+        underrun_min_speed: 0.98,
+        underrun_period_seconds: 15,
+        underrun_success_threshold: 2,
+        underrun_failure_threshold: 3,
+        updated_at: NOW,
+        ...overrides,
+      };
+    }
+
+    it('inserts and reads back a row', async () => {
+      await t.db.insertInto('restream_node_probes').values(probeRow()).execute();
+      const row = await t.db.selectFrom('restream_node_probes').selectAll().executeTakeFirstOrThrow();
+      expect(row).toMatchObject({
+        instance_id: 'tyo1',
+        node_id: 'node1',
+        liveness_timeout_seconds: 5,
+        underrun_min_speed: 0.98,
+      });
+      expect(row.updated_at).toBeInstanceOf(Date);
+    });
+
+    it('PK (instance_id, node_id) upsert via onDuplicateKeyUpdate works under the sqlite compat plugin', async () => {
+      const row = probeRow();
+      await t.db
+        .insertInto('restream_node_probes')
+        .values(row)
+        .onDuplicateKeyUpdate(row)
+        .execute();
+      const changed = probeRow({ liveness_timeout_seconds: 9 });
+      await t.db
+        .insertInto('restream_node_probes')
+        .values(changed)
+        .onDuplicateKeyUpdate(changed)
+        .execute();
+      const rows = await t.db.selectFrom('restream_node_probes').selectAll().execute();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.liveness_timeout_seconds).toBe(9);
+    });
+  });
+
+  describe('migration carry-over: restream_cold_activations -> restream_failover_state', () => {
+    it('migrating stepwise to 013 then to latest carries a cold activation row forward and drops the old table', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '013_probe_settings');
+
+        await db
+          .insertInto('restream_profiles')
+          .values({ id: 'prof-1', name: 'p', payload: '{}', updated_at: NOW })
+          .execute();
+        await db
+          .insertInto('restream_channels')
+          .values({
+            id: 'chan-1',
+            slug: 'at-x',
+            channel_name: 'AT-X',
+            channel_number: '9.1',
+            profile_id: 'prof-1',
+            enabled: 1,
+            comment: null,
+            updated_at: NOW,
+          })
+          .execute();
+        await db
+          .insertInto('restream_placements')
+          .values({
+            id: 'hot-1',
+            channel_id: 'chan-1',
+            instance_id: 'tyo1',
+            node_id: 'hot',
+            priority: 1,
+            enabled: 1,
+            weight: null,
+            program_number: null,
+            mode: 'hot',
+            updated_at: NOW,
+          })
+          .execute();
+        await db
+          .insertInto('restream_placements')
+          .values({
+            id: 'cold-1',
+            channel_id: 'chan-1',
+            instance_id: 'tyo1',
+            node_id: 'cold',
+            priority: 2,
+            enabled: 1,
+            weight: null,
+            program_number: null,
+            mode: 'cold',
+            updated_at: NOW,
+          })
+          .execute();
+
+        // restream_cold_activations exists at 013 but is not in the current
+        // Database type — the migration-under-test's own down()/up() casts
+        // through Kysely<unknown> the same way; mirror that here.
+        interface OldColdRow {
+          channel_id: string;
+          placement_id: string;
+          preferred_placement_id: string | null;
+          reason: string;
+          activated_at: string;
+          updated_at: string;
+        }
+        const oldDb = db as unknown as Kysely<{ restream_cold_activations: OldColdRow }>;
+        await oldDb
+          .insertInto('restream_cold_activations')
+          .values({
+            channel_id: 'chan-1',
+            placement_id: 'cold-1',
+            preferred_placement_id: 'hot-1',
+            reason: 'delivery-slow',
+            activated_at: NOW,
+            updated_at: NOW,
+          })
+          .execute();
+
+        await migrateToLatest(db);
+
+        const rows = await db.selectFrom('restream_failover_state').selectAll().execute();
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          channel_id: 'chan-1',
+          from_placement_id: 'hot-1',
+          to_placement_id: 'cold-1',
+          phase: 'complete',
+          suppress_from: 0,
+          trigger_reason: 'underspeed',
+        });
+
+        await expect(
+          oldDb.selectFrom('restream_cold_activations').selectAll().execute(),
+        ).rejects.toThrow(/no such table/i);
+      } finally {
+        await db.destroy();
+      }
     });
   });
 

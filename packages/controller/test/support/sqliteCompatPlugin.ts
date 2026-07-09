@@ -27,17 +27,26 @@ import {
  * into real `Date` objects instead, and the app code (engine.ts, ledger.ts)
  * relies on that: some call sites do `new Date(row.updated_at)` (works on a
  * string too) but others call `.toISOString()` directly on the column,
- * assuming a Date. Every timestamp column in schema.ts is named `*_at` and
+ * assuming a Date. Almost every timestamp column in schema.ts is named
+ * `*_at` (the one exception is `restream_failover_state.drain_until`) and
  * always written as an explicit UTC 'YYYY-MM-DD HH:MM:SS' literal (see
  * engine.ts's own now()), so it's safe to convert any such column back to a
- * UTC Date here, mirroring what mysql2 gives the app in production.
+ * UTC Date here, mirroring what mysql2 gives the app in production. Without
+ * reviving `drain_until` too, it stays a naive string and a raw
+ * `Date.parse()` on it (failoverSync.ts#asMs, which defensively accepts a
+ * string precisely because production drivers might not always hand back a
+ * Date) is interpreted in the machine's LOCAL timezone instead of UTC —
+ * inert in production (mysql2 is configured with `timezone: 'Z'` and always
+ * hands back a real Date) but silently wrong here on any non-UTC machine.
  */
 const SQLITE_DATETIME = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+const EXTRA_TIMESTAMP_COLUMNS = new Set(['drain_until']);
 
 function reviveTimestamps(row: UnknownRow): UnknownRow {
   const out: UnknownRow = { ...row };
   for (const [key, value] of Object.entries(out)) {
-    if (key.endsWith('_at') && typeof value === 'string' && SQLITE_DATETIME.test(value)) {
+    const isTimestampColumn = key.endsWith('_at') || EXTRA_TIMESTAMP_COLUMNS.has(key);
+    if (isTimestampColumn && typeof value === 'string' && SQLITE_DATETIME.test(value)) {
       out[key] = new Date(`${value.replace(' ', 'T')}Z`);
     }
   }
@@ -50,6 +59,8 @@ const CONFLICT_TARGETS: Record<string, string[]> = {
   ignored_orphans: ['instance_id', 'tvh_uuid'],
   restream_node_state: ['instance_id', 'node_id'],
   restream_switcher_state: ['switcher_id'],
+  restream_node_probes: ['instance_id', 'node_id'],
+  restream_failover_state: ['channel_id'],
 };
 
 class OnDuplicateKeyToOnConflictTransformer extends OperationNodeTransformer {

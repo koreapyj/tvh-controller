@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import {
   channelStableId,
+  type NodeProbeSettings,
   type RestreamChannel,
   type RestreamChannelWithStatus,
   type RestreamPlaylist,
@@ -18,13 +19,13 @@ import {
 } from '@tvhc/shared';
 import type { AppConfig } from '../src/config.js';
 import type { InstancePoller } from '../src/tvh/poller.js';
-import { RestreamerError } from '../src/restreamer/client.js';
 import type { RestreamerClient, SwitcherClient } from '../src/restreamer/client.js';
 import {
   RestreamerService,
   nodeKey,
   type RestreamerNodeClient,
 } from '../src/restreamer/service.js';
+import { NODE_PROBE_DEFAULTS } from '../src/restreamer/probeSettings.js';
 import { registerRestreamerRoutes } from '../src/routes/restreamer.js';
 import type { AppContext } from '../src/routes/context.js';
 import type { TvhClient } from '../src/tvh/client.js';
@@ -166,6 +167,7 @@ function seedNodeStatus(
       apiVersionSupported: true,
       desiredRevision: null,
       pendingPush: false,
+      probes: null,
       sessions,
       sourcesHash: sources === null ? null : 'h1',
       sources,
@@ -180,6 +182,7 @@ interface Harness {
   service: RestreamerService;
   restartSession: ReturnType<typeof vi.fn>;
   sessionLog: ReturnType<typeof vi.fn>;
+  resetSessionRestarts: ReturnType<typeof vi.fn>;
   switchChannel: ReturnType<typeof vi.fn>;
   tvhGetRaw: ReturnType<typeof vi.fn>;
   close: () => Promise<void>;
@@ -194,6 +197,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
   const clients = new Map<string, RestreamerNodeClient>();
   const restartSession = vi.fn(async () => {});
   const sessionLog = vi.fn(async () => [{ ts: '2026-01-01T00:00:00Z', src: 'daemon', line: 'hello' }]);
+  const resetSessionRestarts = vi.fn(async () => {});
   const restreamerClients = new Map<string, RestreamerClient>();
   for (const inst of config.instances) {
     cache.init(inst.id, inst.name, inst.url);
@@ -204,6 +208,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
       restreamerClients.set(nodeKey(inst.id, n.id), {
         restartSession,
         sessionLog,
+        resetSessionRestarts,
       } as unknown as RestreamerClient);
     }
   }
@@ -248,6 +253,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
     service,
     restartSession,
     sessionLog,
+    resetSessionRestarts,
     switchChannel,
     tvhGetRaw,
     close: async () => {
@@ -680,7 +686,7 @@ describe('write-time availability and catalog-resolved identity (routes)', () =>
   });
 });
 
-// ---------- manual switch ----------
+// ---------- manual switch / reset — the serialized failover procedure ----------
 
 describe('POST /api/restreamer/channels/:id/switch', () => {
   /** redundant BBB channel across zone1/n1 + zone2/n1; returns its placements */
@@ -706,104 +712,11 @@ describe('POST /api/restreamer/channels/:id/switch', () => {
     return { channel, placements: withStatus.placements };
   }
 
-  it('passes through to the switcher that reports the slug', async () => {
-    const h = await harness();
-    const { channel, placements } = await seedRedundantChannel(h);
-    h.cache.switchers.set('sw1', {
-      switcherId: 'sw1',
-      url: 'http://sw1:5581',
-      publicUrl: 'http://sw.example',
-      reachable: true,
-      error: null,
-      lastPollAt: null,
-      version: '1.0.0',
-      pendingPush: false,
-      channels: [
-        {
-          slug: 'bbb',
-          activeUpstreamId: placements[0]!.id,
-          upstreams: placements.map((p) => ({ id: p.id, healthy: true })),
-          lastSwitch: null,
-        },
-      ],
-    });
-
-    const res = await h.app.inject({
-      method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { placementId: placements[1]!.id },
-    });
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true });
-    expect(h.switchChannel).toHaveBeenCalledWith('bbb', placements[1]!.id);
-  });
-
-  it('falls back to the first configured switcher when none reports the slug yet', async () => {
-    const h = await harness();
-    const { channel, placements } = await seedRedundantChannel(h);
-    const res = await h.app.inject({
-      method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { placementId: placements[0]!.id },
-    });
-    expect(res.statusCode).toBe(200);
-    expect(h.switchChannel).toHaveBeenCalledWith('bbb', placements[0]!.id);
-  });
-
-  it('400 when the placement does not belong to the channel; 404 for an unknown channel', async () => {
-    const h = await harness();
-    const { channel } = await seedRedundantChannel(h);
-    const bad = await h.app.inject({
-      method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { placementId: 'not-a-placement-of-this-channel' },
-    });
-    expect(bad.statusCode).toBe(400);
-    expect(h.switchChannel).not.toHaveBeenCalled();
-
-    const missing = await h.app.inject({
-      method: 'POST',
-      url: '/api/restreamer/channels/ghost/switch',
-      payload: { placementId: 'p1' },
-    });
-    expect(missing.statusCode).toBe(404);
-  });
-
-  it('503 when no switcher is configured', async () => {
-    const h = await harness({ restreamer: undefined });
-    const { channel, placements } = await seedRedundantChannel(h);
-    const res = await h.app.inject({
-      method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { placementId: placements[0]!.id },
-    });
-    expect(res.statusCode).toBe(503);
-  });
-
-  it('maps a switcher-side 404 (unknown slug/upstream) through, unreachable to 502', async () => {
-    const h = await harness();
-    const { channel, placements } = await seedRedundantChannel(h);
-
-    h.switchChannel.mockRejectedValueOnce(
-      new RestreamerError(404, '/v1/channels/bbb/switch', 'unknown upstream'),
-    );
-    const notFound = await h.app.inject({
-      method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { placementId: placements[1]!.id },
-    });
-    expect(notFound.statusCode).toBe(404);
-
-    h.switchChannel.mockRejectedValueOnce(new Error('fetch failed: ECONNREFUSED'));
-    const down = await h.app.inject({
-      method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { placementId: placements[1]!.id },
-    });
-    expect(down.statusCode).toBe(502);
-  });
-
-  // ---------- {reset: true} — back to the highest-priority healthy upstream ----------
+  /** reachable node statuses (with the slug running) so beginNext's admission gate passes */
+  function seedAdmission(h: Harness, slug: string): void {
+    seedNodeStatus(h.cache, 'zone1', 'n1', [sessionStatus(slug)]);
+    seedNodeStatus(h.cache, 'zone2', 'n1', [sessionStatus(slug)]);
+  }
 
   function seedSwitcherStatus(
     h: Harness,
@@ -826,108 +739,114 @@ describe('POST /api/restreamer/channels/:id/switch', () => {
     });
   }
 
-  it('reset switches to the lowest-priority-number healthy placement', async () => {
+  async function seedFailoverRow(
+    h: Harness,
+    channelId: string,
+    fields: {
+      fromPlacementId: string | null;
+      toPlacementId: string;
+      phase: string;
+      triggerReason?: string;
+      suppressFrom?: boolean;
+    },
+  ): Promise<void> {
+    await h.ctx.db!
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: channelId,
+        from_placement_id: fields.fromPlacementId,
+        to_placement_id: fields.toPlacementId,
+        phase: fields.phase,
+        trigger_reason: fields.triggerReason ?? 'manual',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: fields.suppressFrom ? 1 : 0,
+        drain_until: null,
+        started_at: '2026-01-01 00:00:00',
+        updated_at: '2026-01-01 00:00:00',
+      })
+      .execute();
+  }
+
+  async function failoverRow(h: Harness, channelId: string) {
+    return h.ctx.db!
+      .selectFrom('restream_failover_state')
+      .selectAll()
+      .where('channel_id', '=', channelId)
+      .executeTakeFirst();
+  }
+
+  // ---------- {placementId} — manual selection ----------
+
+  it('manual selection: 200 {ok:true, queued:true}; a bringing-up row appears once the enqueued tick runs', async () => {
     const h = await harness();
     const { channel, placements } = await seedRedundantChannel(h);
+    seedAdmission(h, 'bbb');
     seedSwitcherStatus(h, [
-      {
-        slug: 'bbb',
-        activeUpstreamId: placements[1]!.id, // manually switched away earlier
-        upstreams: placements.map((p) => ({ id: p.id, healthy: true })),
-      },
+      { slug: 'bbb', activeUpstreamId: placements[0]!.id, upstreams: placements.map((p) => ({ id: p.id, healthy: true })) },
     ]);
 
     const res = await h.app.inject({
       method: 'POST',
       url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { reset: true },
+      payload: { placementId: placements[1]!.id },
     });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, already: false });
-    expect(h.switchChannel).toHaveBeenCalledWith('bbb', placements[0]!.id);
-  });
+    expect(res.json()).toEqual({ ok: true, queued: true });
 
-  it('reset skips an unhealthy priority-1 upstream and picks priority-2', async () => {
-    const h = await harness();
-    const { channel, placements } = await seedRedundantChannel(h);
-    seedSwitcherStatus(h, [
-      {
-        slug: 'bbb',
-        activeUpstreamId: placements[0]!.id,
-        upstreams: [
-          { id: placements[0]!.id, healthy: false },
-          { id: placements[1]!.id, healthy: true },
-        ],
-      },
-    ]);
-
-    const res = await h.app.inject({
-      method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { reset: true },
+    // requestManualSwitch fire-and-forgets failoverTick(); await it explicitly for determinism
+    await h.ctx.restreamer!.failoverTick();
+    const row = await failoverRow(h, channel.id);
+    expect(row).toMatchObject({
+      phase: 'awaiting-lag', // bringing-up always advances immediately within the same tick
+      trigger_reason: 'manual',
+      to_placement_id: placements[1]!.id,
+      from_placement_id: placements[0]!.id,
     });
-    expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, already: false });
-    expect(h.switchChannel).toHaveBeenCalledWith('bbb', placements[1]!.id);
   });
 
-  it('reset is a no-op when the target upstream is already active', async () => {
+  it('switching to the currently-active placement -> {ok:true, already:true}, no row created', async () => {
     const h = await harness();
     const { channel, placements } = await seedRedundantChannel(h);
     seedSwitcherStatus(h, [
-      {
-        slug: 'bbb',
-        activeUpstreamId: placements[0]!.id,
-        upstreams: placements.map((p) => ({ id: p.id, healthy: true })),
-      },
+      { slug: 'bbb', activeUpstreamId: placements[0]!.id, upstreams: placements.map((p) => ({ id: p.id, healthy: true })) },
     ]);
 
     const res = await h.app.inject({
       method: 'POST',
       url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { reset: true },
+      payload: { placementId: placements[0]!.id },
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: true, already: true });
-    expect(h.switchChannel).not.toHaveBeenCalled();
+    expect(await failoverRow(h, channel.id)).toBeUndefined();
   });
 
-  it('reset 409s when the switcher reports no healthy upstream (or no channel at all)', async () => {
+  it('404 for an unknown channel', async () => {
     const h = await harness();
-    const { channel, placements } = await seedRedundantChannel(h);
-
-    // no switcher reports the slug yet
-    const unknown = await h.app.inject({
+    const res = await h.app.inject({
       method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { reset: true },
+      url: '/api/restreamer/channels/ghost/switch',
+      payload: { placementId: 'p1' },
     });
-    expect(unknown.statusCode).toBe(409);
+    expect(res.statusCode).toBe(404);
+  });
 
-    seedSwitcherStatus(h, [
-      {
-        slug: 'bbb',
-        activeUpstreamId: placements[0]!.id,
-        upstreams: placements.map((p) => ({ id: p.id, healthy: false })),
-      },
-    ]);
+  it('400 when the placement belongs to another channel', async () => {
+    const h = await harness();
+    const { channel } = await seedRedundantChannel(h);
     const res = await h.app.inject({
       method: 'POST',
       url: `/api/restreamer/channels/${channel.id}/switch`,
-      payload: { reset: true },
+      payload: { placementId: 'not-a-placement-of-this-channel' },
     });
-    expect(res.statusCode).toBe(409);
-    expect(h.switchChannel).not.toHaveBeenCalled();
+    expect(res.statusCode).toBe(400);
   });
 
   it('400s a body with both, neither, or a non-true reset', async () => {
     const h = await harness();
     const { channel, placements } = await seedRedundantChannel(h);
-    for (const payload of [
-      {},
-      { placementId: placements[0]!.id, reset: true },
-      { reset: false },
-    ]) {
+    for (const payload of [{}, { placementId: placements[0]!.id, reset: true }, { reset: false }]) {
       const res = await h.app.inject({
         method: 'POST',
         url: `/api/restreamer/channels/${channel.id}/switch`,
@@ -935,7 +854,171 @@ describe('POST /api/restreamer/channels/:id/switch', () => {
       });
       expect(res.statusCode, JSON.stringify(payload)).toBe(400);
     }
-    expect(h.switchChannel).not.toHaveBeenCalled();
+  });
+
+  // ---------- {reset: true} — fail back in natural placement order ----------
+
+  it('reset with no failover row -> 409', async () => {
+    const h = await harness();
+    const { channel } = await seedRedundantChannel(h);
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it('reset from phase=complete: {ok:true, queued:true}; a tick flips trigger_reason to reset', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    seedAdmission(h, 'bbb');
+    // completed onto zone2 (placements[1]); natural (lowest priority) is zone1 (placements[0])
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: placements[0]!.id,
+      toPlacementId: placements[1]!.id,
+      phase: 'complete',
+      triggerReason: 'manual',
+    });
+    seedSwitcherStatus(h, [
+      { slug: 'bbb', activeUpstreamId: placements[1]!.id, upstreams: placements.map((p) => ({ id: p.id, healthy: true })) },
+    ]);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, queued: true });
+
+    await h.ctx.restreamer!.failoverTick();
+    const row = await failoverRow(h, channel.id);
+    expect(row!.trigger_reason).toBe('reset');
+    expect(row!.to_placement_id).toBe(placements[0]!.id); // back to natural order
+  });
+
+  it('reset when already on the natural placement: {ok:true, cleared:true}; row deleted (hot outgoing resumes)', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: placements[1]!.id,
+      toPlacementId: placements[0]!.id, // already the natural placement
+      phase: 'complete',
+      triggerReason: 'manual',
+      suppressFrom: false,
+    });
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, cleared: true });
+    expect(await failoverRow(h, channel.id)).toBeUndefined();
+  });
+
+  it('reset when already on natural with a suppressed HOT outgoing: cleared immediately (hot never leaves the switcher doc)', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: placements[1]!.id,
+      toPlacementId: placements[0]!.id,
+      phase: 'complete',
+      triggerReason: 'manual',
+      suppressFrom: true,
+    });
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, cleared: true });
+    expect(await failoverRow(h, channel.id)).toBeUndefined();
+  });
+
+  it('reset when already on natural with a COLD outgoing: draining with drain_until set', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    await h.ctx
+      .db!.updateTable('restream_placements')
+      .set({ mode: 'cold' })
+      .where('id', '=', placements[1]!.id)
+      .execute();
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: placements[1]!.id,
+      toPlacementId: placements[0]!.id,
+      phase: 'complete',
+      triggerReason: 'manual',
+      suppressFrom: true,
+    });
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, cleared: true });
+    const row = await failoverRow(h, channel.id);
+    expect(row!.phase).toBe('draining');
+    expect(row!.drain_until).not.toBeNull();
+  });
+
+  it('reset from a pre-commit mid-procedure phase (awaiting-lag) aborts loss-free: {ok:true, aborted:true}, row gone', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: placements[0]!.id,
+      toPlacementId: placements[1]!.id,
+      phase: 'awaiting-lag',
+      triggerReason: 'lag',
+    });
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, aborted: true });
+    expect(await failoverRow(h, channel.id)).toBeUndefined();
+  });
+
+  it('reset from a past-commit-point phase (awaiting-switch-confirm) 409s rejected-mid-procedure', async () => {
+    const h = await harness();
+    const { channel, placements } = await seedRedundantChannel(h);
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: placements[0]!.id,
+      toPlacementId: placements[1]!.id,
+      phase: 'awaiting-switch-confirm',
+      triggerReason: 'lag',
+    });
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { reset: true },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ error: 'rejected-mid-procedure', message: expect.any(String) });
+    expect(await failoverRow(h, channel.id)).toMatchObject({ phase: 'awaiting-switch-confirm' });
+  });
+
+  it('a manual switch still queues without a configured switcher (issuing the switch itself just never completes)', async () => {
+    const h = await harness({ restreamer: undefined });
+    const { channel, placements } = await seedRedundantChannel(h);
+    seedAdmission(h, 'bbb');
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/switch`,
+      payload: { placementId: placements[1]!.id },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, queued: true });
   });
 });
 
@@ -1640,15 +1723,24 @@ describe('restreamer cold backup routes', () => {
     return { channel, coldId: (addedCold.json() as { id: string }).id };
   }
 
-  async function seedActivation(h: Harness, channelId: string, placementId: string): Promise<void> {
+  async function seedFailoverRow(
+    h: Harness,
+    channelId: string,
+    fields: { fromPlacementId: string | null; toPlacementId: string; suppressFrom?: boolean },
+  ): Promise<void> {
     await h.ctx.db!
-      .insertInto('restream_cold_activations')
+      .insertInto('restream_failover_state')
       .values({
         channel_id: channelId,
-        placement_id: placementId,
-        preferred_placement_id: null,
-        reason: 'node-unreachable',
-        activated_at: '2026-01-01 00:00:00',
+        from_placement_id: fields.fromPlacementId,
+        to_placement_id: fields.toPlacementId,
+        phase: 'complete',
+        trigger_reason: 'manual',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: fields.suppressFrom ? 1 : 0,
+        drain_until: null,
+        started_at: '2026-01-01 00:00:00',
         updated_at: '2026-01-01 00:00:00',
       })
       .execute();
@@ -1687,50 +1779,318 @@ describe('restreamer cold backup routes', () => {
     expect(badPatch.statusCode).toBe(400);
   });
 
-  it('GET channels carries coldActive/coldActivation/coldBlocked, updated once an activation row exists', async () => {
+  it('GET channels carries failover:null when no row; a complete row populates failover and per-placement indicators', async () => {
     const h = await harness();
     const { channel, coldId } = await createChannelWithColdPlacement(h);
 
     const before = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
     const beforeChan = (before.json() as RestreamChannelWithStatus[]).find((c) => c.id === channel.id)!;
-    expect(beforeChan.placements.find((p) => p.id === coldId)!.coldActive).toBe(false);
-    expect(beforeChan.coldActivation).toBeNull();
-    expect(beforeChan.coldBlocked).toBeNull();
+    expect(beforeChan.failover).toBeNull();
+    expect(beforeChan.placements.every((p) => p.indicator === 'idle')).toBe(true);
 
-    await seedActivation(h, channel.id, coldId);
+    const hotId = beforeChan.placements.find((p) => p.id !== coldId)!.id;
+    await seedFailoverRow(h, channel.id, { fromPlacementId: hotId, toPlacementId: coldId, suppressFrom: true });
 
     const after = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
     const afterChan = (after.json() as RestreamChannelWithStatus[]).find((c) => c.id === channel.id)!;
-    expect(afterChan.placements.find((p) => p.id === coldId)!.coldActive).toBe(true);
-    expect(afterChan.coldActivation).toMatchObject({ placementId: coldId, reason: 'node-unreachable' });
+    expect(afterChan.failover).toMatchObject({
+      toPlacementId: coldId,
+      phase: 'complete',
+      triggerReason: 'manual',
+    });
+    // 'active' on the to_placement; 'stopped' on the suppressed (suppress_from=1) from
+    expect(afterChan.placements.find((p) => p.id === coldId)!.indicator).toBe('active');
+    expect(afterChan.placements.find((p) => p.id === hotId)!.indicator).toBe('stopped');
   });
 
-  it('POST cold/deactivate: existed:false with none, existed:true (and clears it) once seeded; 404 for an unknown channel', async () => {
+  it('GET channels: an unsuppressed complete row leaves the from placement idle', async () => {
     const h = await harness();
     const { channel, coldId } = await createChannelWithColdPlacement(h);
+    const list = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const hotId = (list.json() as RestreamChannelWithStatus[])
+      .find((c) => c.id === channel.id)!
+      .placements.find((p) => p.id !== coldId)!.id;
+    await seedFailoverRow(h, channel.id, { fromPlacementId: hotId, toPlacementId: coldId, suppressFrom: false });
 
-    const noneYet = await h.app.inject({
+    const after = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const afterChan = (after.json() as RestreamChannelWithStatus[]).find((c) => c.id === channel.id)!;
+    expect(afterChan.placements.find((p) => p.id === hotId)!.indicator).toBe('idle');
+  });
+
+  it('POST /channels/:id/cold/deactivate is gone — 404', async () => {
+    const h = await harness();
+    const { channel } = await createChannelWithColdPlacement(h);
+    const res = await h.app.inject({
       method: 'POST',
       url: `/api/restreamer/channels/${channel.id}/cold/deactivate`,
     });
-    expect(noneYet.statusCode).toBe(200);
-    expect(noneYet.json()).toEqual({ ok: true, existed: false });
+    expect(res.statusCode).toBe(404);
+  });
+});
 
-    await seedActivation(h, channel.id, coldId);
+// ---------- per-node probe settings ----------
 
-    const cleared = await h.app.inject({
-      method: 'POST',
-      url: `/api/restreamer/channels/${channel.id}/cold/deactivate`,
+describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/probes', () => {
+  it('GET returns code defaults when no row is stored', async () => {
+    const { app } = await harness();
+    const res = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n1/probes' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual(NODE_PROBE_DEFAULTS);
+  });
+
+  it('PUT persists and returns the settings; a later GET reflects them', async () => {
+    const { app } = await harness();
+    const custom: NodeProbeSettings = {
+      liveness: { timeoutSeconds: 3, periodSeconds: 8, successThreshold: 1, failureThreshold: 2 },
+      underspeed: { timeoutSeconds: 15, periodSeconds: 30, successThreshold: 2, failureThreshold: 4 },
+      lag: { timeoutSeconds: 20, periodSeconds: 12, successThreshold: 2, failureThreshold: 2 },
+      underrun: { minSpeed: 0.9, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
+    };
+    const put = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/probes',
+      payload: custom,
     });
-    expect(cleared.statusCode).toBe(200);
-    expect(cleared.json()).toEqual({ ok: true, existed: true });
-    expect(await h.ctx.db!.selectFrom('restream_cold_activations').selectAll().execute()).toHaveLength(0);
+    expect(put.statusCode).toBe(200);
+    expect(put.json()).toEqual(custom);
 
-    const unknown = await h.app.inject({
+    const get = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n1/probes' });
+    expect(get.json()).toEqual(custom);
+    // a different node is unaffected
+    const other = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n2/probes' });
+    expect(other.json()).toEqual(NODE_PROBE_DEFAULTS);
+  });
+
+  it('PUT with an invalid body -> 400', async () => {
+    const { app } = await harness();
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/probes',
+      payload: { ...NODE_PROBE_DEFAULTS, liveness: { ...NODE_PROBE_DEFAULTS.liveness, timeoutSeconds: 0 } },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('an unknown node -> 400', async () => {
+    const { app } = await harness();
+    const get = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/ghost/probes' });
+    expect(get.statusCode).toBe(400);
+    const put = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/ghost/probes',
+      payload: NODE_PROBE_DEFAULTS,
+    });
+    expect(put.statusCode).toBe(400);
+  });
+});
+
+// ---------- profile clone ----------
+
+describe('POST /api/restreamer/profiles/:id/clone', () => {
+  it('clones the payload verbatim under a new name, 201', async () => {
+    const { app } = await harness();
+    const original = await createProfile(app, 'hd');
+    const res = await app.inject({
       method: 'POST',
-      url: '/api/restreamer/channels/ghost/cold/deactivate',
+      url: `/api/restreamer/profiles/${original.id}/clone`,
+      payload: { name: 'hd-2' },
+    });
+    expect(res.statusCode).toBe(201);
+    const cloned = res.json() as RestreamProfile;
+    expect(cloned.id).not.toBe(original.id);
+    expect(cloned.name).toBe('hd-2');
+    expect(cloned.payload).toEqual(original.payload);
+  });
+
+  it('409s a name conflict', async () => {
+    const { app } = await harness();
+    const original = await createProfile(app, 'hd');
+    await createProfile(app, 'taken');
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/restreamer/profiles/${original.id}/clone`,
+      payload: { name: 'taken' },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it('404s an unknown source profile', async () => {
+    const { app } = await harness();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/profiles/ghost/clone',
+      payload: { name: 'x' },
+    });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+// ---------- transactional channel apply ----------
+
+describe('POST /api/restreamer/channels/:id/apply', () => {
+  it('applies a channel patch and a full placement replacement (create + keep/reorder + delete) in one call', async () => {
+    const h = await harness();
+    const profile = await createProfile(h.app);
+    const created = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'BBB', // resolves via tvh topology on both zone1 and zone2
+        channelNumber: '10',
+        profileId: profile.id,
+        placements: [
+          { instanceId: 'zone1', nodeId: 'n1' }, // priority 1 -> KEPT, reordered to priority 2
+          { instanceId: 'zone1', nodeId: 'n2' }, // priority 2 -> DELETED
+        ],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const channel = created.json() as RestreamChannel;
+    const before = (await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' })).json() as RestreamChannelWithStatus[];
+    const existing = before.find((c) => c.id === channel.id)!.placements;
+    const keepId = existing.find((p) => p.nodeId === 'n1')!.id;
+    const deleteId = existing.find((p) => p.nodeId === 'n2')!.id;
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/apply`,
+      payload: {
+        channel: { comment: 'updated via apply' },
+        placements: [
+          { instanceId: 'zone2', nodeId: 'n1' }, // NEW -> priority 1
+          { id: keepId, instanceId: 'zone1', nodeId: 'n1' }, // KEPT -> priority 2
+        ],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const updated = res.json() as RestreamChannelWithStatus;
+    expect(updated.comment).toBe('updated via apply');
+    expect(updated.placements.map((p) => p.id)).not.toContain(deleteId);
+
+    const rows = await h.ctx.db!
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('channel_id', '=', channel.id)
+      .orderBy('priority')
+      .execute();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ instance_id: 'zone2', node_id: 'n1', priority: 1 });
+    expect(rows[1]).toMatchObject({ id: keepId, instance_id: 'zone1', node_id: 'n1', priority: 2 });
+  });
+
+  it('409s a duplicate node within the desired placement set', async () => {
+    const h = await harness();
+    const profile = await createProfile(h.app);
+    const created = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: { channelName: 'BBB', channelNumber: '10', profileId: profile.id },
+    });
+    const channel = created.json() as RestreamChannel;
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/apply`,
+      payload: {
+        placements: [
+          { instanceId: 'zone1', nodeId: 'n1' },
+          { instanceId: 'zone1', nodeId: 'n1' },
+        ],
+      },
+    });
+    expect(res.statusCode).toBe(409);
+  });
+
+  it('availability 409 carries unavailable[]; force bypasses', async () => {
+    const h = await harness();
+    seedNodeStatus(h.cache, 'zone2', 'n1', [], []); // known-empty catalog — no fallback either
+    const profile = await createProfile(h.app);
+    const created = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: { channelName: 'AT-X', channelNumber: '9.1', profileId: profile.id },
+    });
+    const channel = created.json() as RestreamChannel;
+
+    const denied = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/apply`,
+      payload: { placements: [{ instanceId: 'zone2', nodeId: 'n1' }] }, // zone2 has no AT-X 9.1
+    });
+    expect(denied.statusCode).toBe(409);
+    const body = denied.json() as { error: string; unavailable: Array<{ instanceId: string; nodeId: string }> };
+    expect(body.unavailable).toEqual([{ instanceId: 'zone2', nodeId: 'n1', reason: expect.any(String) }]);
+
+    const forced = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/apply`,
+      payload: { placements: [{ instanceId: 'zone2', nodeId: 'n1' }], force: true },
+    });
+    expect(forced.statusCode).toBe(200);
+  });
+});
+
+// ---------- batch edit playlistIds regression ----------
+
+describe('POST /api/restreamer/channels/batch — playlistIds regression', () => {
+  it('an edit patch carrying playlistIds replaces channel memberships', async () => {
+    const h = await harness();
+    const profile = await createProfile(h.app);
+    const pl1 = await createPlaylist(h.app, { slug: 'a', title: 'A' });
+    const pl2 = await createPlaylist(h.app, { slug: 'b', title: 'B' });
+    const created = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'AT-X',
+        channelNumber: '9.1',
+        profileId: profile.id,
+        playlistIds: [pl1.id],
+      },
+    });
+    const channel = created.json() as RestreamChannel;
+    expect(channel.playlistIds).toEqual([pl1.id]);
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels/batch',
+      payload: { action: 'edit', ids: [channel.id], patch: { playlistIds: [pl2.id] } },
+    });
+    expect(res.statusCode).toBe(200);
+    expect((res.json() as Array<{ ok: boolean }>)[0]!.ok).toBe(true);
+
+    const updated = (await h.service.getChannel(channel.id))!;
+    expect(updated.playlistIds).toEqual([pl2.id]);
+  });
+});
+
+// ---------- session restart-counter reset passthrough ----------
+
+describe('POST /api/restreamer/nodes/:instanceId/:nodeId/sessions/:name/restarts/reset', () => {
+  it('passes through to the node client; unknown node -> 404', async () => {
+    const { app, resetSessionRestarts } = await harness();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/nodes/zone1/n1/sessions/at-x/restarts/reset',
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true });
+    expect(resetSessionRestarts).toHaveBeenCalledWith('at-x');
+
+    const unknown = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/nodes/zone1/ghost/sessions/at-x/restarts/reset',
     });
     expect(unknown.statusCode).toBe(404);
+  });
+
+  it('unreachable node surfaces as 502', async () => {
+    const { app, resetSessionRestarts } = await harness();
+    resetSessionRestarts.mockRejectedValueOnce(new Error('fetch failed: ECONNREFUSED'));
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/restreamer/nodes/zone1/n1/sessions/at-x/restarts/reset',
+    });
+    expect(res.statusCode).toBe(502);
   });
 });
 

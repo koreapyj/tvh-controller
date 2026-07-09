@@ -160,6 +160,14 @@ describe('nodeHealthy: speed degradation', () => {
   it('MIN_HEALTHY_SPEED boundary is 0.98', () => {
     expect(MIN_HEALTHY_SPEED).toBe(0.98);
   });
+
+  it("speed 0 (the daemon's coercion of ffmpeg speed=N/A) is unknown, never slowness", () => {
+    // observed in prod: a healthy session reporting speed=0/out_time=0 forever
+    const snap = status([sess('news1', { speed: 0 }), sess('news2', { speed: 0 })]);
+    const history = historyAfter([snap, snap, snap]);
+    const result = nodeHealthy(history, snap);
+    expect(result.healthy).toBe(true);
+  });
 });
 
 describe('nodeHealthy: source-http exclusion', () => {

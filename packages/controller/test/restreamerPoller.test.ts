@@ -6,6 +6,9 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
+  LagProbeStatus,
+  NodeProbeStatus,
+  SessionStatus,
   SourcesResponse,
   SseEvent,
   StatusResponse,
@@ -377,6 +380,101 @@ describe('RestreamerPoller', () => {
       await poller.pollOnce();
       expect(onSourcesChanged).not.toHaveBeenCalled();
       err.mockRestore();
+    });
+  });
+
+  describe('probe state and session enrichment', () => {
+    function probeStatus(overrides: Partial<NodeProbeStatus['liveness']> = {}): NodeProbeStatus {
+      return {
+        liveness: {
+          consecutiveFailures: 0,
+          consecutiveSuccesses: 2,
+          failed: false,
+          lastResult: 'ok',
+          lastCheckedAt: '2026-01-01T00:00:00.000Z',
+          detail: 'playlist HTTP 200',
+          ...overrides,
+        },
+        underspeed: {
+          consecutiveFailures: 0,
+          consecutiveSuccesses: 2,
+          failed: false,
+          lastResult: 'ok',
+          lastCheckedAt: '2026-01-01T00:00:00.000Z',
+          detail: 'segment 1.0KB in 10ms (5s segment)',
+          lastSpeedRatio: 500,
+        },
+      };
+    }
+
+    it('getProbes lands in status.probes and survives an unrelated later poll (no wipe)', async () => {
+      const probes = probeStatus();
+      const { cache, status, poller } = setup({ getProbes: () => probes });
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.probes).toEqual(probes);
+
+      status.mockResolvedValue(nodeStatus({ uptimeSec: 99 }));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.uptimeSec).toBe(99);
+      expect(cache.get('i1').restreamers[0]?.probes).toEqual(probes);
+    });
+
+    it('getProbes returning null (nothing probeable) leaves status.probes null', async () => {
+      const { cache, status, poller } = setup({ getProbes: () => null });
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.probes).toBeNull();
+    });
+
+    it('enrichSessions folds channel-level probe state into the polled sessions', async () => {
+      const lagProbe: LagProbeStatus = {
+        consecutiveFailures: 0,
+        consecutiveSuccesses: 1,
+        failed: false,
+        lastResult: 'ok',
+        lastCheckedAt: '2026-01-01T00:00:00.000Z',
+        detail: 'lag 1.0s (threshold 30s)',
+        lastLagSec: 1,
+        firstMeasuredAt: '2026-01-01T00:00:00.000Z',
+      };
+      const enrichSessions = vi.fn(async (_i: string, _n: string, sessions: SessionStatus[]) =>
+        sessions.map((s) => ({ ...s, lagProbe })),
+      );
+      const { cache, status, poller } = setup({ enrichSessions });
+      status.mockResolvedValue(
+        nodeStatus({
+          sessions: [{ name: 'at-x', state: 'running', enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0 }],
+        }),
+      );
+      await poller.pollOnce();
+      expect(enrichSessions).toHaveBeenCalledWith('i1', 'n1', expect.any(Array));
+      expect(cache.get('i1').restreamers[0]?.sessions[0]).toMatchObject({ name: 'at-x', lagProbe });
+    });
+
+    it('a throwing enrichSessions hook is swallowed — the plain sessions pass through', async () => {
+      const enrichSessions = vi.fn(() => {
+        throw new Error('boom');
+      });
+      const { cache, status, poller } = setup({ enrichSessions });
+      status.mockResolvedValue(
+        nodeStatus({
+          sessions: [{ name: 'at-x', state: 'running', enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0 }],
+        }),
+      );
+      await expect(poller.pollOnce()).resolves.toBeUndefined();
+      expect(cache.get('i1').restreamers[0]?.sessions[0]).toMatchObject({ name: 'at-x' });
+    });
+
+    it('statusKey ignores lastCheckedAt anywhere in the status, not just at the top level', async () => {
+      let n = 0;
+      const { events, status, poller } = setup({
+        getProbes: () => probeStatus({ lastCheckedAt: new Date(2026, 0, 1, 0, 0, n++).toISOString() }),
+      });
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce();
+      await poller.pollOnce(); // only the nested probes.liveness.lastCheckedAt changed
+      expect(events).toHaveLength(1);
     });
   });
 

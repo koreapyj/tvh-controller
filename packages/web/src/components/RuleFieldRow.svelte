@@ -18,6 +18,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <script lang="ts">
   import { WEEKDAY_LABELS } from '../lib/format.js';
   import { needsOverrideToggle, type FieldSpec } from '../lib/ruleFields.js';
+  import MultiSelectDropdown from './MultiSelectDropdown.svelte';
 
   // One form row for a rule field (apply-checkbox · label · control · muted
   // help). Three modes share the markup:
@@ -173,6 +174,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
   {:else if spec.type === 'channel'}
     <input id="bf-{spec.key}" style="flex:1" list={datalistId} {placeholder} {disabled} bind:value />
+  {:else if spec.type === 'multiselect'}
+    <MultiSelectDropdown
+      options={spec.strOptions ?? []}
+      selected={value ? value.split(',').filter(Boolean) : []}
+      onchange={(next) => (value = next.join(','))}
+      {disabled}
+    />
   {:else}
     {#if showOverride}
       <input

@@ -286,3 +286,18 @@ tr.subrow > td { background: var(--panel); padding: 4px 8px 8px 24px; }
 .subtable td { border-bottom: none; padding: 3px 8px; }
 .subtable tr:hover td { background: transparent; }
 code { background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+/* SessionModal live log pane */
+.log-pane {
+  font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  height: 320px;
+  overflow-y: auto;
+  padding: 6px 8px;
+  margin-top: 6px;
+}
+.log-line { white-space: pre-wrap; overflow-wrap: break-word; word-break: break-all; }
+.log-src { color: var(--muted); margin-right: 6px; }

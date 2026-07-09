@@ -154,7 +154,8 @@ describe('RestreamerClient endpoints', () => {
 
   it('sessionLog(): GET /v1/sessions/:name/log with optional ?lines=N', async () => {
     const lines = [{ ts: '2026-07-06T00:00:00Z', src: 'ffmpeg', line: 'frame=1' }];
-    const { fetchImpl, calls } = fakeFetch(json(lines));
+    // the daemon wraps the tail in an envelope; the client unwraps it
+    const { fetchImpl, calls } = fakeFetch(json({ name: 'at-x', lines }));
     const client = new RestreamerClient(NODE, fetchImpl);
     expect(await client.sessionLog('at-x', 50)).toEqual(lines);
     expect(calls[0]).toMatchObject({

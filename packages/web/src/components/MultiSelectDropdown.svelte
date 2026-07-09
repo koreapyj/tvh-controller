@@ -32,6 +32,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     allLabel = 'All',
     unit = 'selected',
     searchPlaceholder = 'Search…',
+    disabled = false,
   }: {
     options: Option[];
     selected: string[];
@@ -39,6 +40,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     allLabel?: string;
     unit?: string;
     searchPlaceholder?: string;
+    /** inert trigger — used by RuleFieldRow's batch mode before the field is ticked */
+    disabled?: boolean;
   } = $props();
 
   let search = $state('');
@@ -74,7 +77,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   bind:this={root}
   ontoggle={(e) => (e.currentTarget as HTMLDetailsElement).open && searchInput?.focus()}
 >
-  <summary>{selected.length ? `${selected.length} ${unit}` : allLabel}</summary>
+  <summary class:inert={disabled}>{selected.length ? `${selected.length} ${unit}` : allLabel}</summary>
   <div class="ms-list">
     <div class="ms-search">
       <input bind:this={searchInput} placeholder={searchPlaceholder} bind:value={search} aria-label="Search" />
@@ -107,6 +110,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
   .ms-filter > summary::-webkit-details-marker {
     display: none;
+  }
+  .ms-filter > summary.inert {
+    pointer-events: none;
+    opacity: 0.5;
   }
   .ms-list {
     position: absolute;

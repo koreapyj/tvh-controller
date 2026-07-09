@@ -25,15 +25,25 @@ import {
   nodeKey,
   resolveCatalogEntry,
   resolveTvhChannel,
+  type ApplyChannelInput,
   type ChannelBatchAction,
   type ChannelPatch,
   type CreateChannelInput,
   type PlacementInput,
   type PlacementPatch,
 } from '../restreamer/service.js';
+import { parseProbeSettings } from '../restreamer/probeSettings.js';
 import { RestreamerError } from '../restreamer/client.js';
 import { httpError, requireDb, type AppContext } from './context.js';
 import { mergeEpg, type EpgMergeInput } from './epg.js';
+
+/** open log-stream relays; aborted before app.close() so shutdown never hangs */
+const logRelayAborts = new Set<AbortController>();
+
+export function abortLogRelays(): void {
+  for (const abort of [...logRelayAborts]) abort.abort();
+  logRelayAborts.clear();
+}
 
 const BATCH_ACTIONS: ReadonlySet<ChannelBatchAction> = new Set([
   'edit',
@@ -598,6 +608,113 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     },
   );
 
+  app.post<{ Params: { instanceId: string; nodeId: string; name: string } }>(
+    '/api/restreamer/nodes/:instanceId/:nodeId/sessions/:name/restarts/reset',
+    async (req) => {
+      const { instanceId, nodeId, name } = req.params;
+      const client = ctx.restreamerClients.get(nodeKey(instanceId, nodeId));
+      if (!client) throw httpError(404, `unknown restreamer node ${nodeKey(instanceId, nodeId)}`);
+      try {
+        await client.resetSessionRestarts(name);
+      } catch (err) {
+        throw passthroughError(err);
+      }
+      return { ok: true };
+    },
+  );
+
+  /**
+   * Transparent byte relay of the daemon's SSE log stream (the daemon frames
+   * the events; the controller never re-encodes). The reply is hijacked, the
+   * upstream fetch is aborted on client disconnect, and every open relay is
+   * tracked so shutdown can abort them — Fastify's close() waits for in-flight
+   * responses and would otherwise hang into the failsafe exit.
+   */
+  app.get<{ Params: { instanceId: string; nodeId: string; name: string } }>(
+    '/api/restreamer/nodes/:instanceId/:nodeId/sessions/:name/log/stream',
+    (req, reply) => {
+      const { instanceId, nodeId, name } = req.params;
+      const client = ctx.restreamerClients.get(nodeKey(instanceId, nodeId));
+      if (!client) {
+        void reply
+          .status(404)
+          .send({ error: `unknown restreamer node ${nodeKey(instanceId, nodeId)}` });
+        return;
+      }
+      reply.hijack();
+      const res = reply.raw;
+      const abort = new AbortController();
+      logRelayAborts.add(abort);
+      const cleanup = (): void => {
+        logRelayAborts.delete(abort);
+        abort.abort();
+        try {
+          res.end();
+        } catch {
+          /* already gone */
+        }
+      };
+      req.raw.on('close', cleanup);
+      req.raw.on('error', cleanup);
+      void (async () => {
+        let upstream: Response;
+        try {
+          upstream = await client.sessionLogStream(name, abort.signal);
+        } catch (err) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: `restreamer node unreachable: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+          );
+          cleanup();
+          return;
+        }
+        if (!upstream.ok || !upstream.body) {
+          res.writeHead(upstream.status || 502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: `daemon log stream HTTP ${upstream.status}` }));
+          cleanup();
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+          'x-accel-buffering': 'no',
+        });
+        try {
+          const reader = upstream.body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) res.write(Buffer.from(value));
+          }
+        } catch {
+          /* upstream ended or client vanished */
+        } finally {
+          cleanup();
+        }
+      })();
+    },
+  );
+
+  // ---------- per-node probe settings ----------
+
+  app.get<{ Params: { instanceId: string; nodeId: string } }>(
+    '/api/restreamer/nodes/:instanceId/:nodeId/probes',
+    async (req) => svc().getNodeProbeSettings(req.params.instanceId, req.params.nodeId),
+  );
+
+  app.put<{ Params: { instanceId: string; nodeId: string } }>(
+    '/api/restreamer/nodes/:instanceId/:nodeId/probes',
+    async (req) =>
+      svc().setNodeProbeSettings(
+        req.params.instanceId,
+        req.params.nodeId,
+        parseProbeSettings(req.body),
+      ),
+  );
+
   // ---------- profiles ----------
 
   app.get('/api/restreamer/profiles', async () => svc().listProfiles());
@@ -622,6 +739,13 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
   app.delete<{ Params: { id: string } }>('/api/restreamer/profiles/:id', async (req) => {
     await svc().deleteProfile(req.params.id);
     return { ok: true };
+  });
+
+  app.post<{ Params: { id: string } }>('/api/restreamer/profiles/:id/clone', async (req, reply) => {
+    const b = asObject(req.body, 'request body');
+    const profile = await svc().cloneProfile(req.params.id, requireString(b.name, 'name'));
+    reply.code(201);
+    return profile;
   });
 
   // ---------- channels ----------
@@ -666,6 +790,41 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
       const updated = await svc().updateChannel(req.params.id, patch);
       return (await svc().channelWithStatus(updated.id)) ?? updated;
     });
+  });
+
+  // transactional Save for the edit modal: channel patch + FULL desired
+  // placement set (array order = priority, missing ids = delete) in one pass
+  app.post<{ Params: { id: string } }>('/api/restreamer/channels/:id/apply', async (req, reply) => {
+    const b = asObject(req.body, 'request body');
+    const input: ApplyChannelInput = {};
+    if (b.channel !== undefined) input.channel = parseChannelPatch(b.channel);
+    if (b.placements !== undefined) {
+      if (!Array.isArray(b.placements)) throw httpError(400, 'placements must be an array');
+      input.placements = b.placements.map((raw) => {
+        const p = asObject(raw, 'placement');
+        const mode = p.mode === 'cold' ? 'cold' : 'hot';
+        if (p.mode !== undefined && p.mode !== 'hot' && p.mode !== 'cold') {
+          throw httpError(400, "placement.mode must be 'hot' or 'cold'");
+        }
+        if (p.weight != null && typeof p.weight !== 'number') {
+          throw httpError(400, 'placement.weight must be a number or null');
+        }
+        if (p.programNumber != null && typeof p.programNumber !== 'number') {
+          throw httpError(400, 'placement.programNumber must be a number or null');
+        }
+        return {
+          ...(p.id !== undefined ? { id: requireString(p.id, 'placement.id') } : {}),
+          instanceId: requireString(p.instanceId, 'placement.instanceId'),
+          nodeId: requireString(p.nodeId, 'placement.nodeId'),
+          mode,
+          weight: (p.weight as number | null | undefined) ?? null,
+          programNumber: (p.programNumber as number | null | undefined) ?? null,
+          enabled: p.enabled === undefined ? true : !!p.enabled,
+        };
+      });
+    }
+    if (b.force !== undefined) input.force = !!b.force;
+    return withAvailability(reply, () => svc().applyChannelChanges(req.params.id, input));
   });
 
   app.delete<{ Params: { id: string } }>('/api/restreamer/channels/:id', async (req) => {
@@ -787,26 +946,13 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     return { ok: true };
   });
 
-  // ---------- cold backup ----------
-  // Operator escape valve: force-clear a channel's cold activation (the
-  // failover loop normally deactivates on its own, make-before-break); the
-  // cleared cold session is torn down by the re-push. existed:false = there
-  // was nothing to clear.
-
-  app.post<{ Params: { id: string } }>(
-    '/api/restreamer/channels/:id/cold/deactivate',
-    async (req) => svc().deactivateColdBackup(req.params.id),
-  );
-
   // ---------- manual switch / reset ----------
-  // Passthrough to POST /v1/channels/:slug/switch on the switcher: the
-  // switcher's own state file is authoritative for the active selection (the
-  // controller mirrors it via the status poll), and its lastSwitch timestamp
-  // is what the sticky-1h rebalance window keys on — nothing to persist here.
-  // Body: {placementId} = explicit switch; {reset: true} = back to the
-  // highest-priority healthy upstream (service-resolved, 409 if none).
+  // Both enter the SAME serialized failover procedure the automatic triggers
+  // use — the response only acknowledges queueing; progress is observed via
+  // the `restreamer-channel` SSE stream. Body: {placementId} = manual
+  // selection; {reset: true, force?} = fail back in natural placement order.
 
-  app.post<{ Params: { id: string } }>('/api/restreamer/channels/:id/switch', async (req) => {
+  app.post<{ Params: { id: string } }>('/api/restreamer/channels/:id/switch', async (req, reply) => {
     const service = svc(); // 503 without a database, like every other mutation
     const b = asObject(req.body, 'request body');
     if ((b.placementId !== undefined) === (b.reset !== undefined)) {
@@ -814,35 +960,19 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     }
     if (b.reset !== undefined) {
       if (b.reset !== true) throw httpError(400, 'reset must be true');
-      return service.resetChannelSwitch(req.params.id);
+      const outcome = await service.requestReset(req.params.id, b.force === true);
+      if ('rejected' in outcome) {
+        reply.code(409);
+        return {
+          error: outcome.rejected,
+          message: outcome.message,
+          ...(outcome.rejected === 'requires-confirm' ? { triggerStillFailing: true } : {}),
+        };
+      }
+      return outcome;
     }
     const placementId = requireString(b.placementId, 'placementId');
-
-    const channel = (await service.listChannels()).find((c) => c.id === req.params.id);
-    if (!channel) throw httpError(404, `restream channel ${req.params.id} not found`);
-    if (!channel.placements.some((p) => p.id === placementId)) {
-      throw httpError(400, `placement ${placementId} does not belong to channel "${channel.slug}"`);
-    }
-
-    // prefer a switcher that already reports the slug; fall back to the first
-    // configured one (a freshly pushed channel may not be polled yet)
-    const switchers = ctx.config.restreamer?.switchers ?? [];
-    const target =
-      switchers.find((sw) =>
-        ctx.cache.switchers.get(sw.id)?.channels.some((c) => c.slug === channel.slug),
-      ) ?? switchers[0];
-    const client = target ? ctx.switcherClients.get(target.id) : undefined;
-    if (!client) {
-      throw httpError(503, 'no switcher configured — redundant-channel switching is unavailable');
-    }
-    try {
-      // switcher upstream ids ARE controller placement ids by construction
-      await client.switchChannel(channel.slug, placementId);
-    } catch (err) {
-      // switcher-side 4xx (unknown slug/upstream) keeps its status, else 502
-      throw passthroughError(err);
-    }
-    return { ok: true };
+    return service.requestManualSwitch(req.params.id, placementId);
   });
 
   // ---------- master playlist M3U ----------

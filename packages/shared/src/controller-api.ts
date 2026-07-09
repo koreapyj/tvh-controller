@@ -25,7 +25,7 @@ import type {
 } from './tvh-types.js';
 import type { DriftItem, MasterRulePayload, RuleInstances, SyncState } from './master-rule.js';
 import type { UploadJob, UploadStatus } from './rclone-rc.js';
-import type { RestreamerNodeStatus, SwitcherNodeStatus } from './restreamer.js';
+import type { RestreamChannelWithStatus, RestreamerNodeStatus, SwitcherNodeStatus } from './restreamer.js';
 
 export interface InstanceSummary {
   id: string;
@@ -254,4 +254,6 @@ export type SseEvent =
   | { type: 'conflicts'; data: { instanceId: string; windows: ConflictWindow[] } }
   | { type: 'upload-progress'; data: UploadJob }
   | { type: 'restreamer'; data: RestreamerNodeStatus }
-  | { type: 'restreamer-switcher'; data: SwitcherNodeStatus };
+  | { type: 'restreamer-switcher'; data: SwitcherNodeStatus }
+  /** live channel failover/indicator state (full REST shape, replace-by-id) */
+  | { type: 'restreamer-channel'; data: RestreamChannelWithStatus };

@@ -23,23 +23,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     type RestreamPlaylist,
     type RestreamProfile,
   } from '@tvhc/shared';
-  import {
-    api,
-    unavailableDetail,
-    type RestreamChannelPatch,
-    type RestreamPlacementInput,
-  } from '../lib/api.js';
+  import { api, unavailableDetail, type RestreamChannelPatch } from '../lib/api.js';
   import { lowestNumberFor, parseChannelInput } from '../lib/channelPick.js';
   import { errText } from '../lib/fetchGuard.js';
-  import { dateTime } from '../lib/format.js';
-  import { notify } from '../lib/notifications.js';
   import { placementAvailability } from '../lib/placementAvailability.js';
   import {
-    coldActivationLabel,
-    deriveSlug,
-    placementModeBadge,
-    SLUG_PATTERN,
-  } from '../lib/restreamFields.js';
+    buildPlacementsPayload,
+    removedPlacementIds,
+    seedStagedPlacements,
+    type StagedPlacement,
+  } from '../lib/placementStaging.js';
+  import { deriveSlug, placementModeBadge, sessionStateBadge, SLUG_PATTERN } from '../lib/restreamFields.js';
   import { channelOptions, instName, restreamerNodeKey, restreamerNodes } from '../lib/stores.js';
 
   // Logical restream channel editor. Channel identity follows the controller
@@ -48,8 +42,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // Each placement resolves this identity independently — tvheadend topology
   // first, then (automatically, no separate UI concept) a node's local
   // sources.m3u catalog by the same (name, number) rules.
-  // Placements: local rows on create (submitted with the channel), live API
-  // operations on edit (each add/reorder/patch/remove hits its endpoint).
+  //
+  // Placements are staged locally (StagedPlacement rows) and applied together
+  // with the channel fields in ONE atomic write on Save (POST .../apply for an
+  // edit, the `placements` field of POST .../channels for a create) — there is
+  // no more live per-placement endpoint hit on every add/reorder/edit.
 
   let {
     channel = null,
@@ -65,11 +62,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     onclose: () => void;
   } = $props();
 
-  /** edit mode: live copy refreshed after every placement operation */
-  let current: RestreamChannelWithStatus | null = $state(
-    channel ? ($state.snapshot(channel) as RestreamChannelWithStatus) : null,
-  );
-
   let channelInput = $state(channel ? channel.channelName : '');
   let numberVal = $state(channel?.channelNumber ?? '');
   let slugVal = $state(channel?.slug ?? '');
@@ -81,6 +73,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let formError = $state('');
   /** "save anyway" pre-provisioning consent — sends force: true on writes */
   let forceSave = $state(false);
+
+  let stagedPlacements: StagedPlacement[] = $state(seedStagedPlacements(channel?.placements ?? []));
 
   // ---------- channel identity ----------
 
@@ -187,140 +181,42 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     if (!nodes.includes(addNode)) addNode = nodes[0] ?? '';
   });
 
-  /** create mode: locally accumulated placement rows (priority = row order) */
-  interface LocalPlacement {
-    instanceId: string;
-    nodeId: string;
-    mode: 'hot' | 'cold';
-    weight: string;
-    programNumber: string;
-    enabled: boolean;
-  }
-  let localPlacements: LocalPlacement[] = $state([]);
-
-  /** any row's target node KNOWN unable to serve the form's identity → offer force */
-  const anyUnavailable = $derived(
-    (current ? current.placements : localPlacements).some(
-      (p) => availability(p.instanceId, p.nodeId) === 'unavailable',
-    ),
-  );
-
   const existingPlacementKeys = $derived(
-    new Set(
-      (current ? current.placements.map((p) => `${p.instanceId}/${p.nodeId}`) : []).concat(
-        localPlacements.map((p) => `${p.instanceId}/${p.nodeId}`),
-      ),
-    ),
+    new Set(stagedPlacements.map((p) => `${p.instanceId}/${p.nodeId}`)),
   );
   const addDisabled = $derived(
     busy || !addNode || existingPlacementKeys.has(`${addInstance}/${addNode}`),
   );
 
-  const sortedPlacements = $derived(
-    current ? [...current.placements].sort((a, b) => a.priority - b.priority) : [],
+  /** any staged row's target node KNOWN unable to serve the form's identity → offer force */
+  const anyUnavailable = $derived(
+    stagedPlacements.some((p) => availability(p.instanceId, p.nodeId) === 'unavailable'),
   );
 
-  async function refreshCurrent(): Promise<void> {
-    if (!current) return;
-    current = await api.restreamChannel(current.id);
-  }
-
-  async function run(fn: () => Promise<unknown>): Promise<void> {
-    busy = true;
-    try {
-      await fn();
-      await refreshCurrent();
-    } catch (err) {
-      const availText = availabilityText(err);
-      if (availText) formError = availText;
-      else notify.error(errText(err));
-      await refreshCurrent().catch(() => {});
-    } finally {
-      busy = false;
-    }
-  }
-
   function addPlacement(): void {
-    if (current) {
-      const id = current.id;
-      void run(() =>
-        api.addRestreamPlacement(id, {
-          instanceId: addInstance,
-          nodeId: addNode,
-          mode: addMode,
-          ...(forceSave ? { force: true } : {}),
-        }),
-      );
-    } else {
-      localPlacements = [
-        ...localPlacements,
-        {
-          instanceId: addInstance,
-          nodeId: addNode,
-          mode: addMode,
-          weight: '',
-          programNumber: '',
-          enabled: true,
-        },
-      ];
-    }
+    stagedPlacements = [
+      ...stagedPlacements,
+      { instanceId: addInstance, nodeId: addNode, mode: addMode, weight: '', programNumber: '', enabled: true },
+    ];
   }
 
-  /** priority reorder: swap with the neighbor and push the full order */
+  /** priority reorder: swap with the neighbor */
   function move(index: number, delta: -1 | 1): void {
-    if (current) {
-      const ids = sortedPlacements.map((p) => p.id);
-      const other = index + delta;
-      if (other < 0 || other >= ids.length) return;
-      [ids[index], ids[other]] = [ids[other]!, ids[index]!];
-      const id = current.id;
-      void run(() => api.reorderRestreamPlacements(id, ids));
-    } else {
-      const other = index + delta;
-      if (other < 0 || other >= localPlacements.length) return;
-      const next = [...localPlacements];
-      [next[index], next[other]] = [next[other]!, next[index]!];
-      localPlacements = next;
-    }
+    const other = index + delta;
+    if (other < 0 || other >= stagedPlacements.length) return;
+    const next = [...stagedPlacements];
+    [next[index], next[other]] = [next[other]!, next[index]!];
+    stagedPlacements = next;
   }
 
-  /** '' = null (clear override); NaN rejected with the field name */
-  function parseOverride(raw: string, label: string, integer: boolean): number | null | undefined {
-    const t = raw.trim();
-    if (t === '') return null;
-    const n = Number(t);
-    if (Number.isNaN(n) || (integer && !Number.isInteger(n))) {
-      notify.error(`${label} must be ${integer ? 'an integer' : 'a number'} or blank`);
-      return undefined;
-    }
-    return n;
+  function removePlacement(index: number): void {
+    stagedPlacements = stagedPlacements.filter((_, i) => i !== index);
   }
 
-  function commitMode(placementId: string, mode: 'hot' | 'cold'): void {
-    void run(() => api.updateRestreamPlacement(placementId, { mode }));
-  }
-
-  function commitWeight(placementId: string, raw: string): void {
-    const v = parseOverride(raw, 'weight', false);
-    if (v === undefined) return;
-    void run(() => api.updateRestreamPlacement(placementId, { weight: v }));
-  }
-
-  function commitProgramNumber(placementId: string, raw: string): void {
-    const v = parseOverride(raw, 'program number', true);
-    if (v === undefined) return;
-    void run(() => api.updateRestreamPlacement(placementId, { programNumber: v }));
-  }
-
-  function removePlacement(placementId: string, label: string): void {
-    if (!confirm(`Remove the placement on ${label}? The node stops encoding this channel.`)) return;
-    void run(() => api.deleteRestreamPlacement(placementId));
-  }
-
-  function deactivateColdBackup(): void {
-    if (!current) return;
-    const id = current.id;
-    void run(() => api.deactivateColdBackup(id));
+  /** the live (session/blockedReason/resolvedVia) record for a staged row that already has an id */
+  function liveFor(p: StagedPlacement): RestreamChannelWithStatus['placements'][number] | null {
+    if (p.id === undefined || !channel) return null;
+    return channel.placements.find((x) => x.id === p.id) ?? null;
   }
 
   // ---------- save ----------
@@ -341,49 +237,53 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       formError = 'slug must be lowercase alphanumerics and dashes, starting alphanumeric (max 64)';
       return;
     }
+    const built = buildPlacementsPayload($state.snapshot(stagedPlacements));
+    if (!built.ok) {
+      formError = built.error;
+      return;
+    }
+
+    if (channel) {
+      const removed = removedPlacementIds(channel.placements, stagedPlacements);
+      if (removed.length) {
+        const labels = removed.map((id) => {
+          const orig = channel!.placements.find((p) => p.id === id);
+          return orig ? `${$instName(orig.instanceId)} / ${orig.nodeId}` : id;
+        });
+        if (
+          !confirm(
+            `Remove ${removed.length} placement${removed.length === 1 ? '' : 's'} (${labels.join(', ')})? ` +
+              'Those nodes stop encoding this channel.',
+          )
+        ) {
+          return;
+        }
+      }
+    }
+
     busy = true;
     try {
-      if (current) {
+      if (channel) {
         const patch: RestreamChannelPatch = {};
-        if (name !== current.channelName || (numberVal.trim() || null) !== current.channelNumber) {
+        if (name !== channel.channelName || (numberVal.trim() || null) !== channel.channelNumber) {
           // name+number always travel as a pair: a name-only patch would NULL
           // the pin server-side (string identity rules)
           patch.channelName = name;
           patch.channelNumber = numberVal.trim() || null;
         }
-        if (slug && slug !== current.slug) patch.slug = slug;
-        if (profileId !== current.profileId) patch.profileId = profileId;
-        if (enabled !== current.enabled) patch.enabled = enabled;
-        if ((comment.trim() || null) !== current.comment) patch.comment = comment.trim() || null;
-        const oldPl = [...current.playlistIds].sort().join(',');
+        if (slug && slug !== channel.slug) patch.slug = slug;
+        if (profileId !== channel.profileId) patch.profileId = profileId;
+        if (enabled !== channel.enabled) patch.enabled = enabled;
+        if ((comment.trim() || null) !== channel.comment) patch.comment = comment.trim() || null;
+        const oldPl = [...channel.playlistIds].sort().join(',');
         const newPl = [...selectedPlaylists].sort().join(',');
         if (oldPl !== newPl) patch.playlistIds = [...selectedPlaylists];
-        if (Object.keys(patch).length) {
-          await api.updateRestreamChannel(
-            current.id,
-            forceSave ? { ...patch, force: true } : patch,
-          );
-        }
+        await api.applyRestreamChannel(channel.id, {
+          ...(Object.keys(patch).length ? { channel: patch } : {}),
+          placements: built.placements,
+          ...(forceSave ? { force: true } : {}),
+        });
       } else {
-        const placements: RestreamPlacementInput[] = [];
-        for (const [i, p] of localPlacements.entries()) {
-          const weight = parseOverride(p.weight, 'weight', false);
-          const programNumber = parseOverride(p.programNumber, 'program number', true);
-          if (weight === undefined || programNumber === undefined) {
-            busy = false;
-            return;
-          }
-          placements.push({
-            instanceId: p.instanceId,
-            nodeId: p.nodeId,
-            priority: i + 1,
-            enabled: p.enabled,
-            mode: p.mode,
-            weight,
-            programNumber,
-            ...(forceSave ? { force: true } : {}),
-          });
-        }
         await api.createRestreamChannel({
           channelName: name,
           channelNumber: numberVal.trim() || null,
@@ -392,7 +292,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           enabled,
           comment: comment.trim() || null,
           playlistIds: [...selectedPlaylists],
-          ...(placements.length ? { placements } : {}),
+          placements: built.placements,
           ...(forceSave ? { force: true } : {}),
         });
       }
@@ -424,10 +324,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     class="modal"
     role="dialog"
     aria-modal="true"
-    aria-label={current ? `Edit ${current.slug}` : 'New restream channel'}
+    aria-label={channel ? `Edit ${channel.slug}` : 'New restream channel'}
   >
     <h2 style="margin-top:0">
-      {current ? `Edit restream channel: ${current.slug}` : 'New restream channel'}
+      {channel ? `Edit restream channel: ${channel.slug}` : 'New restream channel'}
     </h2>
     {#if formError}<div class="error-banner">{formError}</div>{/if}
 
@@ -512,27 +412,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </div>
       </div>
 
-      {#if current?.coldActivation}
-        {@const ca = current.coldActivation}
-        {@const caPlacement = current.placements.find((pp) => pp.id === ca.placementId)}
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;color:var(--warn)" class="small">
-          <span>
-            Cold backup active{#if caPlacement}&nbsp;on {$instName(caPlacement.instanceId)} / {caPlacement.nodeId}{/if}
-            — {coldActivationLabel(ca.reason)} since {dateTime(ca.activatedAt)}
-          </span>
-          <button disabled={busy} onclick={deactivateColdBackup}>Deactivate</button>
-        </div>
-      {/if}
-      {#if current?.coldBlocked}
-        <div
-          class="small"
-          style="color:var(--warn);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-          title={current.coldBlocked}
-        >
-          Cold backup blocked: {current.coldBlocked}
-        </div>
-      {/if}
-
       <div class="muted small" style="margin-top:8px;text-transform:uppercase;font-size:11px">
         Placements (failover order — every enabled placement encodes hot-hot)
       </div>
@@ -549,114 +428,45 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           </tr>
         </thead>
         <tbody>
-          {#if current}
-            {#each sortedPlacements as p, i (p.id)}
-              <tr>
-                <td style="white-space:nowrap">
-                  <button class="expander" disabled={busy || i === 0} title="higher priority" onclick={() => move(i, -1)}>▲</button>
-                  <button class="expander" disabled={busy || i === sortedPlacements.length - 1} title="lower priority" onclick={() => move(i, 1)}>▼</button>
-                  {i + 1}
-                </td>
-                <td class="small">
-                  {$instName(p.instanceId)} / {p.nodeId}
-                  {@render availBadge(p.instanceId, p.nodeId)}
-                  {#if p.blockedReason}<span class="badge warn" title={p.blockedReason}>blocked</span>{/if}
-                  {#if placementModeBadge(p)}
-                    {@const modeBadge = placementModeBadge(p)!}
-                    <span class="badge {modeBadge.cls}">{modeBadge.label}</span>
-                  {/if}
-                </td>
-                <td>
-                  <select
-                    style="width:auto"
-                    value={p.mode}
-                    disabled={busy}
-                    aria-label="mode"
-                    onchange={(e) => commitMode(p.id, e.currentTarget.value as 'hot' | 'cold')}
-                  >
-                    <option value="hot">hot</option>
-                    <option value="cold">cold</option>
-                  </select>
-                </td>
-                <td>
-                  <input
-                    style="width:80px"
-                    inputmode="numeric"
-                    placeholder="(default)"
-                    value={p.weight ?? ''}
-                    disabled={busy}
-                    onchange={(e) => commitWeight(p.id, e.currentTarget.value)}
-                  />
-                </td>
-                <td>
-                  <input
-                    style="width:80px"
-                    inputmode="numeric"
-                    placeholder="(derived)"
-                    value={p.programNumber ?? ''}
-                    disabled={busy}
-                    onchange={(e) => commitProgramNumber(p.id, e.currentTarget.value)}
-                  />
-                </td>
-                <td>
-                  <input
-                    type="checkbox"
-                    checked={p.enabled}
-                    disabled={busy}
-                    onchange={(e) => {
-                      const on = e.currentTarget.checked;
-                      void run(() => api.updateRestreamPlacement(p.id, { enabled: on }));
-                    }}
-                  />
-                </td>
-                <td style="text-align:right">
-                  <button
-                    class="danger"
-                    disabled={busy}
-                    onclick={() => removePlacement(p.id, `${$instName(p.instanceId)} / ${p.nodeId}`)}
-                  >
-                    Remove
-                  </button>
-                </td>
-              </tr>
-            {:else}
-              <tr><td colspan="7" class="muted">No placements — no node encodes this channel yet.</td></tr>
-            {/each}
+          {#each stagedPlacements as p, i (p.id ?? `${p.instanceId}/${p.nodeId}`)}
+            {@const live = liveFor(p)}
+            <tr>
+              <td style="white-space:nowrap">
+                <button class="expander" disabled={i === 0} title="higher priority" onclick={() => move(i, -1)}>▲</button>
+                <button class="expander" disabled={i === stagedPlacements.length - 1} title="lower priority" onclick={() => move(i, 1)}>▼</button>
+                {i + 1}
+              </td>
+              <td class="small">
+                {$instName(p.instanceId)} / {p.nodeId}
+                {@render availBadge(p.instanceId, p.nodeId)}
+                {#if live?.session}<span class="badge {sessionStateBadge(live.session.state)}">{live.session.state}</span>{/if}
+                {#if live?.blockedReason}<span class="badge warn" title={live.blockedReason}>blocked</span>{/if}
+                {#if live?.resolvedVia}<span class="badge neutral" title="channel identity resolved via {live.resolvedVia}">{live.resolvedVia}</span>{/if}
+                {#if placementModeBadge(p)}
+                  {@const modeBadge = placementModeBadge(p)!}
+                  <span class="badge {modeBadge.cls}">{modeBadge.label}</span>
+                {/if}
+              </td>
+              <td>
+                <select style="width:auto" bind:value={p.mode} aria-label="mode">
+                  <option value="hot">hot</option>
+                  <option value="cold">cold</option>
+                </select>
+              </td>
+              <td>
+                <input style="width:80px" inputmode="numeric" placeholder="(default)" bind:value={p.weight} />
+              </td>
+              <td>
+                <input style="width:80px" inputmode="numeric" placeholder="(derived)" bind:value={p.programNumber} />
+              </td>
+              <td><input type="checkbox" bind:checked={p.enabled} /></td>
+              <td style="text-align:right">
+                <button class="danger" onclick={() => removePlacement(i)}>Remove</button>
+              </td>
+            </tr>
           {:else}
-            {#each localPlacements as p, i (`${p.instanceId}/${p.nodeId}`)}
-              <tr>
-                <td style="white-space:nowrap">
-                  <button class="expander" disabled={i === 0} title="higher priority" onclick={() => move(i, -1)}>▲</button>
-                  <button class="expander" disabled={i === localPlacements.length - 1} title="lower priority" onclick={() => move(i, 1)}>▼</button>
-                  {i + 1}
-                </td>
-                <td class="small">
-                  {$instName(p.instanceId)} / {p.nodeId}
-                  {@render availBadge(p.instanceId, p.nodeId)}
-                  {#if placementModeBadge({ mode: p.mode, coldActive: false })}
-                    {@const modeBadge = placementModeBadge({ mode: p.mode, coldActive: false })!}
-                    <span class="badge {modeBadge.cls}">{modeBadge.label}</span>
-                  {/if}
-                </td>
-                <td>
-                  <select style="width:auto" bind:value={p.mode} aria-label="mode">
-                    <option value="hot">hot</option>
-                    <option value="cold">cold</option>
-                  </select>
-                </td>
-                <td><input style="width:80px" inputmode="numeric" placeholder="(default)" bind:value={p.weight} /></td>
-                <td><input style="width:80px" inputmode="numeric" placeholder="(derived)" bind:value={p.programNumber} /></td>
-                <td><input type="checkbox" bind:checked={p.enabled} /></td>
-                <td style="text-align:right">
-                  <button class="danger" onclick={() => (localPlacements = localPlacements.filter((_, x) => x !== i))}>
-                    Remove
-                  </button>
-                </td>
-              </tr>
-            {:else}
-              <tr><td colspan="7" class="muted">No placements yet — add a node below.</td></tr>
-            {/each}
-          {/if}
+            <tr><td colspan="7" class="muted">No placements yet — add a node below.</td></tr>
+          {/each}
         </tbody>
       </table>
 
@@ -680,26 +490,24 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           <span class="muted small">no restreamer nodes configured</span>
         {/if}
       </div>
-      {#if current}
-        <div class="muted small">
-          Placement changes apply immediately; weight/program-number edits save on blur.
-        </div>
-      {/if}
+      <div class="muted small">
+        Placement changes are staged locally and applied together with the channel when you Save.
+      </div>
 
       {#if anyUnavailable}
         <label style="display:flex;gap:6px;align-items:center;margin:0" title="force: true — the write is accepted and the placement stays blocked until the channel/catalog entry appears">
           <input type="checkbox" bind:checked={forceSave} />
           <span class="small" style="color:var(--warn)">
-            {current ? 'Save' : 'Create'} anyway (pre-provisioning — some nodes cannot serve this right now)
+            {channel ? 'Save' : 'Create'} anyway (pre-provisioning — some nodes cannot serve this right now)
           </span>
         </label>
       {/if}
     </div>
 
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
-      <button onclick={onclose}>{current ? 'Close' : 'Cancel'}</button>
+      <button onclick={onclose}>{channel ? 'Close' : 'Cancel'}</button>
       <button class="primary" onclick={save} disabled={busy || !effName}>
-        {current ? 'Save' : 'Create'}
+        {channel ? 'Save' : 'Create'}
       </button>
     </div>
   </div>

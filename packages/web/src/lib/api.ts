@@ -27,6 +27,7 @@ import type {
   MasterRule,
   InstanceSummary,
   MasterRulePayload,
+  NodeProbeSettings,
   ReconcileAction,
   RecordingBatchResult,
   RecordingEditOp,
@@ -41,32 +42,12 @@ import type {
   LogLine,
   PipelineParams,
   RestreamChannelWithStatus,
-  RestreamPlacement,
   RestreamPlaylist,
   RestreamProfile,
   RestreamerNodeStatus,
   SwitcherNodeStatus,
 } from '@tvhc/shared';
-
-/** placement create body (restream channel editor rows) */
-export interface RestreamPlacementInput {
-  instanceId: string;
-  nodeId: string;
-  /** failover order; server default = current max + 1 */
-  priority?: number;
-  enabled?: boolean;
-  /**
-   * 'hot' = always encodes; 'cold' = standby that only encodes while the
-   * failover loop has it activated (preferred placement not ready)
-   */
-  mode?: 'hot' | 'cold';
-  /** tvheadend subscription weight override; null = daemon default */
-  weight?: number | null;
-  /** manual program-number (service SID) override; null = derived */
-  programNumber?: number | null;
-  /** write even when the target node cannot serve the channel right now (pre-provisioning) */
-  force?: boolean;
-}
+import type { StagedPlacementInput } from './placementStaging.js';
 
 /** restream channel create body */
 export interface RestreamChannelInput {
@@ -79,15 +60,22 @@ export interface RestreamChannelInput {
   enabled?: boolean;
   comment?: string | null;
   playlistIds?: string[];
-  placements?: RestreamPlacementInput[];
+  /** full desired placement set, priority = array order; id absent = create */
+  placements?: StagedPlacementInput[];
   /** write even when a target node cannot serve the identity right now (pre-provisioning) */
   force?: boolean;
 }
 
-/** restream channel update / batch-edit patch (placements have their own endpoints) */
+/** restream channel update / batch-edit patch (placements travel through the apply endpoint) */
 export type RestreamChannelPatch = Partial<Omit<RestreamChannelInput, 'placements'>>;
 
-export type RestreamPlacementPatch = Partial<Omit<RestreamPlacementInput, 'instanceId' | 'nodeId'>>;
+/** POST /api/restreamer/channels/:id/apply body — the atomic channel+placements write */
+export interface ApplyRestreamChannelBody {
+  channel?: RestreamChannelPatch;
+  /** full desired placement set (same semantics as RestreamChannelInput.placements) */
+  placements?: StagedPlacementInput[];
+  force?: boolean;
+}
 
 export type RestreamChannelBatchAction =
   | 'edit'
@@ -140,6 +128,24 @@ export function unavailableDetail(err: unknown): UnavailableTarget[] | null {
   const u = (err.body as { unavailable?: unknown } | null)?.unavailable;
   if (!Array.isArray(u) || u.length === 0) return null;
   return u as UnavailableTarget[];
+}
+
+/**
+ * Classify a `switch {reset:true}` 409: 'rejected-mid-procedure' = a failover
+ * procedure is already running and reset must wait; 'requires-confirm' = the
+ * trigger condition is still failing, so a reset would immediately fail over
+ * again unless the caller retries with `force: true`. null = any other error
+ * (caller falls back to a generic error toast).
+ */
+export function classifyResetError(
+  err: unknown,
+): { kind: 'rejected-mid-procedure' | 'requires-confirm'; message: string } | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const body = err.body as { error?: string; message?: string } | null;
+  if (body?.error === 'rejected-mid-procedure' || body?.error === 'requires-confirm') {
+    return { kind: body.error, message: body.message ?? err.message };
+  }
+  return null;
 }
 
 async function http<T>(method: string, url: string, body?: unknown): Promise<T> {
@@ -257,10 +263,19 @@ export const api = {
     ),
   pushRestreamerNode: (instanceId: string, nodeId: string) =>
     http<unknown>('POST', `/api/restreamer/nodes/${instanceId}/${nodeId}/push`),
+  restreamerNodeProbes: (instanceId: string, nodeId: string) =>
+    http<NodeProbeSettings>('GET', `/api/restreamer/nodes/${instanceId}/${nodeId}/probes`),
+  updateRestreamerNodeProbes: (instanceId: string, nodeId: string, payload: NodeProbeSettings) =>
+    http<NodeProbeSettings>('PUT', `/api/restreamer/nodes/${instanceId}/${nodeId}/probes`, payload),
   restartRestreamSession: (instanceId: string, nodeId: string, name: string) =>
     http<{ ok: boolean }>(
       'POST',
       `/api/restreamer/nodes/${instanceId}/${nodeId}/sessions/${name}/restart`,
+    ),
+  resetRestreamSessionRestarts: (instanceId: string, nodeId: string, name: string) =>
+    http<{ ok: boolean }>(
+      'POST',
+      `/api/restreamer/nodes/${instanceId}/${nodeId}/sessions/${name}/restarts/reset`,
     ),
   restreamSessionLog: (instanceId: string, nodeId: string, name: string, lines?: number) =>
     http<LogLine[]>(
@@ -275,6 +290,8 @@ export const api = {
     http<RestreamProfile>('PUT', `/api/restreamer/profiles/${id}`, patch),
   deleteRestreamProfile: (id: string) =>
     http<{ ok: boolean }>('DELETE', `/api/restreamer/profiles/${id}`),
+  cloneRestreamProfile: (id: string, name: string) =>
+    http<RestreamProfile>('POST', `/api/restreamer/profiles/${id}/clone`, { name }),
 
   restreamChannels: () => http<RestreamChannelWithStatus[]>('GET', '/api/restreamer/channels'),
   createRestreamChannel: (input: RestreamChannelInput) =>
@@ -283,6 +300,9 @@ export const api = {
     http<RestreamChannelWithStatus>('GET', `/api/restreamer/channels/${id}`),
   updateRestreamChannel: (id: string, patch: RestreamChannelPatch) =>
     http<RestreamChannelWithStatus>('PUT', `/api/restreamer/channels/${id}`, patch),
+  /** atomic channel-field + full-placement-set write (RestreamChannelModal's Save) */
+  applyRestreamChannel: (id: string, body: ApplyRestreamChannelBody) =>
+    http<RestreamChannelWithStatus>('POST', `/api/restreamer/channels/${id}/apply`, body),
   deleteRestreamChannel: (id: string) =>
     http<{ ok: boolean }>('DELETE', `/api/restreamer/channels/${id}`),
   batchRestreamChannels: (
@@ -298,26 +318,17 @@ export const api = {
     }),
   setRestreamChannelPlaylists: (id: string, playlistIds: string[]) =>
     http<{ ok: boolean }>('POST', `/api/restreamer/channels/${id}/playlists`, { playlistIds }),
-  /** {placementId} = explicit switch; {reset: true} = back to the highest-priority healthy placement */
-  switchRestreamChannel: (id: string, body: { placementId: string } | { reset: true }) =>
-    http<{ ok: boolean; already?: boolean }>('POST', `/api/restreamer/channels/${id}/switch`, body),
-  /** operator escape valve: force-deactivate a channel's current cold-backup activation */
-  deactivateColdBackup: (channelId: string) =>
-    http<{ ok: boolean; existed: boolean }>(
+  /**
+   * {placementId} = explicit switch (enqueues the failover procedure);
+   * {reset: true} = back to the highest-priority healthy placement, {force:
+   * true} bypasses the "trigger still failing" 409 (see classifyResetError).
+   */
+  switchRestreamChannel: (id: string, body: { placementId: string } | { reset: true; force?: true }) =>
+    http<{ ok: boolean; queued?: boolean; already?: boolean; aborted?: boolean; cleared?: boolean }>(
       'POST',
-      `/api/restreamer/channels/${channelId}/cold/deactivate`,
+      `/api/restreamer/channels/${id}/switch`,
+      body,
     ),
-
-  addRestreamPlacement: (channelId: string, input: RestreamPlacementInput) =>
-    http<RestreamPlacement>('POST', `/api/restreamer/channels/${channelId}/placements`, input),
-  updateRestreamPlacement: (id: string, patch: RestreamPlacementPatch) =>
-    http<RestreamPlacement>('PUT', `/api/restreamer/placements/${id}`, patch),
-  deleteRestreamPlacement: (id: string) =>
-    http<{ ok: boolean }>('DELETE', `/api/restreamer/placements/${id}`),
-  reorderRestreamPlacements: (channelId: string, orderedPlacementIds: string[]) =>
-    http<{ ok: boolean }>('POST', `/api/restreamer/channels/${channelId}/placements/reorder`, {
-      orderedPlacementIds,
-    }),
 
   restreamPlaylists: () => http<RestreamPlaylist[]>('GET', '/api/restreamer/playlists'),
   createRestreamPlaylist: (input: RestreamPlaylistInput) =>

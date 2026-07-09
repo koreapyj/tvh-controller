@@ -181,6 +181,7 @@ function seedNodeStatusEntry(cache: InstanceCache, instanceId: string, nodeId: s
     apiVersionSupported: true,
     desiredRevision: null,
     pendingPush: false,
+    probes: null,
     sessions,
     sourcesHash: null,
     sources: null,
@@ -1336,9 +1337,9 @@ describe('listChannels status', () => {
   });
 });
 
-// ---------- cold backup placements ----------
+// ---------- failover state placements (cold-backup successor) ----------
 
-describe('cold backup placements', () => {
+describe('failover state placements', () => {
   async function seedColdChannel(h: Harness) {
     const p = await h.service.createProfile('p', profilePayload());
     const chan = await h.service.createChannel({
@@ -1356,24 +1357,44 @@ describe('cold backup placements', () => {
     return { chan, hot, cold };
   }
 
-  async function insertActivation(
+  async function insertFailoverRow(
     h: Harness,
-    fields: { channelId: string; placementId: string; preferredPlacementId?: string | null; reason?: string },
+    fields: {
+      channelId: string;
+      fromPlacementId: string | null;
+      toPlacementId: string;
+      phase?: string;
+      suppressFrom?: boolean;
+      triggerReason?: string;
+    },
   ): Promise<void> {
     await h.db
-      .insertInto('restream_cold_activations')
+      .insertInto('restream_failover_state')
       .values({
         channel_id: fields.channelId,
-        placement_id: fields.placementId,
-        preferred_placement_id: fields.preferredPlacementId ?? null,
-        reason: fields.reason ?? 'node-unreachable',
-        activated_at: TS,
+        from_placement_id: fields.fromPlacementId,
+        to_placement_id: fields.toPlacementId,
+        phase: fields.phase ?? 'complete',
+        trigger_reason: fields.triggerReason ?? 'manual',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: fields.suppressFrom ? 1 : 0,
+        drain_until: null,
+        started_at: TS,
+        updated_at: TS,
+      })
+      .onDuplicateKeyUpdate({
+        from_placement_id: fields.fromPlacementId,
+        to_placement_id: fields.toPlacementId,
+        phase: fields.phase ?? 'complete',
+        trigger_reason: fields.triggerReason ?? 'manual',
+        suppress_from: fields.suppressFrom ? 1 : 0,
         updated_at: TS,
       })
       .execute();
   }
 
-  it('computeNodeDoc excludes an enabled cold placement with no activation row', async () => {
+  it('computeNodeDoc excludes an enabled cold placement with no failover row', async () => {
     const h = await setup();
     const { cold } = await seedColdChannel(h);
     expect(cold.mode).toBe('cold');
@@ -1382,37 +1403,85 @@ describe('cold backup placements', () => {
     await h.destroy();
   });
 
-  it('computeNodeDoc includes it once a restream_cold_activations row exists', async () => {
+  it('computeNodeDoc includes it once a row exists with to_placement_id = that placement, in ANY phase', async () => {
     const h = await setup();
     const { chan, hot, cold } = await seedColdChannel(h);
-    await insertActivation(h, { channelId: chan.id, placementId: cold.id, preferredPlacementId: hot.id });
-    const { doc } = await h.service.computeNodeDoc('zone1', 'n2');
-    expect(doc!.sessions.map((s) => s.name)).toEqual(['at-x']);
+    for (const phase of ['bringing-up', 'awaiting-lag', 'switch-ordered', 'complete', 'draining']) {
+      await h.db.deleteFrom('restream_failover_state').execute();
+      await insertFailoverRow(h, { channelId: chan.id, fromPlacementId: hot.id, toPlacementId: cold.id, phase });
+      const { doc } = await h.service.computeNodeDoc('zone1', 'n2');
+      expect(doc!.sessions.map((s) => s.name), `phase=${phase}`).toEqual(['at-x']);
+    }
     await h.destroy();
   });
 
-  it('listChannels surfaces placement.mode, coldActive on the activated placement, and channel.coldActivation', async () => {
+  it('EXCLUDES the hot `from` placement once suppress_from=1 and phase is a suppressing one', async () => {
+    const h = await setup();
+    const { chan, hot, cold } = await seedColdChannel(h);
+    for (const phase of ['stopping-old', 'awaiting-stop-confirm', 'complete', 'draining']) {
+      await h.db.deleteFrom('restream_failover_state').execute();
+      await insertFailoverRow(h, {
+        channelId: chan.id,
+        fromPlacementId: hot.id,
+        toPlacementId: cold.id,
+        phase,
+        suppressFrom: true,
+      });
+      const { doc: hotDoc } = await h.service.computeNodeDoc('zone1', 'n1');
+      expect(hotDoc!.sessions, `phase=${phase}`).toHaveLength(0);
+      const { doc: coldDoc } = await h.service.computeNodeDoc('zone1', 'n2');
+      expect(coldDoc!.sessions.map((s) => s.name), `phase=${phase}`).toEqual(['at-x']);
+    }
+    await h.destroy();
+  });
+
+  it('still includes the hot `from` placement while phase=awaiting-lag, even with suppress_from=1', async () => {
+    const h = await setup();
+    const { chan, hot, cold } = await seedColdChannel(h);
+    await insertFailoverRow(h, {
+      channelId: chan.id,
+      fromPlacementId: hot.id,
+      toPlacementId: cold.id,
+      phase: 'awaiting-lag',
+      suppressFrom: true,
+    });
+    const { doc: hotDoc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(hotDoc!.sessions.map((s) => s.name)).toEqual(['at-x']);
+    await h.destroy();
+  });
+
+  it('listChannels surfaces placement.indicator/lagProbe/underrunProbe and channel.failover shape', async () => {
     const h = await setup();
     const { chan, hot, cold } = await seedColdChannel(h);
     let [listed] = await h.service.listChannels();
+    expect(listed!.failover).toBeNull();
+    expect(listed!.failoverBlocked).toBeNull();
     const hotBefore = listed!.placements.find((x) => x.id === hot.id)!;
-    const coldBefore = listed!.placements.find((x) => x.id === cold.id)!;
     expect(hotBefore.mode).toBe('hot');
+    expect(hotBefore.indicator).toBe('idle');
+    expect(hotBefore.lagProbe).toBeNull();
+    expect(hotBefore.underrunProbe).toBeNull();
+    const coldBefore = listed!.placements.find((x) => x.id === cold.id)!;
     expect(coldBefore.mode).toBe('cold');
-    expect(coldBefore.coldActive).toBe(false);
-    expect(listed!.coldActivation).toBeNull();
+    expect(coldBefore.indicator).toBe('idle');
 
-    await insertActivation(h, {
+    await insertFailoverRow(h, {
       channelId: chan.id,
-      placementId: cold.id,
-      preferredPlacementId: hot.id,
-      reason: 'session-unhealthy',
+      fromPlacementId: hot.id,
+      toPlacementId: cold.id,
+      phase: 'stopping-old',
+      suppressFrom: true,
+      triggerReason: 'lag',
     });
     [listed] = await h.service.listChannels();
-    expect(listed!.placements.find((x) => x.id === cold.id)!.coldActive).toBe(true);
-    expect(listed!.placements.find((x) => x.id === hot.id)!.coldActive).toBe(false);
-    expect(listed!.coldActivation).toMatchObject({ placementId: cold.id, reason: 'session-unhealthy' });
-    expect(listed!.coldActivation!.activatedAt).toBe('2026-01-01T00:00:00.000Z');
+    expect(listed!.failover).toMatchObject({
+      fromPlacementId: hot.id,
+      toPlacementId: cold.id,
+      phase: 'stopping-old',
+      triggerReason: 'lag',
+    });
+    expect(listed!.placements.find((x) => x.id === cold.id)!.indicator).toBe('active');
+    expect(listed!.placements.find((x) => x.id === hot.id)!.indicator).toBe('stopping');
     await h.destroy();
   });
 

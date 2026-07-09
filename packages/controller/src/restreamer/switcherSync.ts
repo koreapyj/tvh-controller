@@ -112,11 +112,20 @@ export class SwitcherSync {
    * node.
    */
   private async channelGroups(): Promise<ChannelGroup[]> {
+    // NOTE the deliberate divergence from computeNodeDoc: a suppressed
+    // outgoing placement (failover from_placement) leaves its NODE doc (the
+    // encode stops) but stays a switcher upstream for the failover row's
+    // whole lifetime — the switcher 404s segments of upstreams absent from
+    // its doc while viewers' playlists still hold retained seg/<old-id>/ URIs
+    // (the drain horizon is ~segmentSeconds × listSize). An extra unhealthy
+    // upstream costs one probe fetch and is never self-selected (the switcher
+    // has no autonomous failover).
     const rows = await this.db
       .selectFrom('restream_placements as p')
       .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
       .innerJoin('restream_profiles as pr', 'pr.id', 'c.profile_id')
-      .leftJoin('restream_cold_activations as rca', 'rca.placement_id', 'p.id')
+      .leftJoin('restream_failover_state as fs', 'fs.to_placement_id', 'p.id')
+      .leftJoin('restream_failover_state as fsFrom', 'fsFrom.from_placement_id', 'p.id')
       .select([
         'p.id as placement_id',
         'p.instance_id',
@@ -128,8 +137,14 @@ export class SwitcherSync {
       ])
       .where('p.enabled', '=', 1)
       .where('c.enabled', '=', 1)
-      // a cold placement becomes a switcher upstream only while activated
-      .where((eb) => eb.or([eb('p.mode', '=', 'hot'), eb('rca.placement_id', 'is not', null)]))
+      // hot, or a failover target (cold activation), or a retained outgoing
+      .where((eb) =>
+        eb.or([
+          eb('p.mode', '=', 'hot'),
+          eb('fs.to_placement_id', 'is not', null),
+          eb('fsFrom.from_placement_id', 'is not', null),
+        ]),
+      )
       .orderBy('c.slug')
       .orderBy('p.priority')
       .orderBy('p.id')
@@ -344,13 +359,18 @@ export class SwitcherSync {
    * One rebalance evaluation: build the pure-policy input from the DB
    * (switcher-fronted channels + profile bitrates), the switchers' polled
    * status (active upstream, per-upstream health, last switch) and the config
-   * egress budgets, then execute the proposed move (at most one per pass) via
-   * the switcher's switch endpoint. Channels the switcher does not report yet
-   * are never rebalanced; single-upstream channels contribute load to their
-   * node's utilization but have no alternative targets, so planRebalance
-   * never proposes a move for them. Failures are logged, never thrown.
+   * egress budgets, then hand the proposed move (at most one per pass) to
+   * `requestMove` — RestreamerService routes it through the serialized
+   * failover procedure (reason 'rebalance'), never at the switcher directly,
+   * so rebalance moves obey the same one-at-a-time ordering as failovers.
+   * Channels the switcher does not report yet are never rebalanced;
+   * single-upstream channels contribute load but have no alternative targets.
+   * Failures are logged, never thrown.
    */
-  async rebalanceTickInner(nowDate = new Date()): Promise<void> {
+  async rebalanceTickInner(
+    nowDate: Date,
+    requestMove: (channelId: string, toPlacementId: string, slug: string) => Promise<void>,
+  ): Promise<void> {
     const switchers = this.config.restreamer?.switchers ?? [];
     if (!switchers.length) return;
 
@@ -388,20 +408,17 @@ export class SwitcherSync {
     }
 
     const moves = planRebalance({ channels, nodes, now: nowDate });
+    const channelIdBySlug = new Map(channels.map((c) => [c.slug, c.channelId]));
     for (const move of moves) {
-      const switcherId = switcherBySlug.get(move.slug)!;
-      const client = this.clients.get(switcherId);
-      if (!client) {
-        console.error(`restreamer: rebalance: no client for switcher ${switcherId}`);
-        continue;
-      }
+      const channelId = channelIdBySlug.get(move.slug);
+      if (!channelId) continue;
       try {
-        await client.switchChannel(move.slug, move.toPlacementId);
+        await requestMove(channelId, move.toPlacementId, move.slug);
         console.log(
-          `restreamer: rebalance switched "${move.slug}" to placement ${move.toPlacementId} via switcher ${switcherId}`,
+          `restreamer: rebalance queued "${move.slug}" → placement ${move.toPlacementId} (via failover procedure)`,
         );
       } catch (err) {
-        console.error(`restreamer: rebalance switch of "${move.slug}" failed:`, err);
+        console.error(`restreamer: rebalance move of "${move.slug}" failed:`, err);
       }
     }
   }

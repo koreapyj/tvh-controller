@@ -314,10 +314,38 @@ describe('computeSwitcherDoc', () => {
   });
 });
 
-// ---------- cold-backup placements ----------
+// ---------- failover state placements (cold-backup successor) ----------
 
-describe('computeSwitcherDoc: cold-backup placements', () => {
-  it('excludes an enabled cold placement without an activation row; includes it at its priority once activated', async () => {
+describe('computeSwitcherDoc: failover state placements', () => {
+  async function insertFailoverRow(
+    h: Harness,
+    fields: {
+      channelId: string;
+      fromPlacementId: string | null;
+      toPlacementId: string;
+      phase?: string;
+      suppressFrom?: boolean;
+    },
+  ): Promise<void> {
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: fields.channelId,
+        from_placement_id: fields.fromPlacementId,
+        to_placement_id: fields.toPlacementId,
+        phase: fields.phase ?? 'complete',
+        trigger_reason: 'manual',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: fields.suppressFrom ? 1 : 0,
+        drain_until: null,
+        started_at: '2026-01-01 00:00:00',
+        updated_at: '2026-01-01 00:00:00',
+      })
+      .execute();
+  }
+
+  it('excludes an enabled cold placement without a failover row; includes it at its priority once it is a to_placement', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     const chan = await h.service.createChannel({
@@ -338,22 +366,44 @@ describe('computeSwitcherDoc: cold-backup placements', () => {
     const chBefore = before.doc.channels.find((c) => c.slug === 'bbb')!;
     expect(chBefore.upstreams.map((u) => u.id)).toEqual([hotId]);
 
-    await h.db
-      .insertInto('restream_cold_activations')
-      .values({
-        channel_id: chan.id,
-        placement_id: cold.id,
-        preferred_placement_id: hotId,
-        reason: 'node-unreachable',
-        activated_at: '2026-01-01 00:00:00',
-        updated_at: '2026-01-01 00:00:00',
-      })
-      .execute();
+    await insertFailoverRow(h, { channelId: chan.id, fromPlacementId: hotId, toPlacementId: cold.id });
 
     const after = await h.service.computeSwitcherDoc();
     const chAfter = after.doc.channels.find((c) => c.slug === 'bbb')!;
-    // priority order: the hot placement (priority 1) first, the now-activated cold one (priority 2) second
+    // priority order: the hot placement (priority 1) first, the now-targeted cold one (priority 2) second
     expect(chAfter.upstreams.map((u) => u.id)).toEqual([hotId, cold.id]);
+    await h.destroy();
+  });
+
+  it('a suppressed from_placement STAYS in the switcher doc for the whole row lifetime (deliberate divergence from node docs)', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'BBB',
+      channelNumber: '10',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' }, // hot, priority 1 (the eventual "from")
+        { instanceId: 'zone2', nodeId: 'n1' }, // hot, priority 2 (the eventual "to")
+      ],
+    });
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    const fromId = placements[0]!.id;
+    const toId = placements[1]!.id;
+
+    await insertFailoverRow(h, {
+      channelId: chan.id,
+      fromPlacementId: fromId,
+      toPlacementId: toId,
+      phase: 'complete',
+      suppressFrom: true,
+    });
+
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    // node doc for `from`'s node would exclude it (suppress_from + complete); the
+    // switcher doc keeps BOTH upstreams so retained seg/<from>/ URIs stay resolvable
+    expect(ch.upstreams.map((u) => u.id).sort()).toEqual([fromId, toId].sort());
     await h.destroy();
   });
 });
@@ -531,8 +581,38 @@ describe('rebalanceTick', () => {
     };
   }
 
-  it('issues the planned switch through the switcher client', async () => {
+  /**
+   * A move now enters the SAME serialized failover procedure as every other
+   * trigger (reason 'rebalance') instead of calling switchChannel directly —
+   * rebalanceTick() only enqueues; failoverTick() (or the 3s timer) actually
+   * begins the procedure. Admission needs each candidate node's cached status
+   * to be reachable.
+   */
+  function seedNodeReachable(h: Harness, instanceId: string, nodeId: string): void {
+    h.cache.get(instanceId).restreamers.push({
+      instanceId,
+      nodeId,
+      url: `http://${instanceId}-${nodeId}`,
+      serveUrl: null,
+      reachable: true,
+      error: null,
+      lastPollAt: null,
+      version: '1.0.0',
+      uptimeSec: 1,
+      apiVersionSupported: true,
+      desiredRevision: null,
+      pendingPush: false,
+      probes: null,
+      sessions: [],
+      sourcesHash: null,
+      sources: null,
+    });
+  }
+
+  it('routes the planned move through the failover procedure: a row appears only after failoverTick, never a direct switch', async () => {
     const h = await setup();
+    seedNodeReachable(h, 'zone1', 'n1');
+    seedNodeReachable(h, 'zone2', 'n1');
     // two redundant channels, both ACTIVE on zone1/n1 → clear imbalance
     const a = await seedRedundant(h, 'BBB', '10');
     const b = await seedRedundant(h, 'BBB', '10'); // slug uniquified to bbb-2
@@ -543,15 +623,26 @@ describe('rebalanceTick', () => {
     ]);
 
     await h.service.rebalanceTick(new Date());
-    expect(h.switcher.switches()).toHaveLength(1);
-    const sw = h.switcher.switches()[0]!;
-    expect(sw.slug).toBe('bbb'); // deterministic: lower slug first
-    expect(sw.upstreamId).toBe(a.placements[1]!.id); // the zone2 upstream
+    // enqueued only — no row yet, and definitely no direct switch
+    expect(h.switcher.switches()).toHaveLength(0);
+    expect(await h.db.selectFrom('restream_failover_state').selectAll().execute()).toHaveLength(0);
+
+    await h.service.failoverTick();
+    expect(h.switcher.switches()).toHaveLength(0); // still no direct switch — the procedure owns it
+    const rows = await h.db.selectFrom('restream_failover_state').selectAll().execute();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      channel_id: a.channel.id, // deterministic: lower slug first
+      trigger_reason: 'rebalance',
+      to_placement_id: a.placements[1]!.id, // the zone2 upstream
+    });
     await h.destroy();
   });
 
   it('honors the sticky window: a recently switched channel is passed over', async () => {
     const h = await setup();
+    seedNodeReachable(h, 'zone1', 'n1');
+    seedNodeReachable(h, 'zone2', 'n1');
     const a = await seedRedundant(h, 'BBB', '10');
     const b = await seedRedundant(h, 'BBB', '10');
     const now = new Date();
@@ -564,16 +655,21 @@ describe('rebalanceTick', () => {
     ]);
 
     await h.service.rebalanceTick(now);
-    expect(h.switcher.switches()).toHaveLength(1);
-    expect(h.switcher.switches()[0]).toMatchObject({
-      slug: 'bbb-2',
-      upstreamId: b.placements[1]!.id,
+    await h.service.failoverTick();
+    const rows = await h.db.selectFrom('restream_failover_state').selectAll().execute();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      channel_id: b.channel.id,
+      trigger_reason: 'rebalance',
+      to_placement_id: b.placements[1]!.id,
     });
     await h.destroy();
   });
 
-  it('never rebalances channels the switcher does not report yet', async () => {
+  it('never rebalances channels the switcher does not report yet — no row, no switch', async () => {
     const h = await setup();
+    seedNodeReachable(h, 'zone1', 'n1');
+    seedNodeReachable(h, 'zone2', 'n1');
     const a = await seedRedundant(h, 'BBB', '10');
     await seedRedundant(h, 'BBB', '10'); // bbb-2: NOT in the switcher status
     seedSwitcherStatus(h.cache, 'sw1', [
@@ -583,20 +679,9 @@ describe('rebalanceTick', () => {
     ]);
 
     await h.service.rebalanceTick(new Date());
+    await h.service.failoverTick();
     expect(h.switcher.switches()).toHaveLength(0);
-    await h.destroy();
-  });
-
-  it('tolerates a failing switch command', async () => {
-    const h = await setup();
-    const a = await seedRedundant(h, 'BBB', '10');
-    const b = await seedRedundant(h, 'BBB', '10');
-    seedSwitcherStatus(h.cache, 'sw1', [
-      switcherChannel('bbb', a.placements[0]!.id, a.placements.map((p) => p.id), null),
-      switcherChannel('bbb-2', b.placements[0]!.id, b.placements.map((p) => p.id), null),
-    ]);
-    h.switcher.failNextSwitch();
-    await expect(h.service.rebalanceTick(new Date())).resolves.toBeUndefined();
+    expect(await h.db.selectFrom('restream_failover_state').selectAll().execute()).toHaveLength(0);
     await h.destroy();
   });
 });

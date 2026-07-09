@@ -147,6 +147,40 @@ describe('formatFieldValue', () => {
   });
 });
 
+describe('multiselect (CSV convention, exactly like weekdays but string[])', () => {
+  const multiSpec: FieldSpec = {
+    key: 'playlistIds',
+    label: 'Playlists',
+    type: 'multiselect',
+    strOptions: [
+      { value: 'p1', label: 'Playlist 1' },
+      { value: 'p2', label: 'Playlist 2' },
+    ],
+  };
+
+  it('parseFieldValue splits on comma, trims, and drops blanks', () => {
+    expect(parseFieldValue(multiSpec, 'p1,p2')).toEqual({ ok: true, value: ['p1', 'p2'] });
+    expect(parseFieldValue(multiSpec, ' p1 , , p2 ')).toEqual({ ok: true, value: ['p1', 'p2'] });
+    expect(parseFieldValue(multiSpec, '')).toEqual({ ok: true, value: [] });
+  });
+
+  it('formatFieldValue joins an array back with commas', () => {
+    expect(formatFieldValue(multiSpec, ['p1', 'p2'])).toBe('p1,p2');
+    expect(formatFieldValue(multiSpec, [])).toBe('');
+    expect(formatFieldValue(multiSpec, null)).toBe('');
+    expect(formatFieldValue(multiSpec, undefined)).toBe('');
+  });
+
+  it('round-trips', () => {
+    for (const value of [['p1'], ['p1', 'p2'], []]) {
+      expect(parseFieldValue(multiSpec, formatFieldValue(multiSpec, value))).toEqual({
+        ok: true,
+        value,
+      });
+    }
+  });
+});
+
 describe('RULE_PAYLOAD_DEFAULTS', () => {
   it('matches the TypeBox schema defaults for every field', () => {
     expect(Object.keys(RULE_PAYLOAD_DEFAULTS).sort()).toEqual(
