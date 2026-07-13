@@ -42,6 +42,7 @@ import {
 } from '@tvhc/shared';
 import type { AppConfig, RestreamerNodeConfig } from '../config.js';
 import type { Db } from '../db/db.js';
+import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { InstancePoller } from '../tvh/poller.js';
@@ -383,6 +384,14 @@ export class RestreamerService {
   private failoverTimer: NodeJS.Timeout | null = null;
   /** dedup keys for `restreamer-channel` SSE publishes, by channel id */
   private readonly lastChannelPublishKey = new Map<string, string>();
+  /**
+   * Site #7 (node push failed/healed) transition state, keyed by nodeKey().
+   * NOT read from cache.restreamers[].error — the RestreamerPoller overwrites
+   * that field every tick with its own reachability error, independent of
+   * push outcomes, so reading it here would spam or suppress the transition
+   * log depending on unrelated poll timing.
+   */
+  private readonly pushProblems = new Map<string, string | null>();
   /** brief cache for the per-node probe settings map (probe base tick is 5s) */
   private probeSettingsCache: { at: number; map: Map<string, NodeProbeSettings> } | null = null;
   /** a switch was just ordered — main.ts wires this to SwitcherPoller.pollOnce */
@@ -398,14 +407,18 @@ export class RestreamerService {
     private readonly clients: Map<string, RestreamerNodeClient>,
     /** keyed by switcherId; empty = no switchers configured */
     private readonly switcherClients: Map<string, SwitcherNodeClient> = new Map(),
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {
-    this.switcherSync = new SwitcherSync(db, cache, bus, config, switcherClients);
+    this.switcherSync = new SwitcherSync(db, cache, bus, config, switcherClients, events);
     this.probeEngine = new ProbeEngine(
       () => this.probeTargets(),
       () => this.allProbeSettings(),
       (channelId) => {
         void this.publishChannelStatus(channelId).catch(() => {});
       },
+      undefined,
+      undefined,
+      events,
     );
     this.failoverSync = new FailoverSync(
       db,
@@ -422,6 +435,8 @@ export class RestreamerService {
         },
         onSwitchIssued: () => this.onSwitchIssued?.(),
       },
+      undefined,
+      events,
     );
   }
 
@@ -2014,6 +2029,11 @@ export class RestreamerService {
     force = false,
   ): Promise<NodePushResult> {
     const base = { instanceId, nodeId };
+    // site #7: node push failed/healed — read the dedicated pushProblems
+    // entry BEFORE this attempt overwrites it, so the outcome can be logged
+    // as a transition (never on every 60s sweep retry of a still-down node)
+    const key = nodeKey(instanceId, nodeId);
+    const prevError = this.pushProblems.get(key) ?? null;
     try {
       const computed = await this.computeNodeDoc(instanceId, nodeId);
       if (computed.deferred || !computed.doc) {
@@ -2044,6 +2064,11 @@ export class RestreamerService {
       }
       const client = this.clients.get(nodeKey(instanceId, nodeId));
       if (!client) {
+        // treated the same as a thrown push error (site #7) — updateNodeStatus
+        // here (previously skipped) keeps the cached status consistent
+        this.updateNodeStatus(instanceId, nodeId, { pendingPush: true, error: 'no client configured for node' });
+        this.pushProblems.set(key, 'no client configured for node');
+        this.logPushTransition(instanceId, nodeId, prevError, 'no client configured for node');
         return { ...base, action: 'error', detail: 'no client configured for node', blocked: computed.blocked };
       }
       await client.putDesired(doc);
@@ -2061,14 +2086,39 @@ export class RestreamerService {
       this.updateNodeStatus(instanceId, nodeId, {
         pendingPush: false,
         desiredRevision: doc.revision,
+        error: null,
       });
+      this.pushProblems.set(key, null);
+      this.logPushTransition(instanceId, nodeId, prevError, null);
       return { ...base, action: 'pushed', blocked: computed.blocked };
     } catch (err) {
       // failed push: the stored hash stays, the node stays pending — the 60s
       // sweep (or the poller's revision-mismatch trigger) heals it later
       const detail = err instanceof Error ? err.message : String(err);
       this.updateNodeStatus(instanceId, nodeId, { pendingPush: true, error: detail });
+      this.pushProblems.set(key, detail);
+      this.logPushTransition(instanceId, nodeId, prevError, detail);
       return { ...base, action: 'error', detail, blocked: [] };
+    }
+  }
+
+  /**
+   * Site #7 (node push failed/healed): logs only on the null<->non-null
+   * transition of the push outcome — a still-failing node re-attempted by the
+   * 60s sweep must not spam a new warning every cycle.
+   */
+  private logPushTransition(
+    instanceId: string,
+    nodeId: string,
+    prevError: string | null,
+    newError: string | null,
+  ): void {
+    if ((prevError === null) === (newError === null)) return;
+    const source = `node.${instanceId}.${nodeId}`;
+    if (newError !== null) {
+      this.events.log({ type: 'warning', service: 'restreamer', source, message: `push to ${source} failed: ${newError}` });
+    } else {
+      this.events.log({ type: 'normal', service: 'restreamer', source, message: `push to ${source} recovered` });
     }
   }
 

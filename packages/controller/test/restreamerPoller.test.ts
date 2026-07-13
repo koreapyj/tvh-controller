@@ -51,6 +51,13 @@ function catalog(hash: string, entries: SourcesResponse['entries'] = []): Source
   return { apiVersion: 1, catalogHash: hash, updatedAt: '2026-07-06T00:00:00Z', entries };
 }
 
+interface LoggedEvent {
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
+}
+
 function setup(hooks = {}) {
   const cache = new InstanceCache();
   cache.init('i1', 'Instance 1', 'http://tvh1');
@@ -59,8 +66,11 @@ function setup(hooks = {}) {
   bus.subscribe((e) => events.push(e));
   const status = vi.fn<() => Promise<StatusResponse>>();
   const sources = vi.fn<() => Promise<SourcesResponse>>();
-  const poller = new RestreamerPoller('i1', NODE, { status, sources }, cache, bus, 15_000, hooks);
-  return { cache, bus, events, status, sources, poller };
+  const logs: LoggedEvent[] = [];
+  const poller = new RestreamerPoller('i1', NODE, { status, sources }, cache, bus, 15_000, hooks, {
+    log: (e) => logs.push(e),
+  });
+  return { cache, bus, events, status, sources, poller, logs };
 }
 
 afterEach(() => {
@@ -494,6 +504,120 @@ describe('RestreamerPoller', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(status).toHaveBeenCalledTimes(2);
   });
+
+  describe('event-log emission: node up/down (site #6)', () => {
+    it('logs nothing on the very first poll (no prior state), then a normal/warning on each transition only', async () => {
+      const { logs, status, poller } = setup();
+      status.mockRejectedValue(new Error('down'));
+      await poller.pollOnce(); // first-ever entry — nothing to transition from
+      expect(logs).toHaveLength(0);
+
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce(); // false -> true
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'node.i1.n1' });
+      expect(logs[0]!.message).toContain('node.i1.n1');
+
+      await poller.pollOnce(); // still reachable — no repeat
+      expect(logs).toHaveLength(1);
+
+      status.mockRejectedValue(new Error('ECONNRESET'));
+      await poller.pollOnce(); // true -> false
+      expect(logs).toHaveLength(2);
+      expect(logs[1]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'node.i1.n1' });
+      expect(logs[1]!.message).toContain('ECONNRESET');
+    });
+
+    it('a pre-seeded placeholder entry (lastPollAt: null, as main.ts seeds before any poller runs) does not log "came online" on the first real poll', async () => {
+      const { cache, logs, status, poller } = setup();
+      // mimic main.ts: a reachable:false placeholder exists in the cache
+      // BEFORE this poller's first tick — a naive idx !== -1 check would read
+      // its reachable:false as a real prior observation
+      cache.get('i1').restreamers = [
+        {
+          instanceId: 'i1',
+          nodeId: 'n1',
+          url: NODE.url,
+          serveUrl: NODE.serveUrl,
+          reachable: false,
+          error: null,
+          lastPollAt: null,
+          version: null,
+          uptimeSec: null,
+          apiVersionSupported: true,
+          desiredRevision: null,
+          pendingPush: false,
+          probes: null,
+          sessions: [],
+          sourcesHash: null,
+          sources: null,
+        },
+      ];
+
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce(); // first REAL poll — must not log despite the placeholder's reachable:false
+      expect(logs).toHaveLength(0);
+
+      status.mockRejectedValue(new Error('ECONNRESET'));
+      await poller.pollOnce(); // first genuine transition: true -> false
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'node.i1.n1' });
+
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce(); // false -> true
+      expect(logs).toHaveLength(2);
+      expect(logs[1]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'node.i1.n1' });
+    });
+  });
+
+  describe('event-log emission: ffmpeg session restarts (site #8)', () => {
+    function sess(name: string, over: Partial<SessionStatus> = {}): SessionStatus {
+      return { name, state: 'running', enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0, ...over };
+    }
+
+    it('warns only on an increase, never on the first-poll baseline or a repeat of the same count', async () => {
+      const { logs, status, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sessions: [sess('at-x', { restarts: 2 })] }));
+      await poller.pollOnce(); // baseline — pre-existing restarts=2 must not log
+      expect(logs).toHaveLength(0);
+
+      status.mockResolvedValue(nodeStatus({ sessions: [sess('at-x', { restarts: 2 })] }));
+      await poller.pollOnce(); // unchanged
+      expect(logs).toHaveLength(0);
+
+      status.mockResolvedValue(
+        nodeStatus({
+          sessions: [sess('at-x', { restarts: 3, lastExit: { code: 1, signal: null, at: '2026-01-01T00:00:00Z', class: 'crash' } })],
+        }),
+      );
+      await poller.pollOnce(); // restarts increased
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'node.i1.n1' });
+      expect(logs[0]!.message).toContain('at-x');
+      expect(logs[0]!.message).toContain('restarts=3');
+      expect(logs[0]!.message).toContain('crash');
+    });
+
+    it('a session that disappears and reappears at a lower count is rebaselined without logging a spurious event', async () => {
+      const { logs, status, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ sessions: [sess('at-x', { restarts: 5 })] }));
+      await poller.pollOnce(); // baseline
+      expect(logs).toHaveLength(0);
+
+      status.mockResolvedValue(nodeStatus({ sessions: [] })); // session gone (e.g. placement removed)
+      await poller.pollOnce();
+      expect(logs).toHaveLength(0);
+
+      status.mockResolvedValue(nodeStatus({ sessions: [sess('at-x', { restarts: 0 })] })); // reappears fresh
+      await poller.pollOnce();
+      expect(logs).toHaveLength(0); // 0 < the old count, but it's a fresh session, not a restart
+
+      status.mockResolvedValue(nodeStatus({ sessions: [sess('at-x', { restarts: 1 })] }));
+      await poller.pollOnce(); // now a genuine increase from the rebaselined count
+      expect(logs).toHaveLength(1);
+      expect(logs[0]!.message).toContain('restarts=1');
+    });
+  });
 });
 
 describe('SwitcherPoller', () => {
@@ -503,8 +627,11 @@ describe('SwitcherPoller', () => {
     const events: SseEvent[] = [];
     bus.subscribe((e) => events.push(e));
     const status = vi.fn<() => Promise<SwitcherStatus>>();
-    const poller = new SwitcherPoller(SWITCHER, { status }, cache, bus, 15_000, hooks);
-    return { cache, events, status, poller };
+    const logs: LoggedEvent[] = [];
+    const poller = new SwitcherPoller(SWITCHER, { status }, cache, bus, 15_000, hooks, {
+      log: (e) => logs.push(e),
+    });
+    return { cache, events, status, poller, logs };
   }
 
   it('successful tick stores the status in cache.switchers and publishes once', async () => {
@@ -578,5 +705,28 @@ describe('SwitcherPoller', () => {
     poller.stop();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(status).toHaveBeenCalledTimes(1);
+  });
+
+  describe('event-log emission: switcher up/down (site #6)', () => {
+    it('logs nothing on the first poll, then a normal/warning only on transitions', async () => {
+      const { logs, status, poller } = setupSwitcher();
+      status.mockRejectedValue(new Error('down'));
+      await poller.pollOnce(); // first-ever entry
+      expect(logs).toHaveLength(0);
+
+      status.mockResolvedValue(switcherStatus());
+      await poller.pollOnce(); // false -> true
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'switcher.sw1' });
+
+      await poller.pollOnce(); // unchanged
+      expect(logs).toHaveLength(1);
+
+      status.mockRejectedValue(new Error('gone'));
+      await poller.pollOnce(); // true -> false
+      expect(logs).toHaveLength(2);
+      expect(logs[1]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'switcher.sw1' });
+      expect(logs[1]!.message).toContain('gone');
+    });
   });
 });

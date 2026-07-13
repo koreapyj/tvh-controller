@@ -120,12 +120,20 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     overlapThreshold: 0.7,
     autoUpload: { enabled: false, graceSeconds: 120 },
     restreamer: { switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'https://tv.example' }] },
+    eventLogRetentionDays: 30,
     ...overrides,
   };
 }
 
 function profilePayload(video: Record<string, unknown> = { mode: 'ivtc' }): unknown {
   return { template: 'arib-hls', templateVersion: 1, video, audio: [{}] };
+}
+
+interface LoggedEvent {
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
 }
 
 interface Harness {
@@ -137,6 +145,7 @@ interface Harness {
   nodes: Map<string, FakeRestreamerNode>;
   pollers: Map<string, InstancePoller>;
   config: AppConfig;
+  logs: LoggedEvent[];
 }
 
 async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness> {
@@ -159,8 +168,11 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
       clients.set(nodeKey(inst.id, n.id), fake);
     }
   }
-  const service = new RestreamerService(db, cache, pollers, bus, config, clients);
-  return { db, destroy, cache, events, service, nodes, pollers, config };
+  const logs: LoggedEvent[] = [];
+  const service = new RestreamerService(db, cache, pollers, bus, config, clients, new Map(), {
+    log: (e) => logs.push(e),
+  });
+  return { db, destroy, cache, events, service, nodes, pollers, config, logs };
 }
 
 function sessionStatus(name: string): SessionStatus {
@@ -2193,5 +2205,69 @@ describe('tvh-less instance (url: null)', () => {
     expect(result.action).toBe('pushed');
     expect(fake.desired!.sessions[0]!.source).toEqual({ url: 'http://cam.example/1.m3u8' });
     await destroy();
+  });
+});
+
+// ---------- event-log emission: node push failed/healed (site #7) ----------
+
+describe('RestreamerService: node push failed/healed event-log emission (site #7)', () => {
+  it('logs a warning on the first push failure, nothing on a repeated failure, and a normal once it recovers', async () => {
+    const h = await setup();
+    // this harness's config carries a switcher ('sw1') with no client wired up
+    // (site #11 territory) — filter this test's assertions down to node.zone1.n1
+    // logs so the two sites' coverage stay independent
+    const nodeLogs = () => h.logs.filter((l) => l.source === 'node.zone1.n1');
+    // updateNodeStatus() (and therefore the cached-error read the site #7
+    // transition guard relies on) is a no-op until the node has a cached
+    // status entry — normally seeded by main.ts before any poller runs
+    seedNodeStatusEntry(h.cache, 'zone1', 'n1');
+
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    // the createChannel push above succeeded — no failure yet, no log
+    expect(nodeLogs()).toHaveLength(0);
+
+    const node = h.nodes.get('zone1/n1')!;
+    node.failNextPut(new Error('putDesired: connection refused'));
+    const failed = await h.service.pushNode('zone1', 'n1', true);
+    expect(failed.action).toBe('error');
+    expect(nodeLogs()).toHaveLength(1);
+    expect(nodeLogs()[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'node.zone1.n1' });
+    expect(nodeLogs()[0]!.message).toContain('connection refused');
+
+    // the 60s sweep (pushAll) hitting the SAME still-down node must not spam
+    node.unreachable = true;
+    const stillFailing = await h.service.pushNode('zone1', 'n1', true);
+    expect(stillFailing.action).toBe('error');
+    expect(nodeLogs()).toHaveLength(1);
+
+    // the exact spam bug being fixed: the RestreamerPoller runs concurrently
+    // and overwrites cache.restreamers[].error every tick with its OWN
+    // reachability result, independent of push outcomes — simulate it
+    // resetting the cached error back to null while the push is still broken
+    h.cache.get('zone1').restreamers = h.cache.get('zone1').restreamers.map((r) =>
+      r.nodeId === 'n1' ? { ...r, error: null } : r,
+    );
+    node.unreachable = true;
+    const stillFailingAfterPollerReset = await h.service.pushNode('zone1', 'n1', true);
+    expect(stillFailingAfterPollerReset.action).toBe('error');
+    // must NOT re-log: the transition guard reads the dedicated pushProblems
+    // map, not the poller-owned cache field the code above just reset
+    expect(nodeLogs()).toHaveLength(1);
+
+    node.unreachable = false;
+    const healed = await h.service.pushNode('zone1', 'n1', true);
+    expect(healed.action).toBe('pushed');
+    expect(nodeLogs()).toHaveLength(2);
+    expect(nodeLogs()[1]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'node.zone1.n1' });
+    // the successful push also clears the stale error on the cached status
+    expect(h.cache.get('zone1').restreamers.find((r) => r.nodeId === 'n1')!.error).toBeNull();
+
+    await h.destroy();
   });
 });

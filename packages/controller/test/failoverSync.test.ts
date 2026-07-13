@@ -66,6 +66,7 @@ function makeConfig(): AppConfig {
     overlapThreshold: 0.7,
     autoUpload: { enabled: false, graceSeconds: 120 },
     restreamer: { switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'https://tv.example' }] },
+    eventLogRetentionDays: 30,
   };
 }
 
@@ -325,6 +326,13 @@ function failoverRow(db: Kysely<Database>, channelId: string) {
 
 // ---------- harness ----------
 
+interface LoggedEvent {
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
+}
+
 interface Harness {
   db: Kysely<Database>;
   destroy: () => Promise<void>;
@@ -340,6 +348,7 @@ interface Harness {
   onSwitchIssued: ReturnType<typeof vi.fn>;
   advanceNow: (ms: number) => void;
   nowMs: () => number;
+  logs: LoggedEvent[];
 }
 
 async function setup(): Promise<Harness> {
@@ -362,6 +371,7 @@ async function setup(): Promise<Harness> {
   const pushSwitchers = vi.fn(async () => {});
   const publishChannel = vi.fn((_channelId: string) => {});
   const onSwitchIssued = vi.fn(() => {});
+  const logs: LoggedEvent[] = [];
 
   let ms = Date.parse('2026-06-01T00:00:00.000Z');
   const sync = new FailoverSync(
@@ -373,6 +383,7 @@ async function setup(): Promise<Harness> {
     async () => settingsMap,
     { pushNodes, pushSwitchers, publishChannel, onSwitchIssued },
     () => new Date(ms),
+    { log: (e) => logs.push(e) },
   );
 
   return {
@@ -392,6 +403,7 @@ async function setup(): Promise<Harness> {
       ms += delta;
     },
     nowMs: () => ms,
+    logs,
   };
 }
 
@@ -887,5 +899,104 @@ describe('FailoverSync: rowHygiene (draining expiry)', () => {
 
     await h.sync.tick();
     expect(await failoverRow(h.db, chanId)).toBeDefined();
+  });
+});
+
+// ---------- 8. event-log emission (site #4) ----------
+
+describe('FailoverSync: event-log emission (site #4)', () => {
+  it('warns on an automatic BEGIN and logs a normal on complete', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    h.snapshot.lag.set(aId, lagFail(40));
+
+    await h.sync.tick(); // BEGIN
+    expect(h.logs).toHaveLength(1);
+    expect(h.logs[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'controller' });
+    expect(h.logs[0]!.message).toMatch(/BEGIN/);
+    expect(h.logs[0]!.message).toContain('chan1');
+
+    h.snapshot.lag.set(bId, lagOk(5));
+    await h.sync.tick(); // -> awaiting-switch-confirm
+    h.cache.switchers.get('sw1')!.channels[0]!.activeUpstreamId = bId;
+    await h.sync.tick(); // -> awaiting-stop-confirm
+    h.cache.get('zoneA').restreamers.find((r) => r.nodeId === 'n1')!.sessions = [];
+    await h.sync.tick(); // -> complete
+
+    const normals = h.logs.filter((l) => l.type === 'normal');
+    expect(normals).toHaveLength(1);
+    expect(normals[0]!.message).toMatch(/complete/);
+    expect(normals[0]!.message).toContain('chan1');
+  });
+
+  it('warns on an automatic RETARGET and ABORT', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+    const bId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n2', priority: 2 });
+    const cId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneB', nodeId: 'n1', priority: 3 });
+    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess('chan1')] });
+    seedNode(h.cache, 'zoneA', 'n2', { sessions: [] });
+    seedNode(h.cache, 'zoneB', 'n1', { sessions: [] });
+    seedSwitcherStatus(h.cache, 'sw1', [swChan('chan1', aId, [{ id: aId, healthy: true }])]);
+    void bId;
+    void cId;
+
+    h.snapshot.lag.set(aId, lagFail(40));
+    await h.sync.tick(); // BEGIN -> targets B
+    h.advanceNow(LAG_DISCOVERY_TIMEOUT_MS + 1_000);
+    await h.sync.tick(); // RETARGET -> C
+    h.advanceNow(LAG_DISCOVERY_TIMEOUT_MS + 1_000);
+    await h.sync.tick(); // ABORT — candidates exhausted
+
+    const warnings = h.logs.filter((l) => l.type === 'warning').map((l) => l.message);
+    expect(warnings.some((m) => /BEGIN/.test(m))).toBe(true);
+    expect(warnings.some((m) => /RETARGET/.test(m))).toBe(true);
+    expect(warnings.some((m) => /ABORTED/.test(m))).toBe(true);
+    expect(h.logs.every((l) => l.source === 'controller' && l.service === 'restreamer')).toBe(true);
+  });
+
+  it('logs nothing for a manual-reason procedure start through completion', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    seedSwitcherStatus(h.cache, 'sw1', [
+      swChan('chan1', bId, [
+        { id: aId, healthy: true },
+        { id: bId, healthy: true },
+      ]),
+    ]);
+    await h.sync.requestFailover(chanId, { toPlacementId: aId, reason: 'manual', detail: 'operator' });
+    h.snapshot.lag.set(aId, lagOk(2));
+
+    await h.sync.tick(); // begin -> ... -> issue-switch
+    seedSwitcherStatus(h.cache, 'sw1', [
+      swChan('chan1', aId, [
+        { id: aId, healthy: true },
+        { id: bId, healthy: true },
+      ]),
+    ]);
+    removeSession(h.cache, 'zoneA', 'n2', 'chan1');
+    await h.sync.tick(); // confirm -> stopping-old -> stop-confirm -> complete
+
+    expect(h.logs).toHaveLength(0);
+  });
+
+  it('logs nothing for a reset-reason procedure', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'complete',
+      triggerReason: 'lag',
+    });
+    h.snapshot.lag.set(aId, lagFail(40)); // still failing — force bypasses the check
+
+    const outcome = await h.sync.requestReset(chanId, { force: true });
+    expect(outcome).toEqual({ ok: true, queued: true });
+    await h.sync.tick(); // begins a 'reset' procedure
+
+    expect(h.logs).toHaveLength(0);
   });
 });

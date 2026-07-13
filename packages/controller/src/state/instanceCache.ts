@@ -60,6 +60,17 @@ export interface InstanceSnapshot {
   autorecs: TvhAutorecRule[];
   topology: TopologySnapshot | null;
   conflicts: ConflictWindow[];
+  /**
+   * true once a DVR poll has succeeded — distinguishes "no recordings" from
+   * "not polled yet", so diff-based consumers (conflict transitions) don't
+   * baseline against the pre-first-poll empty grids
+   */
+  dvrLoaded: boolean;
+  /**
+   * true once an autorec poll has succeeded — distinguishes "no rules" from
+   * "not polled yet"
+   */
+  autorecsLoaded: boolean;
   /** polled status of this location's restreamer daemon nodes (keyed by nodeId) */
   restreamers: RestreamerNodeStatus[];
 }
@@ -92,6 +103,8 @@ export function emptySnapshot(
     autorecs: [],
     topology: null,
     conflicts: [],
+    dvrLoaded: false,
+    autorecsLoaded: false,
     restreamers: [],
   };
 }

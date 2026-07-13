@@ -28,7 +28,8 @@ export interface Route {
     | 'drift'
     | 'conflicts'
     | 'uploads'
-    | 'restreamer';
+    | 'restreamer'
+    | 'events';
   instanceId?: string;
   /** sub-view within a page (rules: 'deleted' tab) */
   sub?: 'deleted';
@@ -59,6 +60,8 @@ function parse(pathname: string, search: string): Route {
       return { page: 'uploads', search };
     case 'restreamer':
       return { page: 'restreamer', search };
+    case 'events':
+      return { page: 'events', search };
     default:
       return { page: 'epg', search };
   }

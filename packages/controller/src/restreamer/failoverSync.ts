@@ -48,6 +48,7 @@ import type {
 import type { AppConfig, RestreamerNodeConfig } from '../config.js';
 import type { Db } from '../db/db.js';
 import type { RestreamFailoverStateTable } from '../db/schema.js';
+import type { EventLog } from '../state/eventLog.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import { httpError } from '../util/httpError.js';
 import {
@@ -187,6 +188,7 @@ export class FailoverSync {
     private readonly settings: () => Promise<Map<string, NodeProbeSettings>>,
     private readonly hooks: FailoverSyncHooks,
     private readonly now: () => Date = () => new Date(),
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {}
 
   /** why the last trigger for a channel could not start a failover; null = n/a */
@@ -647,6 +649,15 @@ export class FailoverSync {
     console.error(
       `restreamer: failover BEGIN for "${channel.slug}" (${item.reason}) — ${from?.id ?? '(none)'} → ${targetId}`,
     );
+    // site #4: automatic failover lifecycle — skip manual/reset (user-initiated)
+    if (item.reason !== 'manual' && item.reason !== 'reset') {
+      this.events.log({
+        type: 'warning',
+        service: 'restreamer',
+        source: 'controller',
+        message: `failover BEGIN for "${channel.slug}" (${item.reason}) — ${from?.id ?? '(none)'} → ${targetId}`,
+      });
+    }
 
     // bring-up push: the target joins the docs via to_placement_id
     try {
@@ -806,6 +817,9 @@ export class FailoverSync {
     const candidates = placements
       .filter((p) => p.id !== row.from_placement_id)
       .map((p) => this.candidateOf(data, p));
+    const slug = data.channels.get(channelId)?.slug ?? channelId;
+    // site #4: automatic failover lifecycle — skip manual/reset (user-initiated)
+    const automatic = row.trigger_reason !== 'manual' && row.trigger_reason !== 'reset';
     const chosen = selectTarget(candidates, this.tried);
     if (chosen) {
       this.tried.add(chosen.placementId);
@@ -813,6 +827,14 @@ export class FailoverSync {
       this.phaseEnteredAtMs = this.now().getTime();
       changed.add(channelId);
       console.error(`restreamer: failover RETARGET for channel ${channelId} → ${chosen.placementId}`);
+      if (automatic) {
+        this.events.log({
+          type: 'warning',
+          service: 'restreamer',
+          source: 'controller',
+          message: `failover RETARGET for "${slug}" → placement ${chosen.placementId}`,
+        });
+      }
       await this.hooks.pushNodes(this.channelNodes(data, channelId)).catch(() => {});
       await this.hooks.pushSwitchers().catch(() => {});
       this.hooks.publishChannel(channelId);
@@ -826,6 +848,14 @@ export class FailoverSync {
     this.clearActive();
     changed.add(channelId);
     console.error(`restreamer: failover ABORTED for channel ${channelId} — candidates exhausted`);
+    if (automatic) {
+      this.events.log({
+        type: 'warning',
+        service: 'restreamer',
+        source: 'controller',
+        message: `failover ABORTED for "${slug}" — candidates exhausted`,
+      });
+    }
   }
 
   /** procedure reached complete: row lifecycle + slot release */
@@ -835,6 +865,16 @@ export class FailoverSync {
     row: FailoverRow,
     changed: Set<string>,
   ): Promise<void> {
+    // site #4: automatic failover lifecycle (complete) — skip manual/reset
+    if (row.trigger_reason !== 'manual' && row.trigger_reason !== 'reset') {
+      const slug = data.channels.get(channelId)?.slug ?? channelId;
+      this.events.log({
+        type: 'normal',
+        service: 'restreamer',
+        source: 'controller',
+        message: `failover complete for "${slug}" — now on placement ${row.to_placement_id}`,
+      });
+    }
     // a procedure that ENDS on the channel's natural steady-state placement
     // is a fail-back and must not leave standing failover state behind: an
     // explicit reset always, and a MANUAL switch whose target is the natural

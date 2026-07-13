@@ -94,12 +94,20 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     overlapThreshold: 0.7,
     autoUpload: { enabled: false, graceSeconds: 120 },
     restreamer: { switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'https://tv.example' }] },
+    eventLogRetentionDays: 30,
     ...overrides,
   };
 }
 
 function profilePayload(extra: Record<string, unknown> = {}): unknown {
   return { template: 'arib-hls', templateVersion: 1, video: { mode: 'ivtc' }, audio: [{}], ...extra };
+}
+
+interface LoggedEvent {
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
 }
 
 interface Harness {
@@ -110,6 +118,7 @@ interface Harness {
   service: RestreamerService;
   switcher: FakeSwitcher;
   config: AppConfig;
+  logs: LoggedEvent[];
 }
 
 async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness> {
@@ -132,8 +141,11 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
   const switcher = fakeSwitcher();
   const switcherClients = new Map<string, SwitcherNodeClient>();
   for (const sw of config.restreamer?.switchers ?? []) switcherClients.set(sw.id, switcher);
-  const service = new RestreamerService(db, cache, pollers, bus, config, clients, switcherClients);
-  return { db, destroy, cache, events, service, switcher, config };
+  const logs: LoggedEvent[] = [];
+  const service = new RestreamerService(db, cache, pollers, bus, config, clients, switcherClients, {
+    log: (e) => logs.push(e),
+  });
+  return { db, destroy, cache, events, service, switcher, config, logs };
 }
 
 function switcherStateRow(db: Kysely<Database>, switcherId: string) {
@@ -682,6 +694,72 @@ describe('rebalanceTick', () => {
     await h.service.failoverTick();
     expect(h.switcher.switches()).toHaveLength(0);
     expect(await h.db.selectFrom('restream_failover_state').selectAll().execute()).toHaveLength(0);
+    await h.destroy();
+  });
+
+  it('logs a normal event-log entry when a rebalance move is queued (site #11)', async () => {
+    const h = await setup();
+    seedNodeReachable(h, 'zone1', 'n1');
+    seedNodeReachable(h, 'zone2', 'n1');
+    const a = await seedRedundant(h, 'BBB', '10');
+    const b = await seedRedundant(h, 'BBB', '10'); // slug uniquified to bbb-2
+    const ids = (ps: typeof a.placements) => ps.map((p) => p.id);
+    seedSwitcherStatus(h.cache, 'sw1', [
+      switcherChannel('bbb', a.placements[0]!.id, ids(a.placements), null),
+      switcherChannel('bbb-2', b.placements[0]!.id, ids(b.placements), null),
+    ]);
+
+    await h.service.rebalanceTick(new Date());
+    const moveLogs = h.logs.filter((l) => l.message.includes('rebalance queued'));
+    expect(moveLogs).toHaveLength(1);
+    expect(moveLogs[0]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'switcher.sw1' });
+    expect(moveLogs[0]!.message).toContain('bbb');
+    await h.destroy();
+  });
+});
+
+// ---------- event-log emission: switcher push failed/healed (site #11) ----------
+
+describe('SwitcherSync: switcher push failed/healed event-log emission (site #11)', () => {
+  it('logs a warning on the first push failure, nothing on a repeat, and a normal once it recovers', async () => {
+    const h = await setup();
+    seedSwitcherStatus(h.cache, 'sw1', []); // updateStatus() is a no-op until a status entry exists
+    await seedRedundant(h); // gives the switcher something to push
+
+    h.switcher.failNextPut(new Error('putDesired: connection refused'));
+    const failed = await h.service.pushSwitcher('sw1', true);
+    expect(failed.action).toBe('error');
+    expect(h.logs).toHaveLength(1);
+    expect(h.logs[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'switcher.sw1' });
+    expect(h.logs[0]!.message).toContain('connection refused');
+
+    // still down (e.g. the 60s sweep retrying) must not spam
+    h.switcher.unreachable = true;
+    const stillFailing = await h.service.pushSwitcher('sw1', true);
+    expect(stillFailing.action).toBe('error');
+    expect(h.logs).toHaveLength(1);
+
+    // the exact spam bug being fixed: the SwitcherPoller runs concurrently
+    // and overwrites cache.switchers' error every tick with its OWN
+    // reachability result, independent of push outcomes — simulate it
+    // resetting the cached error back to null while the push is still broken
+    const entry = h.cache.switchers.get('sw1')!;
+    h.cache.switchers.set('sw1', { ...entry, error: null });
+    h.switcher.unreachable = true;
+    const stillFailingAfterPollerReset = await h.service.pushSwitcher('sw1', true);
+    expect(stillFailingAfterPollerReset.action).toBe('error');
+    // must NOT re-log: the transition guard reads the dedicated pushProblems
+    // map, not the poller-owned cache field the code above just reset
+    expect(h.logs).toHaveLength(1);
+
+    h.switcher.unreachable = false;
+    const healed = await h.service.pushSwitcher('sw1', true);
+    expect(healed.action).toBe('pushed');
+    expect(h.logs).toHaveLength(2);
+    expect(h.logs[1]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'switcher.sw1' });
+    // the successful push also clears the stale error on the cached status
+    expect(h.cache.switchers.get('sw1')!.error).toBeNull();
+
     await h.destroy();
   });
 });

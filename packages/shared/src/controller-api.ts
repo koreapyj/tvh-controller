@@ -242,6 +242,16 @@ export interface RecordingBatchResult {
   error?: string;
 }
 
+/** persisted history row: failovers, outages, drift, failed pushes etc */
+export interface EventLogEntry {
+  id: number;
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
+  createdAt: string;
+}
+
 export type SseEvent =
   | { type: 'instance-status'; data: InstanceSummary }
   | {
@@ -256,4 +266,5 @@ export type SseEvent =
   | { type: 'restreamer'; data: RestreamerNodeStatus }
   | { type: 'restreamer-switcher'; data: SwitcherNodeStatus }
   /** live channel failover/indicator state (full REST shape, replace-by-id) */
-  | { type: 'restreamer-channel'; data: RestreamChannelWithStatus };
+  | { type: 'restreamer-channel'; data: RestreamChannelWithStatus }
+  | { type: 'event-log'; data: EventLogEntry };

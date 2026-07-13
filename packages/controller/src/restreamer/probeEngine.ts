@@ -52,6 +52,7 @@
  */
 
 import type { LagProbeStatus, NodeProbeSettings, NodeProbeStatus } from '@tvhc/shared';
+import type { EventLog } from '../state/eventLog.js';
 import { parseLastPdtEndMs, parseMasterVariant, parseNewestSegment } from './hlsParse.js';
 import { applyProbeResult, toProbeStatus, type ProbeCounterState } from './probeState.js';
 
@@ -123,6 +124,7 @@ export class ProbeEngine {
     private readonly onPlacementChange: (channelId: string) => void = () => {},
     private readonly fetchImpl: typeof fetch = fetch,
     private readonly now: () => Date = () => new Date(),
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {}
 
   start(): void {
@@ -268,7 +270,11 @@ export class ProbeEngine {
           ? `no response within ${cfg.liveness.timeoutSeconds}s`
           : `fetch error: ${err instanceof Error ? err.message : String(err)}`;
     }
-    this.liveness.set(key, applyProbeResult(this.liveness.get(key), result, cfg.liveness, this.now(), detail));
+    const prev = this.liveness.get(key);
+    const next = applyProbeResult(prev, result, cfg.liveness, this.now(), detail);
+    this.liveness.set(key, next);
+    // site #5: liveness trip/clear — transition-based only
+    this.logProbeTransition('liveness', node.instanceId, node.nodeId, prev?.failed, next.failed, detail);
   }
 
   // ---------- underspeed (network/delivery) ----------
@@ -287,6 +293,8 @@ export class ProbeEngine {
       ...next,
       lastSpeedRatio: m.speedRatio ?? prev?.lastSpeedRatio ?? null,
     });
+    // site #5: underspeed trip/clear — transition-based only
+    this.logProbeTransition('underspeed', node.instanceId, node.nodeId, prev?.failed, next.failed, m.detail);
   }
 
   /**
@@ -427,6 +435,8 @@ export class ProbeEngine {
     };
     this.lag.set(p.placementId, merged);
     if (this.meaningfulChange(prev, merged)) this.onPlacementChange(p.channelId);
+    // site #5: lag trip/clear — channel-level, so the message must name the slug
+    this.logProbeTransition('lag', p.instanceId, p.nodeId, prev?.failed, merged.failed, merged.detail, p.slug);
   }
 
   /** counts/failed changed — not just lastCheckedAt/measurement noise */
@@ -436,5 +446,31 @@ export class ProbeEngine {
       prev?.consecutiveFailures !== next.consecutiveFailures ||
       (prev.consecutiveSuccesses > 0) !== (next.consecutiveSuccesses > 0)
     );
+  }
+
+  /**
+   * Site #5 (probe trip/clear): logs only on a `failed` transition, never on
+   * every tick. `prevFailed` undefined (never probed before) is treated as
+   * "not failed" so a first-ever check that already fails still trips — the
+   * counter-based hysteresis in probeState.ts already prevents flapping/spam,
+   * so this site does not need the first-poll baseline guard used elsewhere.
+   */
+  private logProbeTransition(
+    kind: 'liveness' | 'underspeed' | 'lag',
+    instanceId: string,
+    nodeId: string,
+    prevFailed: boolean | undefined,
+    nextFailed: boolean,
+    detail: string,
+    slug?: string,
+  ): void {
+    if ((prevFailed ?? false) === nextFailed) return;
+    const target = slug ? `"${slug}" on node.${instanceId}.${nodeId}` : `node.${instanceId}.${nodeId}`;
+    this.events.log({
+      type: nextFailed ? 'warning' : 'normal',
+      service: 'restreamer',
+      source: `node.${instanceId}.${nodeId}`,
+      message: `${kind} probe ${nextFailed ? 'tripped' : 'cleared'} for ${target}: ${detail}`,
+    });
   }
 }

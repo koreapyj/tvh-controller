@@ -32,6 +32,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import Conflicts from './pages/Conflicts.svelte';
   import Uploads from './pages/Uploads.svelte';
   import Restreamer from './pages/Restreamer.svelte';
+  import Events from './pages/Events.svelte';
 
   // channels need instance topology, which may lag right after a controller
   // restart — retry until available, then surface a banner instead of
@@ -99,6 +100,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     <a href="/drift" class:active={$route.page === 'drift'}>Drift</a>
     <a href="/conflicts" class:active={$route.page === 'conflicts'}>Conflicts</a>
     <a href="/uploads" class:active={$route.page === 'uploads'}>Uploads</a>
+    <a href="/events" class:active={$route.page === 'events'}>Events</a>
     <div style="flex:1"></div>
     <div class="section">
       {#if $sseConnected}<span class="badge ok">live</span>{:else}<span class="badge warn">reconnecting…</span>{/if}
@@ -124,6 +126,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       <Uploads />
     {:else if $route.page === 'restreamer'}
       <Restreamer />
+    {:else if $route.page === 'events'}
+      <Events />
     {/if}
   </main>
 </div>

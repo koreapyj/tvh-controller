@@ -110,6 +110,8 @@ export interface AppConfig {
    */
   restreamer?: { switchers: SwitcherConfig[]; publicUrl?: string; deliveryProbe?: DeliveryProbeAppConfig };
   webDistDir?: string;
+  /** persisted event_log rows older than this are pruned hourly */
+  eventLogRetentionDays: number;
 }
 
 interface RawInstance extends Omit<InstanceConfig, 'url' | 'serverOffsetMinutes' | 'restreamer'> {
@@ -128,6 +130,7 @@ interface RawConfig {
   autoUpload?: boolean | { enabled?: boolean; graceSeconds?: number };
   pollIntervals?: Partial<AppConfig['pollIntervals']>;
   overlapThreshold?: number;
+  eventLogRetentionDays?: number;
   restreamer?: {
     switchers?: SwitcherConfig[];
     publicUrl?: string;
@@ -288,5 +291,6 @@ export function loadConfig(path = defaultConfigPath()): AppConfig {
         : { enabled: raw.autoUpload ?? false, graceSeconds: 120 },
     restreamer: parseSwitchers(raw.restreamer),
     webDistDir: process.env.WEB_DIST_DIR,
+    eventLogRetentionDays: raw.eventLogRetentionDays ?? 30,
   };
 }

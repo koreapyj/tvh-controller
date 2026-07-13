@@ -18,6 +18,7 @@
 
 import type { TvhDvrEntry, UploadJob, UploadStatus } from '@tvhc/shared';
 import type { AppConfig } from '../config.js';
+import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
 import { RcloneRcClient, RcloneRcError } from './rcloneRc.js';
 import { buildRemotePath } from './remotePath.js';
@@ -75,11 +76,20 @@ export class UploadDispatcher {
   private readonly instanceQueues = new Map<string, Promise<void>>();
   private stopped = false;
   private retrySweepTimer: NodeJS.Timeout | null = null;
+  /**
+   * Site #12 (upload failed/auto-retry/done) status-transition tracking, keyed
+   * by upload id. Terminal jobs (done/cancelled/superseded) are evicted once
+   * logged so this stays bounded; 'failed' stays tracked so a later auto-retry
+   * (failed -> verifying via sweepRetries) can still be detected as a
+   * transition.
+   */
+  private readonly uploadTrackedState = new Map<string, { status: UploadStatus; autoRetries: number }>();
 
   constructor(
     private readonly cfg: AppConfig,
     private readonly ledger: UploadLedger,
     private readonly bus: EventBus,
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {
     for (const inst of cfg.instances) {
       if (inst.rclone) this.clients.set(inst.id, new RcloneRcClient(inst.rclone));
@@ -153,6 +163,12 @@ export class UploadDispatcher {
         failure_kind: null,
         auto_retries: job.autoRetries + 1,
       });
+      // route the transition through the same choke point retry()/driveInner
+      // use, so this real auto-retry publishes both the SSE 'upload-progress'
+      // event and the site #12 event-log entry (previously this sweep bumped
+      // the ledger directly, so the failed -> verifying transition was never
+      // observed by logUploadTransition)
+      await this.publish(job.id);
       void this.drive(job.id, job.instanceId);
     }
   }
@@ -240,7 +256,55 @@ export class UploadDispatcher {
 
   private async publish(uploadId: string): Promise<void> {
     const job = await this.ledger.get(uploadId);
-    if (job) this.bus.publish({ type: 'upload-progress', data: job });
+    if (!job) return;
+    this.logUploadTransition(job);
+    this.bus.publish({ type: 'upload-progress', data: job });
+  }
+
+  /**
+   * Site #12 (upload failed/auto-retry/done): publish() is the single choke
+   * point every status change flows through, so it is the natural place to
+   * log TRANSITIONS only — progress-only publishes (same status, e.g. byte
+   * counters during 'uploading') must not log.
+   * - into 'failed' = warning (failure_kind + error)
+   * - into 'done' = normal
+   * - 'failed' -> 'verifying' via the auto-retry sweep = normal; a MANUAL
+   *   retry() also makes this transition but never bumps autoRetries, so
+   *   comparing autoRetries against the tracked value distinguishes the two
+   *   without needing a separate signal from retry()/sweepRetries() (manual
+   *   retries are user-initiated and must not be logged).
+   */
+  private logUploadTransition(job: UploadJob): void {
+    const prev = this.uploadTrackedState.get(job.id);
+    const isTransition = prev?.status !== job.status;
+    const label = job.title ?? job.channelname;
+    if (isTransition) {
+      if (job.status === 'failed') {
+        this.events.log({
+          type: 'warning',
+          service: 'uploads',
+          source: `instance.${job.instanceId}`,
+          message: `upload failed for "${label}" (${job.failureKind ?? 'unknown'}): ${job.error ?? 'unknown error'}`,
+        });
+      } else if (job.status === 'done') {
+        this.events.log({
+          type: 'normal',
+          service: 'uploads',
+          source: `instance.${job.instanceId}`,
+          message: `upload done for "${label}"`,
+        });
+      } else if (job.status === 'verifying' && prev?.status === 'failed' && job.autoRetries > prev.autoRetries) {
+        this.events.log({
+          type: 'normal',
+          service: 'uploads',
+          source: `instance.${job.instanceId}`,
+          message: `upload auto-retry for "${label}" (attempt ${job.autoRetries})`,
+        });
+      }
+    }
+    const terminal = job.status === 'done' || job.status === 'cancelled' || job.status === 'superseded';
+    if (terminal) this.uploadTrackedState.delete(job.id);
+    else this.uploadTrackedState.set(job.id, { status: job.status, autoRetries: job.autoRetries });
   }
 
   /**

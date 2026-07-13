@@ -51,6 +51,9 @@ export const driftItems = writable<DriftItem[] | null>(null);
 export const recordingsTick = writable<{ instanceId: string; n: number }>({ instanceId: '', n: 0 });
 /** bumped when EPG changed on some instance (comet `epg` push) — the EPG page refetches */
 export const epgTick = writable<number>(0);
+/** bumped when a new event-log row is inserted — the SSE payload is discarded, this is only
+ *  an invalidation signal so the Events page's filtering stays 100% server-side */
+export const eventLogTick = writable<number>(0);
 /** last upload progress event — Uploads page merges it in */
 export const uploadEvent = writable<UploadJob | null>(null);
 export const sseConnected = writable(false);

@@ -26,6 +26,7 @@ import type {
   SwitcherNodeStatus,
 } from '@tvhc/shared';
 import type { RestreamerNodeConfig, SwitcherConfig } from '../config.js';
+import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { RestreamerClient, SwitcherClient } from './client.js';
@@ -114,6 +115,10 @@ export class RestreamerPoller {
   private lastSources: SourceCatalogEntry[] | null = null;
   /** fingerprint matching lastSources; null = no catalog / unknown */
   private lastSourcesHash: string | null = null;
+  /** site #8: per-session ffmpeg restart counts across polls */
+  private readonly sessionRestarts = new Map<string, number>();
+  /** first-poll baseline guard (site 8): seeds sessionRestarts without logging on the first pass */
+  private sessionBaselineSeeded = false;
 
   constructor(
     private readonly instanceId: string,
@@ -123,6 +128,7 @@ export class RestreamerPoller {
     private readonly bus: EventBus,
     private readonly intervalMs: number,
     private readonly hooks: RestreamerPollerHooks = {},
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {}
 
   start(): void {
@@ -201,14 +207,79 @@ export class RestreamerPoller {
 
     const snap = this.cache.get(this.instanceId);
     const idx = snap.restreamers.findIndex((r) => r.nodeId === this.node.id);
+    // site #6: restreamer node up/down — read prev reachable before overwriting.
+    // main.ts pre-seeds a reachable:false placeholder (lastPollAt: null) before
+    // this poller's first real tick — a prior entry with lastPollAt === null is
+    // that placeholder, not a real prior observation, so it must not count as
+    // a transition either (same "undefined" treatment as idx === -1).
+    const prev = idx === -1 ? undefined : snap.restreamers[idx]!;
+    const prevReachable = prev === undefined || prev.lastPollAt === null ? undefined : prev.reachable;
     if (idx === -1) snap.restreamers = [...snap.restreamers, status];
     else snap.restreamers = snap.restreamers.map((r, x) => (x === idx ? status : r));
+    this.logReachabilityTransition(prevReachable, status);
+    if (status.reachable) this.trackSessionRestarts(status.sessions);
 
     const key = statusKey(status);
     if (key !== this.lastStatusKey) {
       this.lastStatusKey = key;
       this.bus.publish({ type: 'restreamer', data: status });
     }
+  }
+
+  /** site #6: restreamer node up/down — transition-based only */
+  private logReachabilityTransition(
+    prevReachable: boolean | undefined,
+    status: RestreamerNodeStatus,
+  ): void {
+    if (prevReachable === undefined || prevReachable === status.reachable) return;
+    const source = `node.${this.instanceId}.${this.node.id}`;
+    if (status.reachable) {
+      this.events.log({
+        type: 'normal',
+        service: 'restreamer',
+        source,
+        message: `restreamer ${source} came online`,
+      });
+    } else {
+      this.events.log({
+        type: 'warning',
+        service: 'restreamer',
+        source,
+        message: `restreamer ${source} is unreachable: ${status.error}`,
+      });
+    }
+  }
+
+  /**
+   * Site #8 (ffmpeg session restarts): per-session diff of SessionStatus.restarts
+   * across polls. First-poll baseline guard (sessionBaselineSeeded): the
+   * initial pass only seeds sessionRestarts, never logs — otherwise every
+   * controller restart would flood the log with pre-existing restart counts.
+   * Sessions that disappear are evicted so a later same-named session starts
+   * fresh instead of comparing against a stale count.
+   */
+  private trackSessionRestarts(sessions: EnrichedSessionStatus[]): void {
+    const seen = new Set<string>();
+    for (const s of sessions) {
+      seen.add(s.name);
+      const prev = this.sessionRestarts.get(s.name);
+      if (this.sessionBaselineSeeded && prev !== undefined && s.restarts > prev) {
+        const exitClass = s.lastExit?.class;
+        this.events.log({
+          type: 'warning',
+          service: 'restreamer',
+          source: `node.${this.instanceId}.${this.node.id}`,
+          message: `session "${s.name}" restarted (restarts=${s.restarts}${
+            exitClass ? `, last exit: ${exitClass}` : ''
+          })`,
+        });
+      }
+      this.sessionRestarts.set(s.name, s.restarts);
+    }
+    for (const name of [...this.sessionRestarts.keys()]) {
+      if (!seen.has(name)) this.sessionRestarts.delete(name);
+    }
+    this.sessionBaselineSeeded = true;
   }
 
   private async getPendingPushSafe(): Promise<boolean> {
@@ -309,6 +380,7 @@ export class SwitcherPoller {
     private readonly bus: EventBus,
     private readonly intervalMs: number,
     private readonly hooks: SwitcherPollerHooks = {},
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {}
 
   start(): void {
@@ -363,12 +435,36 @@ export class SwitcherPoller {
       };
     }
 
+    // site #6: switcher up/down — read prev reachable before overwriting
+    const prevReachable = this.cache.switchers.get(this.cfg.id)?.reachable;
     this.cache.switchers.set(this.cfg.id, status);
+    this.logReachabilityTransition(prevReachable, status);
 
     const key = statusKey(status);
     if (key !== this.lastStatusKey) {
       this.lastStatusKey = key;
       this.bus.publish({ type: 'restreamer-switcher', data: status });
+    }
+  }
+
+  /** site #6: switcher up/down — transition-based only */
+  private logReachabilityTransition(prevReachable: boolean | undefined, status: SwitcherNodeStatus): void {
+    if (prevReachable === undefined || prevReachable === status.reachable) return;
+    const source = `switcher.${this.cfg.id}`;
+    if (status.reachable) {
+      this.events.log({
+        type: 'normal',
+        service: 'restreamer',
+        source,
+        message: `${source} came online`,
+      });
+    } else {
+      this.events.log({
+        type: 'warning',
+        service: 'restreamer',
+        source,
+        message: `${source} is unreachable: ${status.error}`,
+      });
     }
   }
 

@@ -34,6 +34,7 @@ import type {
   RecordingTarget,
   RuleWithStatus,
   EpgChannel,
+  EventLogEntry,
   TvhEpgEvent,
   UnifiedEpgEvent,
   UnifiedGroup,
@@ -210,6 +211,27 @@ export const api = {
     http<TvhEpgEvent>('GET', `/api/epg/event/${instanceId}/${eventId}`),
   recordEvent: (instanceId: string, eventId: number) =>
     http<{ uuid: string[] }>('POST', '/api/epg/record', { instanceId, eventId }),
+
+  eventLog: (params?: {
+    service?: string[];
+    source?: string[];
+    type?: string;
+    sort?: string;
+    dir?: string;
+    offset?: number;
+    limit?: number;
+  }) => {
+    const sp = new URLSearchParams();
+    if (params?.service?.length) sp.set('service', JSON.stringify(params.service));
+    if (params?.source?.length) sp.set('source', JSON.stringify(params.source));
+    if (params?.type) sp.set('type', params.type);
+    if (params?.sort) sp.set('sort', params.sort);
+    if (params?.dir) sp.set('dir', params.dir);
+    sp.set('offset', String(params?.offset ?? 0));
+    sp.set('limit', String(params?.limit ?? 100));
+    return http<{ items: EventLogEntry[]; total: number }>('GET', `/api/event-log?${sp.toString()}`);
+  },
+  eventLogFacets: () => http<{ services: string[]; sources: string[] }>('GET', '/api/event-log/facets'),
 
   rules: () => http<RuleWithStatus[]>('GET', '/api/rules'),
   createRule: (input: RuleInput) => http<RuleWithStatus>('POST', '/api/rules', input),

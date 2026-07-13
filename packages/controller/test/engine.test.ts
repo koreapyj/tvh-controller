@@ -25,6 +25,13 @@ import {
   tvhAutorecRule,
 } from './support/fixtures.js';
 
+interface LoggedEvent {
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
+}
+
 interface Harness {
   db: Kysely<Database>;
   destroy: () => Promise<void>;
@@ -32,6 +39,7 @@ interface Harness {
   engine: SyncEngine;
   clients: Map<string, FakeTvhClient>;
   pollers: Map<string, FakePoller>;
+  logs: LoggedEvent[];
 }
 
 async function setup(instanceIds: string[] = ['tyo1', 'osk1']): Promise<Harness> {
@@ -45,6 +53,7 @@ async function setup(instanceIds: string[] = ['tyo1', 'osk1']): Promise<Harness>
     cache.init(id, id, `http://${id}`);
     const snap = cache.get(id);
     snap.summary.reachable = true;
+    snap.autorecsLoaded = true;
     snap.topology = topologySnapshot();
     const client = fakeTvhClient();
     clients.set(id, client);
@@ -52,8 +61,9 @@ async function setup(instanceIds: string[] = ['tyo1', 'osk1']): Promise<Harness>
     fakePollers.set(id, poller);
     enginePollers.set(id, poller as unknown as InstancePoller);
   }
-  const engine = new SyncEngine(db, cache, enginePollers, bus);
-  return { db, destroy, cache, engine, clients, pollers: fakePollers };
+  const logs: LoggedEvent[] = [];
+  const engine = new SyncEngine(db, cache, enginePollers, bus, { log: (e) => logs.push(e) });
+  return { db, destroy, cache, engine, clients, pollers: fakePollers, logs };
 }
 
 async function getBinding(db: Kysely<Database>, masterRuleId: string, instanceId: string) {
@@ -1517,6 +1527,114 @@ describe('tvh-less instances', () => {
     // instances and appended ext1 explicitly
     const updated = await engine.getRule(rule.id);
     expect(updated!.instances).toEqual(['tyo1', 'osk1', 'ext1']);
+
+    await destroy();
+  });
+});
+
+// ---------- event-log emission: drift (site #9) ----------
+
+describe('SyncEngine: drift event-log emission (site #9)', () => {
+  it('baseline: nothing logged on the first publishDrift even with pre-existing drift', async () => {
+    const { destroy, engine, clients, pollers, logs } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'News',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'News', title: 'Original' }),
+    });
+    await engine.pushRule(rule.id);
+    const client = clients.get('tyo1')!;
+    client.rules[0]!.title = 'Changed'; // out-of-band edit BEFORE the controller ever looks
+    await pollers.get('tyo1')!.pollAutorecs();
+
+    // sanity: the drift genuinely exists
+    const items = await engine.computeDrift();
+    expect(items.some((i) => i.kind === 'modified-on-instance')).toBe(true);
+
+    await engine.publishDrift(); // first pass — baseline guard, must not log
+    expect(logs).toHaveLength(0);
+
+    await destroy();
+  });
+
+  it('logs one warning when new drift appears after the baseline, and a normal when it clears', async () => {
+    const { destroy, engine, clients, pollers, logs } = await setup(['tyo1']);
+    const rule = await engine.createRule({
+      name: 'News',
+      instances: 'all',
+      payload: masterRulePayload({ name: 'News', title: 'Original' }),
+    });
+    await engine.pushRule(rule.id);
+    await engine.publishDrift(); // baseline — clean, nothing to seed
+    expect(logs).toHaveLength(0);
+
+    const client = clients.get('tyo1')!;
+    client.rules[0]!.title = 'Changed';
+    await pollers.get('tyo1')!.pollAutorecs();
+    await engine.publishDrift(); // new drift appeared
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ type: 'warning', service: 'drift', source: 'instance.tyo1' });
+    expect(logs[0]!.message).toContain('News');
+
+    client.rules[0]!.title = 'Original'; // reverted — drift clears
+    await pollers.get('tyo1')!.pollAutorecs();
+    await engine.publishDrift();
+    expect(logs).toHaveLength(2);
+    expect(logs[1]).toMatchObject({ type: 'normal', service: 'drift', source: 'instance.tyo1' });
+    expect(logs[1]!.message).toContain('News');
+
+    await destroy();
+  });
+
+  it('per-instance baseline: an instance loading AFTER the first pass still seeds its pre-existing drift silently', async () => {
+    const { destroy, cache, engine, clients, pollers, logs } = await setup(['tyo1', 'osk1']);
+    // restart race: osk1's cache is not loaded when the first pass runs
+    const osk = cache.get('osk1');
+    osk.autorecsLoaded = false;
+    const oskClient = clients.get('osk1')!;
+    oskClient.rules.push(tvhAutorecRule({ name: 'Pre-existing Orphan' })); // standing drift on osk1
+
+    await engine.publishDrift(); // first pass evaluates only tyo1
+    expect(logs).toHaveLength(0);
+
+    osk.summary.reachable = true;
+    await pollers.get('osk1')!.pollAutorecs(); // osk1 loads — its standing orphan enters the pass
+    await engine.publishDrift(); // osk1's first evaluated pass: seed, must NOT log "appeared"
+    expect((await engine.computeDrift()).some((i) => i.kind === 'orphan')).toBe(true);
+    expect(logs).toHaveLength(0);
+
+    oskClient.rules.push(tvhAutorecRule({ name: 'Genuinely New' })); // real new drift afterwards
+    await pollers.get('osk1')!.pollAutorecs();
+    await engine.publishDrift();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ type: 'warning', service: 'drift', source: 'instance.osk1' });
+    expect(logs[0]!.message).toContain('Genuinely New');
+
+    await destroy();
+  });
+});
+
+// ---------- event-log emission: rule push error/blocked (site #10) ----------
+
+describe('SyncEngine: rule push error/blocked event-log emission (site #10)', () => {
+  it('logs one warning when a push is blocked, and none on a repeated still-blocked push', async () => {
+    const { destroy, engine, cache, logs } = await setup(['tyo1']);
+    cache.init('ext1', 'ext1', null); // tvh-less instance — pushRuleToInstance blocks unconditionally
+
+    const rule = await engine.createRule({
+      name: 'News',
+      instances: ['tyo1', 'ext1'],
+      payload: masterRulePayload({ name: 'News' }),
+    });
+    await engine.pushRule(rule.id); // tyo1 created, ext1 blocked
+    expect(logs.filter((l) => l.type === 'warning')).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ type: 'warning', service: 'rules', source: 'instance.ext1' });
+    expect(logs[0]!.message).toContain('News');
+
+    // a second push while still blocked (operator re-clicking "push", or
+    // pushAll retrying the same rule) must not re-log the same problem
+    await engine.pushRule(rule.id);
+    expect(logs.filter((l) => l.type === 'warning')).toHaveLength(1);
 
     await destroy();
   });

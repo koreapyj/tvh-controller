@@ -34,6 +34,7 @@ import {
   conflictsByInstance,
   driftItems,
   epgTick,
+  eventLogTick,
   instances,
   recordingsTick,
   sseConnected,
@@ -106,5 +107,11 @@ export function connectSse(): void {
 
   source.addEventListener('restreamer-channel', (e) => {
     applyRestreamChannel(JSON.parse(e.data) as RestreamChannelWithStatus);
+  });
+
+  // payload discarded — 'event-log' is only an invalidation signal, keeps filtering
+  // 100% server-side (see EventLog.eventLog()'s eventLogTick usage)
+  source.addEventListener('event-log', () => {
+    eventLogTick.update((n) => n + 1);
   });
 }

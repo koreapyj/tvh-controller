@@ -133,6 +133,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     overlapThreshold: 0.7,
     autoUpload: { enabled: false, graceSeconds: 120 },
     restreamer: { switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'http://sw.example' }] },
+    eventLogRetentionDays: 30,
     ...overrides,
   };
 }

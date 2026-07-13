@@ -30,6 +30,7 @@ import type {
 } from '@tvhc/shared';
 import { chanLabel, chanNumberOrder } from '@tvhc/shared';
 import type { Db } from '../db/db.js';
+import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { InstancePoller } from '../tvh/poller.js';
@@ -87,12 +88,33 @@ export class SyncEngine {
    * forms directly so a wrapped operation never waits on itself.
    */
   private opChain: Promise<unknown> = Promise.resolve();
+  /**
+   * site #9 (drift appeared/cleared): previous publishDrift() pass, keyed by
+   * DriftItem.id. Items of instances SKIPPED in a pass (cache not loaded yet,
+   * topology fetch failed) are carried forward, never treated as cleared.
+   */
+  private lastDriftItems = new Map<string, DriftItem>();
+  /**
+   * Per-instance baseline guard (site #9): an instance's drift only logs once
+   * that instance has completed a previous evaluated pass. A global first-call
+   * guard is not enough — instances load their caches at different times, so
+   * the first pass after a controller restart routinely misses some of them
+   * and their pre-existing drift would re-log as "appeared".
+   */
+  private readonly driftSeenInstances = new Set<string>();
+  /**
+   * site #10 (rule push error/blocked): last known problem state per
+   * (ruleId, instanceId), so pushAll/batchPush retrying the same still-broken
+   * rule doesn't re-log a warning every cycle. See logRulePushTransition.
+   */
+  private readonly rulePushProblem = new Map<string, boolean>();
 
   constructor(
     private readonly db: Db,
     private readonly cache: InstanceCache,
     private readonly pollers: Map<string, InstancePoller>,
     private readonly bus: EventBus,
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {}
 
   private serialize<T>(fn: () => Promise<T>): Promise<T> {
@@ -754,7 +776,44 @@ export class SyncEngine {
     );
   }
 
+  /**
+   * Thin wrapper adding site #10 event-log instrumentation around the actual
+   * push logic (pushRuleToInstanceInner) — a single choke point avoids
+   * annotating every one of that method's many return points individually.
+   */
   private async pushRuleToInstance(rule: ResolvedRule, instanceId: string): Promise<PushResult> {
+    const result = await this.pushRuleToInstanceInner(rule, instanceId);
+    this.logRulePushTransition(rule, instanceId, result);
+    return result;
+  }
+
+  /**
+   * Site #10 (rule push error/blocked): a system failure — logged regardless
+   * of what triggered the push (manual button, reconcile follow-up, etc.).
+   * Transition-guarded per (ruleId, instanceId), mirroring site #7/#11, so
+   * pushAll/batchPush repeatedly retrying the same still-broken rule across
+   * many calls (e.g. the operator mashing "push all") doesn't re-log a
+   * warning every time — only the state CHANGE is logged. There is no
+   * periodic automatic retry loop for rule pushes (pushAll/pushRule are only
+   * ever reached via explicit routes), so this guard is a defensive
+   * belt-and-braces measure rather than a response to an observed spam path.
+   */
+  private logRulePushTransition(rule: ResolvedRule, instanceId: string, result: PushResult): void {
+    const key = `${rule.id}:${instanceId}`;
+    const isProblem = result.action === 'error' || result.action === 'blocked';
+    const wasProblem = this.rulePushProblem.get(key) ?? false;
+    if (isProblem && !wasProblem) {
+      this.events.log({
+        type: 'warning',
+        service: 'rules',
+        source: `instance.${instanceId}`,
+        message: `push of rule "${rule.name}" to ${instanceId} ${result.action}: ${result.detail ?? 'unknown reason'}`,
+      });
+    }
+    this.rulePushProblem.set(key, isProblem);
+  }
+
+  private async pushRuleToInstanceInner(rule: ResolvedRule, instanceId: string): Promise<PushResult> {
     const base: Omit<PushResult, 'action'> = { masterRuleId: rule.id, instanceId };
     try {
       if (this.cache.has(instanceId) && !this.cache.hasTvh(instanceId)) {
@@ -842,7 +901,13 @@ export class SyncEngine {
   // ---------- drift ----------
 
   async computeDrift(): Promise<DriftItem[]> {
+    return (await this.computeDriftWithScope()).items;
+  }
+
+  /** as computeDrift(), but also reports WHICH instances the pass evaluated (vs skipped) */
+  private async computeDriftWithScope(): Promise<{ items: DriftItem[]; evaluated: Set<string> }> {
     const items: DriftItem[] = [];
+    const evaluated = new Set<string>();
     const rules = await this.listResolved();
     const rulesById = new Map(rules.map((r) => [r.id, r]));
     const bindings = (await this.db
@@ -857,13 +922,17 @@ export class SyncEngine {
 
     for (const instanceId of this.cache.ids()) {
       const snap = this.cache.get(instanceId);
-      if (!snap.summary.reachable && snap.autorecs.length === 0) continue;
+      // a reachable instance whose autorec grid was never polled would
+      // otherwise read as "zero rules" and report every binding as false
+      // deleted-on-instance drift
+      if (!snap.autorecsLoaded) continue;
       let maps: NameMaps;
       try {
         maps = await this.ensureTopology(instanceId);
       } catch {
         continue;
       }
+      evaluated.add(instanceId);
       const instanceRules = new Map(snap.autorecs.map((r) => [r.uuid, r]));
       const boundUuids = new Set<string>();
 
@@ -925,12 +994,52 @@ export class SyncEngine {
         });
       }
     }
-    return items;
+    return { items, evaluated };
   }
 
   async publishDrift(): Promise<void> {
-    const items = await this.computeDrift();
+    const { items, evaluated } = await this.computeDriftWithScope();
     this.bus.publish({ type: 'drift', data: { items } });
+    this.logDriftTransitions(items, evaluated);
+  }
+
+  /**
+   * Site #9 (drift appeared/cleared): set-diff of item ids against the
+   * previous pass, baseline-guarded PER INSTANCE. An instance's items only
+   * log "appeared" once that instance completed an earlier evaluated pass
+   * (drift standing before the controller started must not re-log on every
+   * restart), and items of an instance skipped this pass are carried forward
+   * instead of logging a false "cleared".
+   */
+  private logDriftTransitions(items: DriftItem[], evaluated: Set<string>): void {
+    const current = new Map(items.map((i) => [i.id, i]));
+    for (const [id, item] of this.lastDriftItems) {
+      if (!evaluated.has(item.instanceId)) current.set(id, item);
+    }
+    const label = (item: DriftItem): string =>
+      `${item.kind} — ${item.masterRuleName ?? item.instanceRuleName ?? item.tvhUuid ?? item.id} on ${item.instanceId}`;
+    for (const [id, item] of current) {
+      if (!this.lastDriftItems.has(id) && this.driftSeenInstances.has(item.instanceId)) {
+        this.events.log({
+          type: 'warning',
+          service: 'drift',
+          source: `instance.${item.instanceId}`,
+          message: `drift appeared: ${label(item)}`,
+        });
+      }
+    }
+    for (const [id, item] of this.lastDriftItems) {
+      if (!current.has(id)) {
+        this.events.log({
+          type: 'normal',
+          service: 'drift',
+          source: `instance.${item.instanceId}`,
+          message: `drift cleared: ${label(item)}`,
+        });
+      }
+    }
+    this.lastDriftItems = current;
+    for (const id of evaluated) this.driftSeenInstances.add(id);
   }
 
   // ---------- manual integrity check ----------

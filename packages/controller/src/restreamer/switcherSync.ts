@@ -39,6 +39,7 @@ import type {
 } from '@tvhc/shared';
 import type { AppConfig, RestreamerNodeConfig } from '../config.js';
 import type { Db } from '../db/db.js';
+import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { SwitcherClient } from './client.js';
@@ -90,6 +91,15 @@ function now(): string {
 }
 
 export class SwitcherSync {
+  /**
+   * Site #11 (switcher push failed/healed) transition state, keyed by
+   * switcherId. NOT read from cache.switchers.get(id)?.error — the
+   * SwitcherPoller overwrites that field every tick with its own reachability
+   * error, independent of push outcomes, so reading it here would spam or
+   * suppress the transition log depending on unrelated poll timing.
+   */
+  private readonly pushProblems = new Map<string, string | null>();
+
   constructor(
     private readonly db: Db,
     private readonly cache: InstanceCache,
@@ -97,6 +107,7 @@ export class SwitcherSync {
     private readonly config: AppConfig,
     /** keyed by switcherId */
     private readonly clients: Map<string, SwitcherNodeClient>,
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {}
 
   private nodeConfig(instanceId: string, nodeId: string): RestreamerNodeConfig | null {
@@ -258,6 +269,10 @@ export class SwitcherSync {
     force = false,
     precomputed?: ComputedSwitcherDoc,
   ): Promise<SwitcherPushResult> {
+    // site #11: switcher push failed/healed — read the dedicated
+    // pushProblems entry BEFORE this attempt overwrites it, mirroring
+    // pushNodeInner (site #7)
+    const prevError = this.pushProblems.get(switcherId) ?? null;
     try {
       const { doc, blocked } = precomputed ?? (await this.computeDoc());
       const state = await this.state(switcherId);
@@ -272,6 +287,9 @@ export class SwitcherSync {
       }
       const client = this.clients.get(switcherId);
       if (!client) {
+        this.updateStatus(switcherId, { pendingPush: true, error: 'no client configured for switcher' });
+        this.pushProblems.set(switcherId, 'no client configured for switcher');
+        this.logSwitcherPushTransition(switcherId, prevError, 'no client configured for switcher');
         return { switcherId, action: 'error', detail: 'no client configured for switcher', blocked };
       }
       await client.putDesired(doc);
@@ -280,14 +298,37 @@ export class SwitcherSync {
         .values({ switcher_id: switcherId, pushed_hash: doc.revision, pushed_at: now() })
         .onDuplicateKeyUpdate({ pushed_hash: doc.revision, pushed_at: now() })
         .execute();
-      this.updateStatus(switcherId, { pendingPush: false });
+      this.updateStatus(switcherId, { pendingPush: false, error: null });
+      this.pushProblems.set(switcherId, null);
+      this.logSwitcherPushTransition(switcherId, prevError, null);
       return { switcherId, action: 'pushed', blocked };
     } catch (err) {
       // failed push: the stored hash stays, the switcher stays pending — the
       // 60s sweep (or the poller's revision-mismatch trigger) heals it later
       const detail = err instanceof Error ? err.message : String(err);
       this.updateStatus(switcherId, { pendingPush: true, error: detail });
+      this.pushProblems.set(switcherId, detail);
+      this.logSwitcherPushTransition(switcherId, prevError, detail);
       return { switcherId, action: 'error', detail, blocked: [] };
+    }
+  }
+
+  /**
+   * Site #11 (switcher push failed/healed): logs only on the null<->non-null
+   * transition, mirroring site #7 — a still-failing switcher retried by the
+   * 60s sweep must not spam a new warning every cycle.
+   */
+  private logSwitcherPushTransition(
+    switcherId: string,
+    prevError: string | null,
+    newError: string | null,
+  ): void {
+    if ((prevError === null) === (newError === null)) return;
+    const source = `switcher.${switcherId}`;
+    if (newError !== null) {
+      this.events.log({ type: 'warning', service: 'restreamer', source, message: `push to ${source} failed: ${newError}` });
+    } else {
+      this.events.log({ type: 'normal', service: 'restreamer', source, message: `push to ${source} recovered` });
     }
   }
 
@@ -412,13 +453,28 @@ export class SwitcherSync {
     for (const move of moves) {
       const channelId = channelIdBySlug.get(move.slug);
       if (!channelId) continue;
+      // site #11: rebalance move queued/failed — controller-automatic, so
+      // always logged (never a user-initiated action)
+      const source = `switcher.${switcherBySlug.get(move.slug) ?? 'unknown'}`;
       try {
         await requestMove(channelId, move.toPlacementId, move.slug);
         console.log(
           `restreamer: rebalance queued "${move.slug}" → placement ${move.toPlacementId} (via failover procedure)`,
         );
+        this.events.log({
+          type: 'normal',
+          service: 'restreamer',
+          source,
+          message: `rebalance queued "${move.slug}" → placement ${move.toPlacementId}`,
+        });
       } catch (err) {
         console.error(`restreamer: rebalance move of "${move.slug}" failed:`, err);
+        this.events.log({
+          type: 'warning',
+          service: 'restreamer',
+          source,
+          message: `rebalance move of "${move.slug}" failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
       }
     }
   }

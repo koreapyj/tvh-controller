@@ -212,6 +212,17 @@ export interface RestreamSwitcherStateTable {
   pushed_at: ColumnType<Date, string, string>;
 }
 
+/** persisted history row: failovers, outages, drift, failed pushes etc */
+export interface EventLogTable {
+  id: Generated<number>;
+  /** 'normal' | 'warning' */
+  type: string;
+  service: string;
+  source: string;
+  message: string;
+  created_at: ColumnType<Date, string, never>;
+}
+
 export interface Database {
   master_rules: MasterRulesTable;
   rule_bindings: RuleBindingsTable;
@@ -226,4 +237,5 @@ export interface Database {
   restream_playlists: RestreamPlaylistsTable;
   restream_playlist_members: RestreamPlaylistMembersTable;
   restream_switcher_state: RestreamSwitcherStateTable;
+  event_log: EventLogTable;
 }

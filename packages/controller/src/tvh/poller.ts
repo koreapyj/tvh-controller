@@ -25,11 +25,24 @@ import type {
   TvhSubscription,
 } from '@tvhc/shared';
 import type { InstanceConfig, AppConfig } from '../config.js';
+import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache, TopologySnapshot } from '../state/instanceCache.js';
 import { RcloneRcClient } from '../uploads/rcloneRc.js';
 import { TvhClient } from './client.js';
 import { CometClient, type CometNotification } from './comet.js';
+import { classifyLogMessage, isNoisySubsystem, parseLogMessage } from './logMessage.js';
+
+/** site #2 (tvheadend log ingestion) rate limit: a bad mux can spew continuity
+ * errors at 10+/sec — cap at LOG_RATE_LIMIT logged events per LOG_RATE_WINDOW_MS,
+ * counting (not logging) the drops, then emitting one suppression summary. */
+const LOG_RATE_LIMIT = 20;
+const LOG_RATE_WINDOW_MS = 60_000;
+
+/** site #3 (recording failed) pure diff helper — exported for direct testing */
+export function diffNewFailures(prevUuids: ReadonlySet<string>, failed: TvhDvrEntry[]): TvhDvrEntry[] {
+  return failed.filter((e) => !prevUuids.has(e.uuid));
+}
 
 function dvrChanged(prev: TvhDvrEntry[], next: TvhDvrEntry[]): boolean {
   if (prev.length !== next.length) return true;
@@ -81,6 +94,16 @@ export class InstancePoller {
   onCapacityInputsChanged: (() => void) | null = null;
   onAutorecsChanged: (() => void) | null = null;
 
+  // ---- site #3 (recording failed) diff state ----
+  private failedUuids = new Set<string>();
+  /** first-poll baseline guard (site 3): seeds failedUuids without logging on the first pass */
+  private failedBaselineSeeded = false;
+
+  // ---- site #2 (tvheadend log ingestion) rate-limit state ----
+  private logRateCount = 0;
+  private logRateWindowStart = 0;
+  private logRateDropped = 0;
+
   private readonly rclone: RcloneRcClient | null;
   /** narrowed tvheadend base URL (a tvh-less `url: null` instance never gets a poller) */
   private readonly tvhUrl: string;
@@ -90,6 +113,7 @@ export class InstancePoller {
     private readonly cache: InstanceCache,
     private readonly bus: EventBus,
     private readonly intervals: AppConfig['pollIntervals'],
+    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {
     if (instance.url === null) {
       // main.ts never constructs a poller for a tvh-less instance; keep the
@@ -162,7 +186,60 @@ export class InstancePoller {
       this.triggerAutorecPoll();
     } else if (cls === 'epg') {
       this.triggerEpgPoll();
+    } else if (cls === 'logmessage') {
+      this.handleLogMessage(n);
     }
+  }
+
+  // ---------- site #2: tvheadend log ingestion ----------
+
+  /**
+   * tvheadend's own `logmessage` comet notification, ingested as event-log
+   * entries. Carries only `{ notificationClass: 'logmessage', logtxt }` — no
+   * severity metadata reaches the client (tvheadend pre-filters to INFO+
+   * before pushing), so type is inferred from an error-keyword match.
+   */
+  private handleLogMessage(n: CometNotification): void {
+    const logtxt = (n as { logtxt?: unknown }).logtxt;
+    if (typeof logtxt !== 'string') return;
+    const { subsystem, message } = parseLogMessage(logtxt);
+    if (isNoisySubsystem(subsystem)) return;
+    if (!this.allowLogEvent()) return;
+    this.events.log({
+      type: classifyLogMessage(message),
+      service: 'tvheadend',
+      source: `instance.${this.instance.id}`,
+      message,
+    });
+  }
+
+  /**
+   * Fixed-window rate limit for site #2: at most LOG_RATE_LIMIT events logged
+   * per LOG_RATE_WINDOW_MS. While capped, drops are only counted; when the
+   * window next rolls over (on the following log line, if any) with drops>0,
+   * one summary warning is emitted and the window resets.
+   */
+  private allowLogEvent(): boolean {
+    const nowMs = Date.now();
+    if (nowMs - this.logRateWindowStart >= LOG_RATE_WINDOW_MS) {
+      if (this.logRateDropped > 0) {
+        this.events.log({
+          type: 'warning',
+          service: 'tvheadend',
+          source: `instance.${this.instance.id}`,
+          message: `suppressed ${this.logRateDropped} tvheadend log lines (rate limit)`,
+        });
+      }
+      this.logRateWindowStart = nowMs;
+      this.logRateCount = 0;
+      this.logRateDropped = 0;
+    }
+    if (this.logRateCount >= LOG_RATE_LIMIT) {
+      this.logRateDropped++;
+      return false;
+    }
+    this.logRateCount++;
+    return true;
   }
 
   /** input_status fires once per second per active input with a full entry */
@@ -266,16 +343,42 @@ export class InstancePoller {
   private markReachable(error: string | null): void {
     const snap = this.cache.get(this.instance.id);
     const wasReachable = snap.summary.reachable;
+    // first observation is baseline, not a transition — otherwise every
+    // controller restart logs a "reachable again" row per instance
+    const firstObservation = snap.summary.lastPollAt === null;
     snap.summary.reachable = error === null;
     snap.summary.error = error;
     snap.summary.lastPollAt = new Date().toISOString();
     if (wasReachable !== snap.summary.reachable) {
       this.bus.publish({ type: 'instance-status', data: { ...snap.summary } });
+      // site #1: tvh instance up/down — transition-based (wasReachable already tracked)
+      if (!firstObservation) {
+        if (snap.summary.reachable) {
+          this.events.log({
+            type: 'normal',
+            service: 'instance',
+            source: `instance.${this.instance.id}`,
+            message: `instance "${this.instance.name}" is reachable again`,
+          });
+        } else {
+          this.events.log({
+            type: 'warning',
+            service: 'instance',
+            source: `instance.${this.instance.id}`,
+            message: `instance "${this.instance.name}" is unreachable: ${error}`,
+          });
+        }
+      }
     }
   }
 
   async pollDvrAndStatus(): Promise<void> {
     const snap = this.cache.get(this.instance.id);
+    // captured before dvrLoaded is assigned below — an initial empty grid
+    // never registers as "changed", so without this the conflict baseline in
+    // capacity/service.ts would otherwise seed from the NEXT change, silently
+    // swallowing the first genuine conflict as if it were the baseline
+    const firstDvrLoad = !snap.dvrLoaded;
     const [upcoming, finished, failed, inputs, subscriptions] = await Promise.all([
       this.client.dvrUpcoming(),
       this.client.dvrFinished(),
@@ -298,6 +401,27 @@ export class InstancePoller {
     if (dvrChanged(snap.finished, finished)) changed.push('finished');
     if (dvrChanged(snap.failed, failed)) changed.push('failed');
 
+    // site #3: recording failed — diff the failed grid by uuid; first-poll
+    // baseline guard (see failedBaselineSeeded) skips logging pre-existing
+    // failures on controller restart
+    const newFailures = diffNewFailures(this.failedUuids, failed);
+    if (this.failedBaselineSeeded) {
+      for (const f of newFailures) {
+        const title = f.disp_title ?? f.channelname ?? f.uuid;
+        const errCount = f.errors ?? f.data_errors;
+        this.events.log({
+          type: 'warning',
+          service: 'recordings',
+          source: `instance.${this.instance.id}`,
+          message: `recording failed: "${title}"${f.channelname ? ` on ${f.channelname}` : ''}${
+            errCount ? ` (errors=${errCount})` : ''
+          }`,
+        });
+      }
+    }
+    this.failedUuids = new Set(failed.map((e) => e.uuid));
+    this.failedBaselineSeeded = true;
+
     const statusKey = JSON.stringify([inputs, subscriptions]);
     const statusChanged = statusKey !== this.lastStatusKey;
     this.lastStatusKey = statusKey;
@@ -308,6 +432,7 @@ export class InstancePoller {
     snap.failed = failed;
     snap.inputs = inputs;
     snap.subscriptions = subscriptions;
+    snap.dvrLoaded = true;
 
     for (const state of changed) {
       this.bus.publish({ type: 'recordings', data: { instanceId: this.instance.id, state } });
@@ -318,7 +443,7 @@ export class InstancePoller {
         data: { instanceId: this.instance.id, inputs, subscriptions },
       });
     }
-    if (upcomingChanged) this.onCapacityInputsChanged?.();
+    if (upcomingChanged || firstDvrLoad) this.onCapacityInputsChanged?.();
   }
 
   async pollAutorecs(): Promise<void> {
@@ -326,6 +451,7 @@ export class InstancePoller {
     const autorecs = await this.client.autorecGrid();
     const prevKey = JSON.stringify(snap.autorecs);
     snap.autorecs = autorecs;
+    snap.autorecsLoaded = true;
     if (prevKey !== JSON.stringify(autorecs)) {
       this.onAutorecsChanged?.();
     }

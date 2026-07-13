@@ -70,7 +70,9 @@ export function fakePoller(cache: InstanceCache, instanceId: string, client: Fak
     client,
     pollTopology: vi.fn(async () => {}),
     pollAutorecs: vi.fn(async () => {
-      cache.get(instanceId).autorecs = await client.autorecGrid();
+      const snap = cache.get(instanceId);
+      snap.autorecs = await client.autorecGrid();
+      snap.autorecsLoaded = true;
     }),
   };
 }

@@ -104,6 +104,13 @@ function segmentResponse(opts: { bytes?: number; delayMs?: number; status?: numb
   return new Response(body, { status });
 }
 
+interface LoggedEvent {
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
+}
+
 interface Setup {
   engine: ProbeEngine;
   calls: string[];
@@ -114,6 +121,7 @@ interface Setup {
   /** one engine round, then advance the injected clock 10s so the next round is due */
   tick: () => Promise<void>;
   changes: string[];
+  logs: LoggedEvent[];
 }
 
 function setup(): Setup {
@@ -122,12 +130,14 @@ function setup(): Setup {
   let settings = new Map<string, NodeProbeSettings>();
   let now = new Date('2026-01-01T00:00:00.000Z');
   const changes: string[] = [];
+  const logs: LoggedEvent[] = [];
   const engine = new ProbeEngine(
     async () => targets,
     async () => settings,
     (channelId) => changes.push(channelId),
     fetchImpl,
     () => now,
+    { log: (e) => logs.push(e) },
   );
   return {
     engine,
@@ -147,6 +157,7 @@ function setup(): Setup {
       now = new Date(now.getTime() + 10_000);
     },
     changes,
+    logs,
   };
 }
 
@@ -477,5 +488,64 @@ describe('ProbeEngine: per-target period gating and pruning', () => {
     await s.tick();
     expect(s.engine.nodeProbeStatus('z1', 'n1')).toBeNull();
     expect(s.engine.lagStatus('plc1')).toBeNull();
+  });
+});
+
+// ---------- event-log emission (site #5) ----------
+
+describe('ProbeEngine: event-log emission (site #5)', () => {
+  it('liveness: warns on trip, stays silent on repeated still-failing ticks, normal on clear', async () => {
+    const s = setup();
+    s.setTargets({ nodes: [nodeTarget('z1', 'n1', 'http://node1', ['ch1'])], placements: [] });
+    s.setSettings(new Map([[nk('z1', 'n1'), cfg()]]));
+
+    s.set(PLAYLIST_URL, () => new Response('boom', { status: 500 }));
+    await s.tick(); // trip
+    expect(s.logs).toHaveLength(1);
+    expect(s.logs[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'node.z1.n1' });
+    expect(s.logs[0]!.message).toMatch(/liveness probe tripped/);
+
+    await s.tick(); // still failing — must not repeat the warning
+    expect(s.logs).toHaveLength(1);
+
+    s.set(PLAYLIST_URL, () => new Response('#EXTM3U\n', { status: 200 }));
+    await s.tick(); // clear
+    expect(s.logs).toHaveLength(2);
+    expect(s.logs[1]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'node.z1.n1' });
+    expect(s.logs[1]!.message).toMatch(/liveness probe cleared/);
+  });
+
+  it('lag: trip/clear messages include the channel slug (channel-level probe)', async () => {
+    const s = setup();
+    s.setTargets({
+      nodes: [],
+      placements: [placementTarget('chan1', 'plc1', 'z1', 'n1', 'ch1', PLAYLIST_URL)],
+    });
+    s.setSettings(
+      new Map([
+        [
+          nk('z1', 'n1'),
+          cfg({ lag: { timeoutSeconds: 3, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 } }),
+        ],
+      ]),
+    );
+
+    const t0 = new Date('2026-01-01T00:00:10.000Z');
+    s.setNow(t0);
+    const failPdt = new Date(t0.getTime() - 5000).toISOString(); // 5s lag > 3s threshold
+    s.set(PLAYLIST_URL, () => new Response(mediaPlaylist([{ uri: 'seg1.ts', durationSec: 0, pdtIso: failPdt }])));
+    await s.tick(); // trip
+    expect(s.logs).toHaveLength(1);
+    expect(s.logs[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'node.z1.n1' });
+    expect(s.logs[0]!.message).toContain('"ch1"');
+
+    const t1 = new Date(t0.getTime() + 20_000);
+    s.setNow(t1);
+    const clearPdt = new Date(t1.getTime() - 1000).toISOString(); // 1s lag < 3s threshold
+    s.set(PLAYLIST_URL, () => new Response(mediaPlaylist([{ uri: 'seg1.ts', durationSec: 0, pdtIso: clearPdt }])));
+    await s.tick(); // clear
+    expect(s.logs).toHaveLength(2);
+    expect(s.logs[1]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'node.z1.n1' });
+    expect(s.logs[1]!.message).toContain('"ch1"');
   });
 });

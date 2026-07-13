@@ -21,6 +21,7 @@ import type { Db } from '../db/db.js';
 import type { RestreamerClient, SwitcherClient } from '../restreamer/client.js';
 import type { RestreamerPoller, SwitcherPoller } from '../restreamer/poller.js';
 import type { RestreamerService } from '../restreamer/service.js';
+import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
 import type { SyncEngine } from '../sync/engine.js';
@@ -36,6 +37,7 @@ export interface AppContext {
   db: Db | null;
   cache: InstanceCache;
   bus: EventBus;
+  eventLog: EventLog;
   pollers: Map<string, InstancePoller>;
   /** one authenticated HTTP client per configured tvheadend instance (logo proxy) */
   tvhHttp: Map<string, TvhClient>;

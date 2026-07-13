@@ -35,7 +35,9 @@ import { registerUploadRoutes } from './routes/uploads.js';
 import { RestreamerClient, SwitcherClient } from './restreamer/client.js';
 import { RestreamerPoller, SwitcherPoller } from './restreamer/poller.js';
 import { RestreamerService, nodeKey } from './restreamer/service.js';
+import { registerEventLogRoutes } from './routes/eventLog.js';
 import type { AppContext } from './routes/context.js';
+import { EventLog } from './state/eventLog.js';
 import { EventBus } from './state/events.js';
 import { InstanceCache } from './state/instanceCache.js';
 import { SyncEngine } from './sync/engine.js';
@@ -63,7 +65,8 @@ async function main(): Promise<void> {
 
   const cache = new InstanceCache();
   const bus = new EventBus();
-  const conflicts = new ConflictService(cache, bus);
+  const eventLog = new EventLog(db, bus);
+  const conflicts = new ConflictService(cache, bus, eventLog);
   const pollers = new Map<string, InstancePoller>();
 
   for (const inst of config.instances) {
@@ -71,7 +74,7 @@ async function main(): Promise<void> {
     // — but NO tvheadend machinery: no poller, no comet, no conflict recompute
     cache.init(inst.id, inst.name, inst.url, inst.serverOffsetMinutes ?? null);
     if (inst.url === null) continue;
-    const poller = new InstancePoller(inst, cache, bus, config.pollIntervals);
+    const poller = new InstancePoller(inst, cache, bus, config.pollIntervals, eventLog);
     poller.onCapacityInputsChanged = () => conflicts.recompute(inst.id);
     pollers.set(inst.id, poller);
   }
@@ -84,7 +87,7 @@ async function main(): Promise<void> {
     tvhHttp.set(inst.id, new TvhClient(inst.url, inst.username, inst.password));
   }
 
-  const sync = db ? new SyncEngine(db, cache, pollers, bus) : null;
+  const sync = db ? new SyncEngine(db, cache, pollers, bus, eventLog) : null;
   if (sync) {
     for (const [, poller] of pollers) {
       poller.onAutorecsChanged = () =>
@@ -106,7 +109,7 @@ async function main(): Promise<void> {
   }
 
   const restreamer = db
-    ? new RestreamerService(db, cache, pollers, bus, config, restreamerClients, switcherClients)
+    ? new RestreamerService(db, cache, pollers, bus, config, restreamerClients, switcherClients, eventLog)
     : null;
   if (restreamer) {
     // chain into the topology-change callback set above (fires after every
@@ -160,6 +163,7 @@ async function main(): Promise<void> {
           bus,
           config.pollIntervals.restreamer,
           restreamerHooks,
+          eventLog,
         ),
       );
     }
@@ -174,11 +178,12 @@ async function main(): Promise<void> {
         bus,
         config.pollIntervals.restreamer,
         switcherHooks,
+        eventLog,
       ),
   );
 
   const ledger = db ? new UploadLedger(db, config.overlapThreshold) : null;
-  const dispatcher = ledger ? new UploadDispatcher(config, ledger, bus) : null;
+  const dispatcher = ledger ? new UploadDispatcher(config, ledger, bus, eventLog) : null;
   const autoUploader =
     ledger && dispatcher && config.autoUpload.enabled
       ? new AutoUploader(config, cache, ledger, dispatcher, bus)
@@ -189,6 +194,7 @@ async function main(): Promise<void> {
     db,
     cache,
     bus,
+    eventLog,
     pollers,
     tvhHttp,
     sync,
@@ -212,6 +218,7 @@ async function main(): Promise<void> {
   registerUploadRoutes(app, ctx);
   registerRestreamerRoutes(app, ctx);
   registerEventRoutes(app, ctx);
+  registerEventLogRoutes(app, ctx);
   app.get('/healthz', async () => ({ ok: true }));
 
   // serve the built SPA when present (single container, no CORS)
@@ -249,6 +256,7 @@ async function main(): Promise<void> {
   restreamer?.startFailover();
   if (dispatcher) await dispatcher.resume();
   autoUploader?.start();
+  eventLog.startRetention(config.eventLogRetentionDays);
 
   let closing = false;
   const close = async (): Promise<void> => {
@@ -257,6 +265,7 @@ async function main(): Promise<void> {
     // failsafe: a hung app.close()/db.destroy() must not block SIGTERM forever
     setTimeout(() => process.exit(1), 10_000).unref();
     try {
+      eventLog.stopRetention();
       autoUploader?.stop();
       for (const [, poller] of pollers) poller.stop();
       for (const poller of restreamerPollers) poller.stop();
@@ -282,6 +291,9 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void close());
 
   await app.listen({ port: config.port, host: '0.0.0.0' });
+  // single explicit restart marker, replacing the per-component boot noise
+  // that site #1/#6 baseline guards now suppress (log() no-ops without a db)
+  eventLog.log({ type: 'normal', service: 'controller', source: 'controller', message: 'controller started' });
 }
 
 main().catch((err) => {

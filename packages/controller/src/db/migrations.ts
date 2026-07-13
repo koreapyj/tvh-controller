@@ -553,6 +553,50 @@ migrations['015_drop_underrun'] = {
   },
 };
 
+migrations['016_event_log'] = {
+  // persisted history of failovers/outages/drift/failed pushes etc, normally
+  // only visible as live SSE state or scattered console.error lines. First
+  // integer-PK table in the codebase (everything else is uuid varchar(36)):
+  // deliberate, since a monotonic id is the same-second ordering tiebreaker
+  // for bursts of events landing in the same wall-clock second.
+  async up(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .createTable('event_log')
+      .addColumn('id', 'integer', (c) => c.primaryKey().autoIncrement())
+      .addColumn('type', 'varchar(16)', (c) => c.notNull())
+      .addColumn('service', 'varchar(64)', (c) => c.notNull())
+      .addColumn('source', 'varchar(128)', (c) => c.notNull())
+      .addColumn('message', 'text', (c) => c.notNull())
+      .addColumn('created_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .execute();
+
+    // every filterable/sortable column is index-backed
+    await db.schema
+      .createIndex('idx_event_log_created_at')
+      .on('event_log')
+      .column('created_at')
+      .execute();
+    await db.schema
+      .createIndex('idx_event_log_service_created_at')
+      .on('event_log')
+      .columns(['service', 'created_at'])
+      .execute();
+    await db.schema
+      .createIndex('idx_event_log_source_created_at')
+      .on('event_log')
+      .columns(['source', 'created_at'])
+      .execute();
+    await db.schema
+      .createIndex('idx_event_log_type_created_at')
+      .on('event_log')
+      .columns(['type', 'created_at'])
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.dropTable('event_log').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

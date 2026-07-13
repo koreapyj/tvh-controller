@@ -159,12 +159,20 @@ function entry(over: Partial<TvhDvrEntry> = {}): TvhDvrEntry {
   } as TvhDvrEntry;
 }
 
-function makeDispatcher(ledger: FakeLedger) {
+interface LoggedEvent {
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
+}
+
+function makeDispatcher(ledger: FakeLedger, logs?: LoggedEvent[]) {
   const cfg = {
     instances: [{ id: 'tyo1', rclone: { rcUrl: 'http://x' } }],
     rclone: { remote: 'gdrive:arc' },
   } as never;
-  const dispatcher = new UploadDispatcher(cfg, ledger as never, new EventBus());
+  const events = logs ? { log: (e: LoggedEvent) => logs.push(e) } : undefined;
+  const dispatcher = new UploadDispatcher(cfg, ledger as never, new EventBus(), events);
   return dispatcher;
 }
 
@@ -328,6 +336,115 @@ describe('UploadDispatcher auto-retry sweep (Part 2b)', () => {
     expect(ledger.jobs.get('t1')!.status).toBe('done');
     // the permanent row was untouched
     expect(ledger.jobs.get('p1')!.status).toBe('failed');
+    await dispatcher.stop(0);
+  });
+});
+
+describe('UploadDispatcher event-log emission (site #12)', () => {
+  /** drives the private publish() choke point directly against a synthetic ledger row */
+  async function publishJob(dispatcher: UploadDispatcher, ledger: FakeLedger, j: Partial<UploadJob>): Promise<void> {
+    const merged = { ...(ledger.jobs.get(j.id as string) ?? {}), ...j } as UploadJob;
+    ledger.jobs.set(merged.id, merged);
+    await (dispatcher as unknown as { publish: (id: string) => Promise<void> }).publish(merged.id);
+  }
+
+  it('logs exactly one warning on the transition into failed, and nothing for repeated progress publishes', async () => {
+    const ledger = new FakeLedger();
+    const logs: LoggedEvent[] = [];
+    const dispatcher = makeDispatcher(ledger, logs);
+
+    await publishJob(dispatcher, ledger, { id: 'u1', instanceId: 'tyo1', title: 'Show', status: 'uploading', progress: 10 });
+    await publishJob(dispatcher, ledger, { id: 'u1', status: 'uploading', progress: 50 }); // progress-only
+    await publishJob(dispatcher, ledger, { id: 'u1', status: 'uploading', progress: 90 }); // progress-only
+    expect(logs).toHaveLength(0);
+
+    await publishJob(dispatcher, ledger, {
+      id: 'u1',
+      status: 'failed',
+      failureKind: 'permanent',
+      error: 'size mismatch',
+    });
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ type: 'warning', service: 'uploads', source: 'instance.tyo1' });
+    expect(logs[0]!.message).toContain('Show');
+    expect(logs[0]!.message).toContain('size mismatch');
+
+    // a duplicate publish while still failed must not re-log
+    await publishJob(dispatcher, ledger, { id: 'u1', status: 'failed', failureKind: 'permanent', error: 'size mismatch' });
+    expect(logs).toHaveLength(1);
+
+    await dispatcher.stop(0);
+  });
+
+  it('logs a normal on done', async () => {
+    const ledger = new FakeLedger();
+    const logs: LoggedEvent[] = [];
+    const dispatcher = makeDispatcher(ledger, logs);
+
+    await publishJob(dispatcher, ledger, { id: 'u2', instanceId: 'tyo1', title: 'Show', status: 'uploading' });
+    await publishJob(dispatcher, ledger, { id: 'u2', status: 'verifying' });
+    await publishJob(dispatcher, ledger, { id: 'u2', status: 'done' });
+
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ type: 'normal', service: 'uploads', source: 'instance.tyo1' });
+    expect(logs[0]!.message).toContain('Show');
+    expect(logs[0]!.message).toMatch(/done/);
+
+    await dispatcher.stop(0);
+  });
+
+  it('logs a normal on auto-retry (failed -> verifying with autoRetries bumped) via the REAL sweepRetries() path, but not on a manual retry (autoRetries unchanged)', async () => {
+    const ledger = new FakeLedger();
+    const logs: LoggedEvent[] = [];
+    const dispatcher = makeDispatcher(ledger, logs);
+    const client = makeClient([]);
+    (dispatcher as unknown as { clients: Map<string, unknown> }).clients.set('tyo1', client);
+
+    await publishJob(dispatcher, ledger, {
+      id: 'u3',
+      instanceId: 'tyo1',
+      title: 'Show',
+      status: 'failed',
+      failureKind: 'transient',
+      error: 'rcd unreachable',
+      autoRetries: 0,
+    });
+    expect(logs).toHaveLength(1); // the initial failure warning
+
+    // manual retry(): status -> verifying, autoRetries untouched — must NOT log
+    await publishJob(dispatcher, ledger, { id: 'u3', status: 'verifying', autoRetries: 0 });
+    expect(logs).toHaveLength(1);
+
+    // fail again with the backoff already elapsed (updatedAt far in the
+    // past) — a retriable row for the REAL sweepRetries() path below
+    await publishJob(dispatcher, ledger, {
+      id: 'u3',
+      instanceId: 'tyo1',
+      localPath: '/rec/show.ts',
+      remotePath: 'gdrive:arc/Show/f.ts',
+      filesize: 100,
+      status: 'failed',
+      failureKind: 'transient',
+      error: 'rcd unreachable',
+      autoRetries: 0,
+      updatedAt: new Date(0).toISOString(),
+    });
+    expect(logs).toHaveLength(2);
+
+    // exercise the production sweep path directly (private-access pattern
+    // already used elsewhere in this file) instead of hand-publishing the
+    // 'verifying' transition — this is the exact path that used to bypass
+    // publish() and so never emitted the site #12 event
+    await (dispatcher as unknown as { sweepRetries: () => Promise<void> }).sweepRetries();
+    await (dispatcher as unknown as { instanceQueues: Map<string, Promise<void>> }).instanceQueues.get(
+      'tyo1',
+    );
+
+    expect(ledger.jobs.get('u3')!.autoRetries).toBe(1);
+    const autoRetryLogs = logs.filter((l) => l.message.includes('auto-retry'));
+    expect(autoRetryLogs).toHaveLength(1);
+    expect(autoRetryLogs[0]).toMatchObject({ type: 'normal', service: 'uploads', source: 'instance.tyo1' });
+
     await dispatcher.stop(0);
   });
 });

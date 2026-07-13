@@ -17,10 +17,14 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import type { TvhDvrEntry } from '@tvhc/shared';
 import { analyze } from '../src/capacity/analyze.js';
 import { checkWindow } from '../src/capacity/matching.js';
 import type { CapacityEntry, CapacityModel } from '../src/capacity/model.js';
 import { overlapWindows } from '../src/capacity/sweep.js';
+import { ConflictService } from '../src/capacity/service.js';
+import { EventBus } from '../src/state/events.js';
+import { InstanceCache, type TopologySnapshot } from '../src/state/instanceCache.js';
 
 function model(opts: {
   channels: Record<string, string[]>; // channel -> muxes
@@ -156,5 +160,111 @@ describe('analyze', () => {
       frontends: [['dvbt'], ['dvbt'], ['dvbt']],
     });
     expect(analyze([entry('a', 'c1', 0, 100), entry('b', 'c2', 0, 100)], threeTuners)).toEqual([]);
+  });
+});
+
+// ---------- ConflictService: event-log emission (site #13) ----------
+
+interface LoggedEvent {
+  type: 'normal' | 'warning';
+  service: string;
+  source: string;
+  message: string;
+}
+
+/** two channels, each on their own mux, both on the single-frontend network — one tuner short of feasible together */
+function oneTunerTopology(): TopologySnapshot {
+  return {
+    channels: [
+      { uuid: 'c1', name: 'Chan1', services: ['s1'] },
+      { uuid: 'c2', name: 'Chan2', services: ['s2'] },
+    ],
+    tags: [],
+    dvrConfigs: [],
+    muxes: [
+      { uuid: 'm1', network_uuid: 'net-dvbt' },
+      { uuid: 'm2', network_uuid: 'net-dvbt' },
+    ],
+    services: [
+      { uuid: 's1', multiplex_uuid: 'm1' },
+      { uuid: 's2', multiplex_uuid: 'm2' },
+    ],
+    networks: [{ uuid: 'net-dvbt', networkname: 'DVB-T' }],
+    hardware: [],
+    frontendNetworks: new Map([['fe0', ['net-dvbt']]]),
+    fetchedAt: Date.now(),
+  };
+}
+
+function dvrEntry(uuid: string, channel: string, start: number, stop: number): TvhDvrEntry {
+  return { uuid, channel, start, stop, disp_title: uuid };
+}
+
+function setupConflicts() {
+  const cache = new InstanceCache();
+  cache.init('i1', 'Instance 1', 'http://tvh1');
+  cache.get('i1').topology = oneTunerTopology();
+  cache.get('i1').dvrLoaded = true;
+  const bus = new EventBus();
+  const logs: LoggedEvent[] = [];
+  const conflicts = new ConflictService(cache, bus, { log: (e) => logs.push(e) });
+  return { cache, bus, logs, conflicts };
+}
+
+describe('ConflictService: capacity conflict appeared/cleared event-log emission (site #13)', () => {
+  it('baseline: nothing logged on the first recompute() even with a pre-existing conflict', () => {
+    const { cache, logs, conflicts } = setupConflicts();
+    cache.get('i1').upcoming = [dvrEntry('a', 'c1', 0, 100), dvrEntry('b', 'c2', 50, 150)];
+
+    conflicts.recompute('i1'); // first pass — baseline guard, must not log
+    expect(cache.get('i1').conflicts.length).toBeGreaterThan(0); // sanity: a conflict genuinely exists
+    expect(logs).toHaveLength(0);
+  });
+
+  it('logs a warning when a new conflict appears after the baseline, and a normal when it clears', () => {
+    const { cache, logs, conflicts } = setupConflicts();
+    cache.get('i1').upcoming = [];
+    conflicts.recompute('i1'); // baseline — no conflicts yet
+    expect(logs).toHaveLength(0);
+
+    cache.get('i1').upcoming = [dvrEntry('a', 'c1', 0, 100), dvrEntry('b', 'c2', 50, 150)];
+    conflicts.recompute('i1'); // conflict window appears
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ type: 'warning', service: 'conflicts', source: 'instance.i1' });
+
+    cache.get('i1').upcoming = []; // the overlap is gone
+    conflicts.recompute('i1');
+    expect(logs).toHaveLength(2);
+    expect(logs[1]).toMatchObject({ type: 'normal', service: 'conflicts', source: 'instance.i1' });
+  });
+
+  it('recompute() with no topology is a no-op (nothing to log, nothing to crash on)', () => {
+    const cache = new InstanceCache();
+    cache.init('i1', 'Instance 1', 'http://tvh1');
+    const bus = new EventBus();
+    const logs: LoggedEvent[] = [];
+    const conflicts = new ConflictService(cache, bus, { log: (e) => logs.push(e) });
+    expect(() => conflicts.recompute('i1')).not.toThrow();
+    expect(logs).toHaveLength(0);
+  });
+
+  it('recompute() before the first DVR poll must not seed the baseline: a standing conflict still suppresses on the first loaded pass', () => {
+    const { cache, logs, conflicts } = setupConflicts();
+    const snap = cache.get('i1');
+    // topology arrived first; DVR grids not polled yet (restart race)
+    snap.dvrLoaded = false;
+    conflicts.recompute('i1'); // must NOT baseline against the empty grids
+    expect(logs).toHaveLength(0);
+
+    snap.upcoming = [dvrEntry('a', 'c1', 0, 100), dvrEntry('b', 'c2', 50, 150)];
+    snap.dvrLoaded = true;
+    conflicts.recompute('i1'); // first loaded pass — pre-existing conflict seeds silently
+    expect(cache.get('i1').conflicts.length).toBeGreaterThan(0);
+    expect(logs).toHaveLength(0);
+
+    snap.upcoming = [];
+    conflicts.recompute('i1'); // and a genuine transition afterwards still logs
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ type: 'normal', service: 'conflicts', source: 'instance.i1' });
   });
 });
