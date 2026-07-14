@@ -255,6 +255,10 @@ export interface RestreamerNodeStatus {
    * [] = known-empty (no catalog configured or an empty file)
    */
   sources: SourceCatalogEntry[] | null;
+  /** the daemon's configured hardware/feature capabilities (e.g. ['qsv','opencl']); null = unreachable / unknown */
+  capabilities: string[] | null;
+  /** pipeline templates the daemon can build (from `/v1/status.templates`); null = unreachable / unknown */
+  templates: { id: string; version: number }[] | null;
 }
 
 /** one switcher's polled status (SSE `restreamer-switcher` events) */

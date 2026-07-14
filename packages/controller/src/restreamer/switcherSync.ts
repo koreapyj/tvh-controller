@@ -241,7 +241,10 @@ export class SwitcherSync {
       const payload = JSON.parse(g.profilePayload) as PipelineParams;
       channels.push({
         slug: g.slug,
-        segmentSeconds: payload.hls?.segmentSeconds ?? 5,
+        segmentSeconds:
+          payload.template === 'arib-hls'
+            ? (payload.hls?.segmentSeconds ?? 5)
+            : (payload.segmentSeconds ?? 5),
         upstreams,
       });
     }

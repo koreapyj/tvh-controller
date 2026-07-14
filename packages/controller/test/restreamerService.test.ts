@@ -9,7 +9,9 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Kysely } from 'kysely';
 import type {
+  AribHlsParams,
   DesiredState,
+  RawArgvParams,
   RestreamProfile,
   SessionStatus,
   SourceCatalogEntry,
@@ -29,6 +31,7 @@ import {
   sessionsHash,
   type RestreamerNodeClient,
 } from '../src/restreamer/service.js';
+import { buildRawArgvParams } from '../src/restreamer/argv/index.js';
 import { createTestDb } from './support/testDb.js';
 import { fakeRestreamerNode, type FakeRestreamerNode } from './support/fakeRestreamerNode.js';
 
@@ -197,6 +200,8 @@ function seedNodeStatusEntry(cache: InstanceCache, instanceId: string, nodeId: s
     sessions,
     sourcesHash: null,
     sources: null,
+    capabilities: null,
+    templates: null,
   });
 }
 
@@ -2438,6 +2443,173 @@ describe('RestreamerService: node push failed/healed event-log emission (site #7
     // the successful push also clears the stale error on the cached status
     expect(h.cache.get('zone1').restreamers.find((r) => r.nodeId === 'n1')!.error).toBeNull();
 
+    await h.destroy();
+  });
+});
+
+// ---------- raw-argv variant gating ----------
+
+/**
+ * Profiles/placements stay semantic ('arib-hls') in the DB and UI throughout.
+ * These tests cover the *rendering* layer only: whether computeNodeDoc emits
+ * the stored semantic pipeline as-is, or pre-renders it into a 'raw-argv' doc
+ * for nodes that have (stickily) advertised support for that template.
+ */
+describe('raw-argv variant gating', () => {
+  it('a node that has never advertised raw-argv gets the semantic arib-hls doc (regression)', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(doc!.sessions[0]!.pipeline).toMatchObject({ template: 'arib-hls' });
+    await h.destroy();
+  });
+
+  it('a raw-argv-capable node gets a pre-rendered raw-argv doc matching buildRawArgvParams', async () => {
+    const h = await setup();
+    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    const pipeline = doc!.sessions[0]!.pipeline as RawArgvParams;
+    expect(pipeline.template).toBe('raw-argv');
+    expect(pipeline.templateVersion).toBe(1);
+    expect(pipeline.segmentSeconds).toBe(5);
+    expect(pipeline.listSize).toBe(120);
+    expect(pipeline.ffmpegArgv.some((a) => a.includes('{OUT_DIR}'))).toBe(true);
+
+    const expected = buildRawArgvParams(p.payload as AribHlsParams);
+    expect(pipeline.ffmpegArgv).toEqual(expected.ffmpegArgv);
+    await h.destroy();
+  });
+
+  it('doc revision for a raw-argv-rendered node is deterministic across repeated computes', async () => {
+    const h = await setup();
+    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const a = await h.service.computeNodeDoc('zone1', 'n1');
+    const b = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(a.doc!.revision).toBe(b.doc!.revision);
+    expect(a.doc!.revision).toBe(sessionsHash(a.doc!.sessions));
+    await h.destroy();
+  });
+
+  it('mixed fleet: only the raw-argv-capable node gets rendered argv; the other stays semantic and both push cleanly', async () => {
+    const h = await setup();
+    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone1', nodeId: 'n2' },
+      ],
+    });
+    const n1 = h.nodes.get('zone1/n1')!;
+    const n2 = h.nodes.get('zone1/n2')!;
+    expect(n1.desired!.sessions[0]!.pipeline).toMatchObject({ template: 'raw-argv' });
+    expect(n2.desired!.sessions[0]!.pipeline).toMatchObject({ template: 'arib-hls' });
+
+    const pushed1 = await h.service.pushNode('zone1', 'n1', true);
+    const pushed2 = await h.service.pushNode('zone1', 'n2', true);
+    expect(pushed1.action).toBe('pushed');
+    expect(pushed2.action).toBe('pushed');
+    await h.destroy();
+  });
+
+  it('the flag is sticky: a later poll without raw-argv in the template list does not clear it', async () => {
+    const h = await setup();
+    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
+    // simulate a subsequent poll of a daemon that (for whatever reason) no
+    // longer lists raw-argv — the flag must NOT be cleared by this
+    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'arib-hls', version: 1 }]);
+    const row = await nodeStateRow(h.db, 'zone1', 'n1');
+    expect(row!.advertised_raw_argv).toBe(1);
+
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(doc!.sessions[0]!.pipeline).toMatchObject({ template: 'raw-argv' });
+    await h.destroy();
+  });
+
+  it('persistAdvertisedRawArgv upserts a fresh row when the node has never been pushed', async () => {
+    const h = await setup();
+    expect(await nodeStateRow(h.db, 'zone1', 'n2')).toBeUndefined();
+    await h.service.persistAdvertisedRawArgv('zone1', 'n2', [{ id: 'raw-argv', version: 1 }]);
+    const row = await nodeStateRow(h.db, 'zone1', 'n2');
+    expect(row).toMatchObject({ advertised_raw_argv: 1, pushed_hash: '' });
+
+    // the '' placeholder can never equal a real sha256 doc revision, so the
+    // first genuine push after this must proceed as an ordinary push
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n2' }],
+    });
+    const n2 = h.nodes.get('zone1/n2')!;
+    expect(n2.puts()).toHaveLength(1);
+    await h.destroy();
+  });
+
+  it('a wrong template version does not set the sticky flag', async () => {
+    const h = await setup();
+    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 2 }]);
+    expect(await nodeStateRow(h.db, 'zone1', 'n1')).toBeUndefined();
+
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(doc!.sessions[0]!.pipeline).toMatchObject({ template: 'arib-hls' });
+    await h.destroy();
+  });
+
+  it('pollerHooks().onTemplatesObserved is wired to persistAdvertisedRawArgv', async () => {
+    const h = await setup();
+    const hooks = h.service.pollerHooks();
+    await hooks.onTemplatesObserved!('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
+    const row = await nodeStateRow(h.db, 'zone1', 'n1');
+    expect(row!.advertised_raw_argv).toBe(1);
+
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(doc!.sessions[0]!.pipeline).toMatchObject({ template: 'raw-argv' });
     await h.destroy();
   });
 });

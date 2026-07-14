@@ -72,6 +72,8 @@ function status(
     pendingPush: false,
     sourcesHash: null,
     sources: null,
+    capabilities: null,
+    templates: null,
     sessions,
     ...opts,
   };

@@ -162,8 +162,33 @@ export const AribHlsParams = Type.Object({
 });
 export type AribHlsParams = Static<typeof AribHlsParams>;
 
+/**
+ * 'raw-argv' — a fully pre-rendered ffmpeg argv, produced by the controller.
+ * The daemon does not interpret it — it substitutes `{OUT_DIR}` tokens
+ * (reserved; exact-substring, all occurrences per token) with the session's
+ * output directory and appends `-progress pipe:3` at runtime.
+ *
+ * Layout invariants the rendered argv must honor (not verified by the daemon):
+ * - primary video rendition is named `1080p`, media playlist at
+ *   `{OUT_DIR}/1080p/stream.m3u8` (the playlist watchdog watches that path;
+ *   violating it silently degrades lag detection to the progress backstop)
+ * - every output-path token contains `{OUT_DIR}`
+ * - `{OUT_DIR}/health` is daemon-written; the argv must not reference it
+ */
+export const RawArgvParams = Type.Object({
+  template: Type.Literal('raw-argv'),
+  templateVersion: Type.Literal(1),
+  /** complete ffmpeg argv (binary excluded) */
+  ffmpegArgv: Type.Array(Type.String({ minLength: 1 }), { minItems: 1 }),
+  /** actual -hls_time baked into the argv; drives playlist-stall threshold + cleanup delay */
+  segmentSeconds: Type.Optional(Type.Number({ minimum: 1, default: 5 })),
+  /** actual -hls_list_size baked into the argv; drives cleanup delay */
+  listSize: Type.Optional(Type.Integer({ minimum: 1, default: 120 })),
+});
+export type RawArgvParams = Static<typeof RawArgvParams>;
+
 /** future pipeline shapes become new union members */
-export const PipelineParams = Type.Union([AribHlsParams]);
+export const PipelineParams = Type.Union([AribHlsParams, RawArgvParams]);
 export type PipelineParams = Static<typeof PipelineParams>;
 
 // ---------------------------------------------------------------------------
@@ -335,6 +360,15 @@ export type SourcesResponse = Static<typeof SourcesResponse>;
 
 // ---------------------------------------------------------------------------
 // Log tail (GET /v1/sessions/:name/log?lines=N)
+//
+// GET /v1/sessions/:name/log/stream — Server-Sent Events: `event: log` per
+// LogLine (replays the ring tail on connect, then streams live lines);
+// `event: end` when the session object is discarded (config change /
+// removal) — reconnect to pick up any replacement session under the name.
+//
+// POST /v1/sessions/:name/restarts/reset — zeroes the lifetime `restarts`
+// counter without disturbing the running process group; 404 for unknown or
+// invalid sessions.
 // ---------------------------------------------------------------------------
 
 export const LogLine = Type.Object({

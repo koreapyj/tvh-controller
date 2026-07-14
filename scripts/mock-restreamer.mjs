@@ -18,7 +18,11 @@
 
 // Minimal mock restreamer daemon (wire contract v1) for development/testing
 // without real nodes.
-//   node scripts/mock-restreamer.mjs --port 15801 [--name node1]
+//   node scripts/mock-restreamer.mjs --port 15801 [--name node1] [--raw-argv]
+//
+// --raw-argv: also advertise {id:'raw-argv',version:1} in /v1/status.templates
+// (in addition to arib-hls), so the controller renders pre-built ffmpeg argv
+// docs for this node instead of semantic arib-hls params.
 //
 // Contract endpoints: GET /v1/status, GET/PUT /v1/desired, GET /v1/sources,
 // POST /v1/sessions/:name/restart, GET /v1/sessions/:name/log?lines=N,
@@ -49,6 +53,8 @@ function argValue(flag, fallback) {
 }
 const port = Number(argValue('--port', 15801));
 const name = argValue('--name', `mock-node:${port}`);
+/** advertise the 'raw-argv' template alongside 'arib-hls' in /v1/status.templates */
+const rawArgv = args.includes('--raw-argv');
 
 const startedAt = new Date().toISOString();
 const startedMs = Date.now();
@@ -194,7 +200,9 @@ createServer((req, res) => {
         startedAt,
         uptimeSec: (Date.now() - startedMs) / 1000,
         capabilities: ['qsv'],
-        templates: [{ id: 'arib-hls', version: 1 }],
+        templates: rawArgv
+          ? [{ id: 'arib-hls', version: 1 }, { id: 'raw-argv', version: 1 }]
+          : [{ id: 'arib-hls', version: 1 }],
         desiredRevision: desired?.revision ?? null,
         sourcesHash: sourcesHash(),
         sessions: sessionStatuses(),

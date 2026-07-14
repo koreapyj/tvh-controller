@@ -96,6 +96,12 @@ export function parseBitrateMbps(v: string | undefined, fallbackMbps: number): n
  * first output and '64k' for the rest), times the overhead factor.
  */
 export function expectedChannelMbps(payload: PipelineParams): number {
+  if (payload.template !== 'arib-hls') {
+    // stored profiles are always the semantic 'arib-hls' shape — 'raw-argv'
+    // is a render-time-only transform applied in computeNodeDoc and is
+    // never persisted, so this branch is defensive, not expected to run.
+    return 3 * EGRESS_OVERHEAD;
+  }
   let mbps = parseBitrateMbps(payload.video.bitrate, 3);
   payload.audio.forEach((a, i) => {
     mbps += parseBitrateMbps(a.bitrate, i === 0 ? 0.128 : 0.064);

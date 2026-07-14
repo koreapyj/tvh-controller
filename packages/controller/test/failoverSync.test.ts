@@ -96,6 +96,8 @@ function nodeStatusFixture(
     sessions: [],
     sourcesHash: null,
     sources: null,
+    capabilities: null,
+    templates: null,
     ...opts,
   };
 }

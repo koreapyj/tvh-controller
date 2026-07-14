@@ -54,6 +54,8 @@ function node(
     sessions: [],
     sourcesHash: sources === null ? null : 'hash',
     sources,
+    capabilities: null,
+    templates: null,
   };
 }
 

@@ -440,8 +440,13 @@ export class FailoverSync {
     if (payloadText) {
       try {
         const payload = JSON.parse(payloadText) as PipelineParams;
-        seg = payload.hls?.segmentSeconds ?? 5;
-        list = payload.hls?.listSize ?? 120;
+        if (payload.template === 'arib-hls') {
+          seg = payload.hls?.segmentSeconds ?? 5;
+          list = payload.hls?.listSize ?? 120;
+        } else {
+          seg = payload.segmentSeconds ?? 5;
+          list = payload.listSize ?? 120;
+        }
       } catch {
         /* defaults */
       }

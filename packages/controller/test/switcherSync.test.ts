@@ -618,6 +618,8 @@ describe('rebalanceTick', () => {
       sessions: [],
       sourcesHash: null,
       sources: null,
+      capabilities: null,
+      templates: null,
     });
   }
 

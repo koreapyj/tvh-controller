@@ -687,6 +687,72 @@ describe('migration 008_restreamer', () => {
     });
   });
 
+  describe('018_restream_node_state_raw_argv', () => {
+    it('a pre-existing node_state row reads back advertised_raw_argv 0 by default', async () => {
+      await seed();
+      const row = await t.db
+        .selectFrom('restream_node_state')
+        .selectAll()
+        .where('instance_id', '=', 'tyo1')
+        .where('node_id', '=', 'node1')
+        .executeTakeFirstOrThrow();
+      expect(row.advertised_raw_argv).toBe(0);
+    });
+
+    it('the flag can be set to 1 and round-trips', async () => {
+      await seed();
+      await t.db
+        .updateTable('restream_node_state')
+        .set({ advertised_raw_argv: 1 })
+        .where('instance_id', '=', 'tyo1')
+        .where('node_id', '=', 'node1')
+        .execute();
+      const row = await t.db
+        .selectFrom('restream_node_state')
+        .selectAll()
+        .where('instance_id', '=', 'tyo1')
+        .where('node_id', '=', 'node1')
+        .executeTakeFirstOrThrow();
+      expect(row.advertised_raw_argv).toBe(1);
+    });
+
+    it('migrating stepwise to 017 (no advertised_raw_argv column) then to latest adds the column defaulted to 0', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '017_placement_profile_drop_weight');
+
+        interface OldNodeStateRow017 {
+          instance_id: string;
+          node_id: string;
+          pushed_hash: string;
+          pushed_at: string;
+        }
+        const oldDb = db as unknown as Kysely<{ restream_node_state: OldNodeStateRow017 }>;
+        await oldDb
+          .insertInto('restream_node_state')
+          .values({ instance_id: 'tyo1', node_id: 'node1', pushed_hash: 'abc', pushed_at: NOW })
+          .execute();
+
+        await migrateToLatest(db);
+
+        const row = await db
+          .selectFrom('restream_node_state')
+          .selectAll()
+          .where('instance_id', '=', 'tyo1')
+          .where('node_id', '=', 'node1')
+          .executeTakeFirstOrThrow();
+        expect(row).toMatchObject({ pushed_hash: 'abc', advertised_raw_argv: 0 });
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
   it('enforces UNIQUE(channel_id, instance_id, node_id) on placements', async () => {
     await seed();
     await expect(

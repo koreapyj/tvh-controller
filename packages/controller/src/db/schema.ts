@@ -185,6 +185,8 @@ export interface RestreamNodeStateTable {
   node_id: string;
   pushed_hash: string;
   pushed_at: ColumnType<Date, string, string>;
+  /** node has ever advertised {id:'raw-argv',version:1} in /v1/status.templates; sticky — never cleared on downgrade */
+  advertised_raw_argv: Generated<number>;
 }
 
 /** DB-managed master playlist, served at GET /playlists/<slug>.m3u */

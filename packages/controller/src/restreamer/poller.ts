@@ -70,6 +70,18 @@ export interface RestreamerPollerHooks {
    */
   onSourcesChanged?: (instanceId: string, nodeId: string) => void | Promise<void>;
   /**
+   * Fired (not awaited, errors swallowed) once per SUCCESSFUL poll,
+   * unconditionally, with the node's advertised `/v1/status.templates`. Never
+   * fired on a failed poll (templates are unknown then). The downstream write
+   * is idempotent, so this fires every successful tick rather than only on
+   * change.
+   */
+  onTemplatesObserved?: (
+    instanceId: string,
+    nodeId: string,
+    templates: { id: string; version: number }[],
+  ) => void | Promise<void>;
+  /**
    * Instance-level probe state, PULLED at status-build time (the probe engine
    * is the single source of truth — patching state into the cache after the
    * fact would be wiped by the next poll). Default: null (no probes).
@@ -180,8 +192,11 @@ export class RestreamerPoller {
         sessions: await this.enrichSessionsSafe(res.sessions),
         sourcesHash: this.lastSourcesHash,
         sources: this.lastSources,
+        capabilities: res.capabilities,
+        templates: res.templates,
       };
       await this.checkRevision(res.desiredRevision);
+      this.observeTemplatesSafe(res.templates);
     } catch (err) {
       status = {
         instanceId: this.instanceId,
@@ -202,6 +217,8 @@ export class RestreamerPoller {
         // last-known catalog carried across unreachable polls (like topology)
         sourcesHash: this.lastSourcesHash,
         sources: this.lastSources,
+        capabilities: null,
+        templates: null,
       };
     }
 
@@ -358,6 +375,18 @@ export class RestreamerPoller {
       ).catch(() => {});
     } catch {
       // fire-and-forget: a failing push trigger must not fail the poll
+    }
+  }
+
+  /** fire onTemplatesObserved unconditionally on every successful poll — never on a failed one */
+  private observeTemplatesSafe(templates: { id: string; version: number }[]): void {
+    if (!this.hooks.onTemplatesObserved) return;
+    try {
+      void Promise.resolve(
+        this.hooks.onTemplatesObserved(this.instanceId, this.node.id, templates),
+      ).catch(() => {});
+    } catch {
+      // fire-and-forget: a failing persist must not fail the poll
     }
   }
 }

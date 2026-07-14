@@ -621,6 +621,21 @@ migrations['017_placement_profile_drop_weight'] = {
   },
 };
 
+migrations['018_restream_node_state_raw_argv'] = {
+  // sticky per-node capability flag: has this node ever advertised the
+  // 'raw-argv' pipeline template? Never cleared on downgrade — see
+  // persistAdvertisedRawArgv() in restreamer/service.ts for the rationale.
+  async up(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .alterTable('restream_node_state')
+      .addColumn('advertised_raw_argv', 'boolean', (c) => c.notNull().defaultTo(0))
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('restream_node_state').dropColumn('advertised_raw_argv').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;
