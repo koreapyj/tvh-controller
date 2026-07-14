@@ -277,7 +277,7 @@ async function insertPlacement(
       priority: fields.priority ?? 1,
       enabled: fields.enabled === false ? 0 : 1,
       mode: fields.mode ?? 'hot',
-      weight: null,
+      profile_id: null,
       program_number: null,
       updated_at: TS,
     })

@@ -152,8 +152,8 @@ export interface RestreamPlacement {
    * failover loop has it activated (preferred placement not ready)
    */
   mode: 'hot' | 'cold';
-  /** tvheadend subscription weight override; null = daemon default */
-  weight: number | null;
+  /** per-placement profile override; null = inherit the channel's profile */
+  profileId: string | null;
   /** manual program-number (service SID) override; null = derived channel→service→sid */
   programNumber: number | null;
   updatedAt: string;

@@ -34,7 +34,7 @@ function placement(over: Partial<RestreamPlacement> = {}): RestreamPlacement {
     priority: 1,
     enabled: true,
     mode: 'hot',
-    weight: null,
+    profileId: null,
     programNumber: null,
     updatedAt: '2026-01-01T00:00:00.000Z',
     ...over,
@@ -58,27 +58,36 @@ describe('seedStagedPlacements', () => {
     expect(seeded.map((p) => p.id)).toEqual(['a', 'z']);
   });
 
-  it('formats null weight/programNumber as blank strings, numbers as strings', () => {
+  it('formats null programNumber as a blank string, numbers as strings', () => {
     const seeded = seedStagedPlacements([
-      placement({ id: 'a', weight: null, programNumber: null }),
-      placement({ id: 'b', weight: 500, programNumber: 3 }),
+      placement({ id: 'a', programNumber: null }),
+      placement({ id: 'b', programNumber: 3 }),
     ]);
-    expect(seeded[0]).toMatchObject({ weight: '', programNumber: '' });
-    expect(seeded[1]).toMatchObject({ weight: '500', programNumber: '3' });
+    expect(seeded[0]).toMatchObject({ programNumber: '' });
+    expect(seeded[1]).toMatchObject({ programNumber: '3' });
   });
 
-  it('round-trips through buildPlacementsPayload back to the original numeric values', () => {
+  it('formats null profileId as a blank string (inherit channel default), else the id', () => {
+    const seeded = seedStagedPlacements([
+      placement({ id: 'a', profileId: null }),
+      placement({ id: 'b', profileId: 'prof-1' }),
+    ]);
+    expect(seeded[0]).toMatchObject({ profileId: '' });
+    expect(seeded[1]).toMatchObject({ profileId: 'prof-1' });
+  });
+
+  it('round-trips through buildPlacementsPayload back to the original values', () => {
     const original = [
-      placement({ id: 'a', priority: 1, weight: 500, programNumber: 3, mode: 'hot' }),
-      placement({ id: 'b', priority: 2, weight: null, programNumber: null, mode: 'cold', enabled: false }),
+      placement({ id: 'a', priority: 1, programNumber: 3, profileId: 'prof-1', mode: 'hot' }),
+      placement({ id: 'b', priority: 2, programNumber: null, profileId: null, mode: 'cold', enabled: false }),
     ];
     const seeded = seedStagedPlacements(original);
     const built = buildPlacementsPayload(seeded);
     expect(built).toEqual({
       ok: true,
       placements: [
-        { id: 'a', instanceId: 'tokyo', nodeId: 'node-a', mode: 'hot', weight: 500, programNumber: 3, enabled: true },
-        { id: 'b', instanceId: 'tokyo', nodeId: 'node-a', mode: 'cold', weight: null, programNumber: null, enabled: false },
+        { id: 'a', instanceId: 'tokyo', nodeId: 'node-a', mode: 'hot', programNumber: 3, profileId: 'prof-1', enabled: true },
+        { id: 'b', instanceId: 'tokyo', nodeId: 'node-a', mode: 'cold', programNumber: null, profileId: null, enabled: false },
       ],
     });
   });
@@ -90,8 +99,8 @@ describe('buildPlacementsPayload', () => {
       instanceId: 'tokyo',
       nodeId: 'node-a',
       mode: 'hot',
-      weight: '',
       programNumber: '',
+      profileId: '',
       enabled: true,
       ...over,
     };
@@ -103,33 +112,40 @@ describe('buildPlacementsPayload', () => {
     if (built.ok) expect('id' in built.placements[0]!).toBe(false);
   });
 
-  it('blank weight/programNumber parse to null', () => {
-    const built = buildPlacementsPayload([row({ weight: '', programNumber: '' })]);
+  it('blank programNumber parses to null', () => {
+    const built = buildPlacementsPayload([row({ programNumber: '' })]);
     expect(built).toEqual({
       ok: true,
-      placements: [{ instanceId: 'tokyo', nodeId: 'node-a', mode: 'hot', weight: null, programNumber: null, enabled: true }],
+      placements: [{ instanceId: 'tokyo', nodeId: 'node-a', mode: 'hot', programNumber: null, profileId: null, enabled: true }],
     });
   });
 
-  it('parses positive integers', () => {
-    const built = buildPlacementsPayload([row({ weight: '500', programNumber: '12' })]);
+  it('parses a positive integer program number', () => {
+    const built = buildPlacementsPayload([row({ programNumber: '12' })]);
     expect(built.ok).toBe(true);
-    if (built.ok) expect(built.placements[0]).toMatchObject({ weight: 500, programNumber: 12 });
-  });
-
-  it('rejects a non-integer weight, naming the node', () => {
-    const built = buildPlacementsPayload([row({ weight: '3.5', instanceId: 'tokyo', nodeId: 'node-b' })]);
-    expect(built).toEqual({ ok: false, error: 'tokyo/node-b: weight must be a positive integer, or blank' });
-  });
-
-  it('rejects zero and negative values', () => {
-    expect(buildPlacementsPayload([row({ weight: '0' })]).ok).toBe(false);
-    expect(buildPlacementsPayload([row({ weight: '-5' })]).ok).toBe(false);
+    if (built.ok) expect(built.placements[0]).toMatchObject({ programNumber: 12 });
   });
 
   it('rejects a non-numeric program number, naming the node', () => {
     const built = buildPlacementsPayload([row({ programNumber: 'abc', instanceId: 'osaka', nodeId: 'node-c' })]);
     expect(built).toEqual({ ok: false, error: 'osaka/node-c: program number must be a positive integer, or blank' });
+  });
+
+  it('rejects zero and negative program numbers', () => {
+    expect(buildPlacementsPayload([row({ programNumber: '0' })]).ok).toBe(false);
+    expect(buildPlacementsPayload([row({ programNumber: '-5' })]).ok).toBe(false);
+  });
+
+  it('blank profileId maps to null (inherit channel default)', () => {
+    const built = buildPlacementsPayload([row({ profileId: '' })]);
+    expect(built.ok).toBe(true);
+    if (built.ok) expect(built.placements[0]).toMatchObject({ profileId: null });
+  });
+
+  it('a non-empty profileId is passed through as the override', () => {
+    const built = buildPlacementsPayload([row({ profileId: 'prof-2' })]);
+    expect(built.ok).toBe(true);
+    if (built.ok) expect(built.placements[0]).toMatchObject({ profileId: 'prof-2' });
   });
 
   it('preserves staged array order (priority = index)', () => {
@@ -147,7 +163,7 @@ describe('removedPlacementIds', () => {
 
   it('reports ids missing from the staged rows', () => {
     const staged: StagedPlacement[] = [
-      { id: 'a', instanceId: 'tokyo', nodeId: 'node-a', mode: 'hot', weight: '', programNumber: '', enabled: true },
+      { id: 'a', instanceId: 'tokyo', nodeId: 'node-a', mode: 'hot', programNumber: '', profileId: '', enabled: true },
     ];
     expect(removedPlacementIds(original, staged)).toEqual(['b', 'c']);
   });
@@ -159,11 +175,11 @@ describe('removedPlacementIds', () => {
         instanceId: p.instanceId,
         nodeId: p.nodeId,
         mode: p.mode,
-        weight: '',
         programNumber: '',
+        profileId: '',
         enabled: p.enabled,
       })),
-      { instanceId: 'osaka', nodeId: 'node-x', mode: 'hot', weight: '', programNumber: '', enabled: true },
+      { instanceId: 'osaka', nodeId: 'node-x', mode: 'hot', programNumber: '', profileId: '', enabled: true },
     ];
     expect(removedPlacementIds(original, staged)).toEqual([]);
   });

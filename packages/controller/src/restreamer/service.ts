@@ -183,7 +183,8 @@ export interface PlacementInput {
   enabled?: boolean;
   /** 'hot' (default) = always encodes; 'cold' = standby for the failover loop */
   mode?: 'hot' | 'cold';
-  weight?: number | null;
+  /** per-placement encode-profile override; null/absent = inherit the channel's profile */
+  profileId?: string | null;
   programNumber?: number | null;
   /** skip the write-time availability check (pre-provisioning) */
   force?: boolean;
@@ -225,7 +226,8 @@ export interface PlacementPatch {
   enabled?: boolean;
   /** 'hot' = always encodes; 'cold' = standby for the failover loop */
   mode?: 'hot' | 'cold';
-  weight?: number | null;
+  /** per-placement encode-profile override; undefined = keep, null = clear (inherit channel) */
+  profileId?: string | null;
   programNumber?: number | null;
   /** skip the write-time availability check when moving to another node */
   force?: boolean;
@@ -347,7 +349,8 @@ export interface ApplyChannelInput {
     instanceId: string;
     nodeId: string;
     mode: 'hot' | 'cold';
-    weight: number | null;
+    /** per-placement encode-profile override; null = inherit the channel's profile */
+    profileId: string | null;
     programNumber: number | null;
     enabled: boolean;
   }>;
@@ -488,6 +491,12 @@ export class RestreamerService {
     return r ? this.rowToProfile(r) : null;
   }
 
+  /** shared validation for channel-level and placement-level profileId writes */
+  private async assertProfileExists(id: string): Promise<void> {
+    const profile = await this.getProfile(id);
+    if (!profile) throw httpError(400, `profile ${id} not found`);
+  }
+
   createProfile(name: string, payload: unknown): Promise<RestreamProfile> {
     return this.serialize(() => this.createProfileInner(name, payload));
   }
@@ -571,6 +580,24 @@ export class RestreamerService {
         `profile "${existing.name}" is used by ${refs.length} channel(s) (${names}${refs.length > 5 ? ', …' : ''}) — reassign them first`,
       );
     }
+    // per-placement overrides have no FK backstop — this app-level check IS
+    // the only enforcement
+    const placementRefs = await this.db
+      .selectFrom('restream_placements as p')
+      .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
+      .select('c.slug')
+      .where('p.profile_id', '=', id)
+      .execute();
+    if (placementRefs.length) {
+      const names = placementRefs
+        .slice(0, 5)
+        .map((r) => `"${r.slug}"`)
+        .join(', ');
+      throw httpError(
+        409,
+        `profile "${existing.name}" is used by ${placementRefs.length} placement(s) on channel(s) (${names}${placementRefs.length > 5 ? ', …' : ''}) — reassign them first`,
+      );
+    }
     await this.db.deleteFrom('restream_profiles').where('id', '=', id).execute();
   }
 
@@ -632,7 +659,7 @@ export class RestreamerService {
     priority: number;
     enabled: number;
     mode: string;
-    weight: number | null;
+    profile_id: string | null;
     program_number: number | null;
     updated_at: Date;
   }): RestreamPlacement {
@@ -645,7 +672,7 @@ export class RestreamerService {
       enabled: !!r.enabled,
       // unknown values read as 'hot' — the pre-migration behavior
       mode: r.mode === 'cold' ? 'cold' : 'hot',
-      weight: r.weight,
+      profileId: r.profile_id,
       programNumber: r.program_number,
       updatedAt: new Date(r.updated_at).toISOString(),
     };
@@ -815,6 +842,7 @@ export class RestreamerService {
         throw httpError(409, `duplicate placement on node "${key}"`);
       }
       placementKeys.add(key);
+      if (p.profileId != null) await this.assertProfileExists(p.profileId);
     }
 
     // channel number identity: given → stored verbatim as a STRING; absent →
@@ -878,7 +906,7 @@ export class RestreamerService {
           priority,
           enabled: p.enabled === false ? 0 : 1,
           mode: p.mode ?? 'hot',
-          weight: p.weight ?? null,
+          profile_id: p.profileId ?? null,
           program_number: p.programNumber ?? null,
           updated_at: now(),
         })
@@ -1028,6 +1056,7 @@ export class RestreamerService {
         if (p.id !== undefined && !byId.has(p.id)) {
           throw httpError(400, `placement ${p.id} does not belong to channel ${id}`);
         }
+        if (p.profileId != null) await this.assertProfileExists(p.profileId);
       }
     }
 
@@ -1099,7 +1128,7 @@ export class RestreamerService {
               priority: index + 1,
               enabled: p.enabled ? 1 : 0,
               mode: p.mode,
-              weight: p.weight,
+              profile_id: p.profileId,
               program_number: p.programNumber,
               updated_at: now(),
             })
@@ -1116,7 +1145,7 @@ export class RestreamerService {
               priority: index + 1,
               enabled: p.enabled ? 1 : 0,
               mode: p.mode,
-              weight: p.weight,
+              profile_id: p.profileId,
               program_number: p.programNumber,
               updated_at: now(),
             })
@@ -1335,6 +1364,8 @@ export class RestreamerService {
       );
     }
 
+    if (input.profileId != null) await this.assertProfileExists(input.profileId);
+
     const priority =
       input.priority ?? (existing.length ? Math.max(...existing.map((p) => p.priority)) + 1 : 1);
 
@@ -1349,7 +1380,7 @@ export class RestreamerService {
         priority,
         enabled: input.enabled === false ? 0 : 1,
         mode: input.mode ?? 'hot',
-        weight: input.weight ?? null,
+        profile_id: input.profileId ?? null,
         program_number: input.programNumber ?? null,
         updated_at: now(),
       })
@@ -1414,6 +1445,8 @@ export class RestreamerService {
       }
     }
 
+    if (patch.profileId != null) await this.assertProfileExists(patch.profileId);
+
     await this.db
       .updateTable('restream_placements')
       .set({
@@ -1422,7 +1455,7 @@ export class RestreamerService {
         priority: patch.priority ?? existing.priority,
         enabled: patch.enabled === undefined ? existing.enabled : patch.enabled ? 1 : 0,
         mode: patch.mode ?? existing.mode,
-        weight: patch.weight === undefined ? existing.weight : patch.weight,
+        profile_id: patch.profileId === undefined ? existing.profile_id : patch.profileId,
         program_number:
           patch.programNumber === undefined ? existing.program_number : patch.programNumber,
         updated_at: now(),
@@ -1838,19 +1871,21 @@ export class RestreamerService {
       .selectFrom('restream_placements as p')
       .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
       .innerJoin('restream_profiles as pr', 'pr.id', 'c.profile_id')
+      // per-placement profile override; NULL when the placement inherits c.profile_id
+      .leftJoin('restream_profiles as ppr', 'ppr.id', 'p.profile_id')
       // a failover target joins the doc regardless of mode (cold activation);
       // a suppressed outgoing placement leaves it once its stop phase begins
       .leftJoin('restream_failover_state as fs', 'fs.to_placement_id', 'p.id')
       .leftJoin('restream_failover_state as fsFrom', 'fsFrom.from_placement_id', 'p.id')
       .select([
         'p.id as placement_id',
-        'p.weight',
         'p.program_number',
         'c.id as channel_id',
         'c.slug',
         'c.channel_name',
         'c.channel_number',
         'pr.payload as profile_payload',
+        'ppr.payload as placement_profile_payload',
         'fsFrom.suppress_from as fs_suppress_from',
         'fsFrom.phase as fs_from_phase',
       ])
@@ -1919,20 +1954,17 @@ export class RestreamerService {
         }
       }
       // stored profiles are already validated; Default-complete again so a doc
-      // computed from an older row hashes identically to a fresh one
+      // computed from an older row hashes identically to a fresh one. A
+      // per-placement profile override (row.placement_profile_payload) wins
+      // over the channel's own profile when set.
       const pipeline = Value.Default(
         PipelineParams,
-        JSON.parse(row.profile_payload),
+        JSON.parse(row.placement_profile_payload ?? row.profile_payload),
       ) as PipelineParams;
-      // subscription weight is a tvheadend concept — never merged into a UrlSource
-      const source: SessionSource =
-        'channelUuid' in resolved.source && row.weight != null
-          ? { ...resolved.source, weight: row.weight }
-          : resolved.source;
       sessions.push({
         name: row.slug,
         enabled: true,
-        source,
+        source: resolved.source,
         tsreadex:
           resolved.programNumber !== undefined ? { programNumber: resolved.programNumber } : {},
         pipeline,
@@ -2131,12 +2163,14 @@ export class RestreamerService {
   }
 
   private async pushAffectedByProfileInner(profileId: string): Promise<NodePushResult[]> {
+    // a node is affected if the profile is used either via the channel's own
+    // profile or via a per-placement override
     const rows = await this.db
       .selectFrom('restream_placements as p')
       .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
       .select(['p.instance_id', 'p.node_id'])
       .distinct()
-      .where('c.profile_id', '=', profileId)
+      .where((eb) => eb.or([eb('c.profile_id', '=', profileId), eb('p.profile_id', '=', profileId)]))
       .execute();
     return this.pushNodesInner(
       rows.map((r) => ({ instanceId: r.instance_id, nodeId: r.node_id })),

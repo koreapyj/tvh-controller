@@ -324,8 +324,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   /** profile modal: null = closed, profile null inside = create */
   let profileModal: { profile: RestreamProfile | null } | null = $state(null);
 
+  // in use as a channel default or as a per-placement override
   const profileUseCount = $derived(
-    (id: string) => channels.filter((c) => c.profileId === id).length,
+    (id: string) =>
+      channels.filter(
+        (c) => c.profileId === id || c.placements.some((p) => p.profileId === id),
+      ).length,
   );
 
   function profileSummary(p: RestreamProfile): string {

@@ -32,10 +32,10 @@ export interface StagedPlacement {
   instanceId: string;
   nodeId: string;
   mode: 'hot' | 'cold';
-  /** '' = null (daemon default) */
-  weight: string;
   /** '' = null (derived program number) */
   programNumber: string;
+  /** '' = null (inherit the channel's profile); non-empty = per-placement profile override */
+  profileId: string;
   enabled: boolean;
 }
 
@@ -45,8 +45,8 @@ export interface StagedPlacementInput {
   instanceId: string;
   nodeId: string;
   mode: 'hot' | 'cold';
-  weight: number | null;
   programNumber: number | null;
+  profileId: string | null;
   enabled: boolean;
 }
 
@@ -59,8 +59,8 @@ export function seedStagedPlacements(placements: RestreamPlacement[]): StagedPla
       instanceId: p.instanceId,
       nodeId: p.nodeId,
       mode: p.mode,
-      weight: p.weight === null ? '' : String(p.weight),
       programNumber: p.programNumber === null ? '' : String(p.programNumber),
+      profileId: p.profileId ?? '',
       enabled: p.enabled,
     }));
 }
@@ -70,7 +70,7 @@ export type BuildPlacementsResult =
   | { ok: false; error: string };
 
 /** '' -> null; a positive integer string -> that number; anything else -> undefined (error) */
-function parsePositiveInt(raw: string): number | null | undefined {
+export function parsePositiveInt(raw: string): number | null | undefined {
   const t = raw.trim();
   if (t === '') return null;
   const n = Number(t);
@@ -89,10 +89,6 @@ export function buildPlacementsPayload(staged: StagedPlacement[]): BuildPlacemen
   const placements: StagedPlacementInput[] = [];
   for (const p of staged) {
     const label = `${p.instanceId}/${p.nodeId}`;
-    const weight = parsePositiveInt(p.weight);
-    if (weight === undefined) {
-      return { ok: false, error: `${label}: weight must be a positive integer, or blank` };
-    }
     const programNumber = parsePositiveInt(p.programNumber);
     if (programNumber === undefined) {
       return { ok: false, error: `${label}: program number must be a positive integer, or blank` };
@@ -102,8 +98,8 @@ export function buildPlacementsPayload(staged: StagedPlacement[]): BuildPlacemen
       instanceId: p.instanceId,
       nodeId: p.nodeId,
       mode: p.mode,
-      weight,
       programNumber,
+      profileId: p.profileId === '' ? null : p.profileId,
       enabled: p.enabled,
     });
   }

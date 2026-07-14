@@ -597,6 +597,30 @@ migrations['016_event_log'] = {
   },
 };
 
+migrations['017_placement_profile_drop_weight'] = {
+  // per-placement subscription weight is retired (never reached tvheadend in
+  // a meaningful way — see 015/underrun-style cleanup precedent). Replaced
+  // with a per-placement encode-profile override: NULL = inherit the
+  // channel's profile, matching how program_number already overrides the
+  // channel-derived default. No FK to restream_profiles.id — same app-level
+  // integrity as instance_id/node_id above (deletion-in-use is a 409 the
+  // service layer enforces before the row is touched).
+  async up(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .alterTable('restream_placements')
+      .addColumn('profile_id', 'varchar(36)')
+      .execute();
+    await db.schema.alterTable('restream_placements').dropColumn('weight').execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .alterTable('restream_placements')
+      .addColumn('weight', 'integer')
+      .execute();
+    await db.schema.alterTable('restream_placements').dropColumn('profile_id').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

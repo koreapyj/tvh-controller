@@ -33,6 +33,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     seedStagedPlacements,
     type StagedPlacement,
   } from '../lib/placementStaging.js';
+  import PlacementEditModal from './PlacementEditModal.svelte';
   import { deriveSlug, placementModeBadge, sessionStateBadge, SLUG_PATTERN } from '../lib/restreamFields.js';
   import { channelOptions, instName, restreamerNodeKey, restreamerNodes } from '../lib/stores.js';
 
@@ -196,7 +197,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   function addPlacement(): void {
     stagedPlacements = [
       ...stagedPlacements,
-      { instanceId: addInstance, nodeId: addNode, mode: addMode, weight: '', programNumber: '', enabled: true },
+      { instanceId: addInstance, nodeId: addNode, mode: addMode, programNumber: '', profileId: '', enabled: true },
     ];
   }
 
@@ -217,6 +218,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   function liveFor(p: StagedPlacement): RestreamChannelWithStatus['placements'][number] | null {
     if (p.id === undefined || !channel) return null;
     return channel.placements.find((x) => x.id === p.id) ?? null;
+  }
+
+  /** per-placement profile-override editor (program # + profile), stacked on top of this modal */
+  let placementEdit: { index: number } | null = $state(null);
+
+  /** profile name for a per-placement override id (falls back to the raw id if unknown) */
+  function profileName(id: string): string {
+    return profiles.find((p) => p.id === id)?.name ?? id;
   }
 
   // ---------- save ----------
@@ -305,7 +314,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 </script>
 
-<svelte:window onkeydown={(e) => e.key === 'Escape' && onclose()} />
+<!-- when the placement edit modal is stacked on top, Escape belongs to it -->
+<svelte:window onkeydown={(e) => e.key === 'Escape' && !placementEdit && onclose()} />
 
 <!-- write-time availability of the form's identity on one placement's node -->
 {#snippet availBadge(instanceId: string, nodeId: string)}
@@ -421,8 +431,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             <th style="width:60px">Priority</th>
             <th>Node</th>
             <th>Mode</th>
-            <th>Weight</th>
-            <th>Program #</th>
             <th>Enabled</th>
             <th></th>
           </tr>
@@ -446,6 +454,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                   {@const modeBadge = placementModeBadge(p)!}
                   <span class="badge {modeBadge.cls}">{modeBadge.label}</span>
                 {/if}
+                {#if p.programNumber}<span class="muted">prog {p.programNumber}</span>{/if}
+                {#if p.profileId}<span class="muted">{profileName(p.profileId)}</span>{/if}
               </td>
               <td>
                 <select style="width:auto" bind:value={p.mode} aria-label="mode">
@@ -453,19 +463,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                   <option value="cold">cold</option>
                 </select>
               </td>
-              <td>
-                <input style="width:80px" inputmode="numeric" placeholder="(default)" bind:value={p.weight} />
-              </td>
-              <td>
-                <input style="width:80px" inputmode="numeric" placeholder="(derived)" bind:value={p.programNumber} />
-              </td>
               <td><input type="checkbox" bind:checked={p.enabled} /></td>
-              <td style="text-align:right">
+              <td style="text-align:right;white-space:nowrap">
+                <button onclick={() => (placementEdit = { index: i })}>Edit</button>
                 <button class="danger" onclick={() => removePlacement(i)}>Remove</button>
               </td>
             </tr>
           {:else}
-            <tr><td colspan="7" class="muted">No placements yet — add a node below.</td></tr>
+            <tr><td colspan="5" class="muted">No placements yet — add a node below.</td></tr>
           {/each}
         </tbody>
       </table>
@@ -512,3 +517,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </div>
   </div>
 </div>
+
+{#if placementEdit}
+  {@const editIndex = placementEdit.index}
+  {@const editTarget = stagedPlacements[editIndex]!}
+  <PlacementEditModal
+    placement={editTarget}
+    {profiles}
+    title={`Edit placement: ${$instName(editTarget.instanceId)}/${editTarget.nodeId}`}
+    onsave={(patch) => {
+      stagedPlacements[editIndex]!.programNumber = patch.programNumber;
+      stagedPlacements[editIndex]!.profileId = patch.profileId;
+      placementEdit = null;
+    }}
+    oncancel={() => (placementEdit = null)}
+  />
+{/if}

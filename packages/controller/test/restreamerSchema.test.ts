@@ -58,7 +58,7 @@ describe('migration 008_restreamer', () => {
         node_id: 'node1',
         priority: 0,
         enabled: 1,
-        weight: null,
+        profile_id: null,
         program_number: null,
         updated_at: NOW,
       })
@@ -110,7 +110,7 @@ describe('migration 008_restreamer', () => {
       instance_id: 'tyo1',
       node_id: 'node1',
       priority: 0,
-      weight: null,
+      profile_id: null,
       program_number: null,
     });
 
@@ -219,7 +219,7 @@ describe('migration 008_restreamer', () => {
           node_id: 'node2',
           priority: 1,
           enabled: 1,
-          weight: null,
+          profile_id: null,
           program_number: null,
           updated_at: NOW,
         })
@@ -375,7 +375,22 @@ describe('migration 008_restreamer', () => {
             updated_at: NOW,
           })
           .execute();
-        await db
+        // 013-era placements row shape: `weight` still exists, `profile_id`
+        // is not added until 017 (the migrateToLatest below runs it)
+        interface OldPlacementRow013 {
+          id: string;
+          channel_id: string;
+          instance_id: string;
+          node_id: string;
+          priority: number;
+          enabled: number;
+          weight: number | null;
+          program_number: number | null;
+          mode: string;
+          updated_at: string;
+        }
+        const oldPlacementsDb = db as unknown as Kysely<{ restream_placements: OldPlacementRow013 }>;
+        await oldPlacementsDb
           .insertInto('restream_placements')
           .values({
             id: 'hot-1',
@@ -390,7 +405,7 @@ describe('migration 008_restreamer', () => {
             updated_at: NOW,
           })
           .execute();
-        await db
+        await oldPlacementsDb
           .insertInto('restream_placements')
           .values({
             id: 'cold-1',
@@ -562,6 +577,116 @@ describe('migration 008_restreamer', () => {
     });
   });
 
+  describe('017_placement_profile_drop_weight', () => {
+    it('a placement row with a non-null profile_id round-trips', async () => {
+      await seed();
+      await t.db
+        .insertInto('restream_profiles')
+        .values({
+          id: 'prof-2',
+          name: 'override-profile',
+          payload: JSON.stringify({ template: 'arib-hls', templateVersion: 1 }),
+          updated_at: NOW,
+        })
+        .execute();
+      await t.db
+        .updateTable('restream_placements')
+        .set({ profile_id: 'prof-2' })
+        .where('id', '=', 'plc-1')
+        .execute();
+      const row = await t.db
+        .selectFrom('restream_placements')
+        .selectAll()
+        .where('id', '=', 'plc-1')
+        .executeTakeFirstOrThrow();
+      expect(row.profile_id).toBe('prof-2');
+      expect(row).not.toHaveProperty('weight');
+    });
+
+    it('a plain placement row no longer carries the weight column', async () => {
+      await seed();
+      const row = await t.db
+        .selectFrom('restream_placements')
+        .selectAll()
+        .where('id', '=', 'plc-1')
+        .executeTakeFirstOrThrow();
+      expect(row).not.toHaveProperty('weight');
+      expect(row).toHaveProperty('profile_id');
+      expect(row.profile_id).toBeNull();
+    });
+
+    it('migrating stepwise to 013 (weight, no profile_id) then to latest converts the column', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '013_probe_settings');
+
+        await db
+          .insertInto('restream_profiles')
+          .values({ id: 'prof-1', name: 'p', payload: '{}', updated_at: NOW })
+          .execute();
+        await db
+          .insertInto('restream_channels')
+          .values({
+            id: 'chan-1',
+            slug: 'at-x',
+            channel_name: 'AT-X',
+            channel_number: '9.1',
+            profile_id: 'prof-1',
+            enabled: 1,
+            comment: null,
+            updated_at: NOW,
+          })
+          .execute();
+
+        interface OldPlacementRow013 {
+          id: string;
+          channel_id: string;
+          instance_id: string;
+          node_id: string;
+          priority: number;
+          enabled: number;
+          weight: number | null;
+          program_number: number | null;
+          mode: string;
+          updated_at: string;
+        }
+        const oldPlacementsDb = db as unknown as Kysely<{ restream_placements: OldPlacementRow013 }>;
+        await oldPlacementsDb
+          .insertInto('restream_placements')
+          .values({
+            id: 'plc-1',
+            channel_id: 'chan-1',
+            instance_id: 'tyo1',
+            node_id: 'node1',
+            priority: 1,
+            enabled: 1,
+            weight: 300,
+            program_number: null,
+            mode: 'hot',
+            updated_at: NOW,
+          })
+          .execute();
+
+        await migrateToLatest(db);
+
+        const row = await db
+          .selectFrom('restream_placements')
+          .selectAll()
+          .where('id', '=', 'plc-1')
+          .executeTakeFirstOrThrow();
+        expect(row).not.toHaveProperty('weight');
+        expect(row.profile_id).toBeNull();
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
   it('enforces UNIQUE(channel_id, instance_id, node_id) on placements', async () => {
     await seed();
     await expect(
@@ -574,7 +699,7 @@ describe('migration 008_restreamer', () => {
           node_id: 'node1',
           priority: 1,
           enabled: 1,
-          weight: null,
+          profile_id: null,
           program_number: null,
           updated_at: NOW,
         })

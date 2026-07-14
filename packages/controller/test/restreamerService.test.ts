@@ -254,7 +254,15 @@ async function insertChannelRow(
 
 async function insertPlacementRow(
   db: Kysely<Database>,
-  fields: { channelId: string; instanceId: string; nodeId: string; priority?: number; enabled?: boolean; programNumber?: number | null },
+  fields: {
+    channelId: string;
+    instanceId: string;
+    nodeId: string;
+    priority?: number;
+    enabled?: boolean;
+    programNumber?: number | null;
+    profileId?: string | null;
+  },
 ): Promise<string> {
   const id = randomUUID();
   await db
@@ -266,7 +274,7 @@ async function insertPlacementRow(
       node_id: fields.nodeId,
       priority: fields.priority ?? 1,
       enabled: fields.enabled === false ? 0 : 1,
-      weight: null,
+      profile_id: fields.profileId ?? null,
       program_number: fields.programNumber ?? null,
       updated_at: TS,
     })
@@ -375,6 +383,52 @@ describe('profiles', () => {
     await h.service.deleteChannel(chan.id);
     await h.service.deleteProfile(profile.id);
     expect(await h.service.listProfiles()).toHaveLength(0);
+    await h.destroy();
+  });
+
+  it('deleteProfile is blocked with 409 while only a placement overrides it (channel uses a different profile)', async () => {
+    const h = await setup();
+    const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
+    const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      profileId: channelProfile.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', profileId: overrideProfile.id }],
+    });
+    await expect(h.service.deleteProfile(overrideProfile.id)).rejects.toMatchObject({
+      statusCode: 409,
+    });
+    const placement = (await h.service.listChannels())[0]!.placements[0]!;
+    await h.service.updatePlacement(placement.id, { profileId: null });
+    await h.service.deleteProfile(overrideProfile.id);
+    expect(await h.service.listProfiles()).toHaveLength(1);
+    await h.destroy();
+  });
+
+  it('updateProfile re-pushes a node whose only link to the profile is a placement override', async () => {
+    const h = await setup();
+    const channelProfile = await h.service.createProfile(
+      'channel-profile',
+      profilePayload({ mode: 'ivtc', bitrate: '3M' }),
+    );
+    const overrideProfile = await h.service.createProfile(
+      'override-profile',
+      profilePayload({ mode: 'ivtc', bitrate: '6M' }),
+    );
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      profileId: channelProfile.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', profileId: overrideProfile.id }],
+    });
+    const node = h.nodes.get('zone1/n1')!;
+    expect(node.puts()).toHaveLength(1);
+
+    await h.service.updateProfile(overrideProfile.id, {
+      payload: profilePayload({ mode: 'ivtc', bitrate: '9M' }),
+    });
+    expect(node.puts()).toHaveLength(2);
+    const session = node.desired!.sessions[0]!;
+    expect((session.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe('9M');
     await h.destroy();
   });
 });
@@ -677,6 +731,53 @@ describe('desired doc determinism and push', () => {
     expect(node.desired!.sessions).toHaveLength(1);
     await h.service.deleteChannel(chan.id);
     expect(node.desired!.sessions).toHaveLength(0);
+    await h.destroy();
+  });
+
+  it('a per-placement profile override changes only that placement\'s pipeline; clearing it reverts the doc revision', async () => {
+    const h = await setup();
+    const profileA = await h.service.createProfile('profile-a', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
+    const profileB = await h.service.createProfile('profile-b', profilePayload({ mode: 'ivtc', bitrate: '6M' }));
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: profileA.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone1', nodeId: 'n2' },
+      ],
+    });
+    const placements = (await h.service.listChannels())[0]!.placements;
+    const n1Placement = placements.find((pl) => pl.nodeId === 'n1')!;
+    const n2Placement = placements.find((pl) => pl.nodeId === 'n2')!;
+    // no override yet — both nodes use the channel profile (fallback path)
+    expect(n1Placement.profileId).toBeNull();
+
+    const before = await h.service.computeNodeDoc('zone1', 'n1');
+    const baselineRevision = before.doc!.revision;
+    expect((before.doc!.sessions[0]!.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe(
+      '3M',
+    );
+
+    // override n2 only — n1's doc (and revision) must be unaffected
+    await h.service.updatePlacement(n2Placement.id, { profileId: profileB.id });
+    const n2Doc = await h.service.computeNodeDoc('zone1', 'n2');
+    expect((n2Doc.doc!.sessions[0]!.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe(
+      '6M',
+    );
+    const n1DocAfter = await h.service.computeNodeDoc('zone1', 'n1');
+    expect((n1DocAfter.doc!.sessions[0]!.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe(
+      '3M',
+    );
+    expect(n1DocAfter.doc!.revision).toBe(baselineRevision);
+
+    // override n1 too, then clear it — the doc reverts to the exact original hash
+    await h.service.updatePlacement(n1Placement.id, { profileId: profileB.id });
+    const overriddenDoc = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(overriddenDoc.doc!.revision).not.toBe(baselineRevision);
+    await h.service.updatePlacement(n1Placement.id, { profileId: null });
+    const revertedDoc = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(revertedDoc.doc!.revision).toBe(baselineRevision);
     await h.destroy();
   });
 });
@@ -1026,6 +1127,95 @@ describe('channel and placement CRUD', () => {
     expect(n1.desired!.sessions).toHaveLength(0); // torn down on the old node
     expect(n2.desired!.sessions.map((s) => s.name)).toEqual(['at-x']); // started on the new one
     expect((await h.service.getChannel(chan.id))).not.toBeNull();
+    await h.destroy();
+  });
+
+  it('rejects an unknown placement profileId on create/addPlacement/updatePlacement/apply', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    await expect(
+      h.service.createChannel({
+        channelName: 'AT-X',
+        profileId: p.id,
+        placements: [{ instanceId: 'zone1', nodeId: 'n1', profileId: 'ghost-profile' }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    const chan = await h.service.createChannel({ channelName: 'AT-X', profileId: p.id });
+    await expect(
+      h.service.addPlacement(chan.id, { instanceId: 'zone1', nodeId: 'n1', profileId: 'ghost-profile' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    const placement = await h.service.addPlacement(chan.id, { instanceId: 'zone1', nodeId: 'n1' });
+    await expect(
+      h.service.updatePlacement(placement.id, { profileId: 'ghost-profile' }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    await expect(
+      h.service.applyChannelChanges(chan.id, {
+        placements: [
+          {
+            id: placement.id,
+            instanceId: 'zone1',
+            nodeId: 'n1',
+            mode: 'hot',
+            profileId: 'ghost-profile',
+            programNumber: null,
+            enabled: true,
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    await h.destroy();
+  });
+
+  it('updatePlacement profileId round-trips; null clears the override (inherits the channel profile)', async () => {
+    const h = await setup();
+    const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
+    const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
+    const chan = await h.service.createChannel({ channelName: 'AT-X', profileId: channelProfile.id });
+    const placement = await h.service.addPlacement(chan.id, { instanceId: 'zone1', nodeId: 'n1' });
+    expect(placement.profileId).toBeNull();
+
+    const overridden = await h.service.updatePlacement(placement.id, { profileId: overrideProfile.id });
+    expect(overridden.profileId).toBe(overrideProfile.id);
+
+    const cleared = await h.service.updatePlacement(placement.id, { profileId: null });
+    expect(cleared.profileId).toBeNull();
+    await h.destroy();
+  });
+
+  it('applyChannelChanges persists profileId on new and existing placements', async () => {
+    const h = await setup();
+    const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
+    const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
+    const chan = await h.service.createChannel({ channelName: 'AT-X', profileId: channelProfile.id });
+    const existing = await h.service.addPlacement(chan.id, { instanceId: 'zone1', nodeId: 'n1' });
+
+    const applied = await h.service.applyChannelChanges(chan.id, {
+      placements: [
+        {
+          id: existing.id,
+          instanceId: 'zone1',
+          nodeId: 'n1',
+          mode: 'hot',
+          profileId: overrideProfile.id,
+          programNumber: null,
+          enabled: true,
+        },
+        {
+          instanceId: 'zone1',
+          nodeId: 'n2',
+          mode: 'hot',
+          profileId: null,
+          programNumber: null,
+          enabled: true,
+        },
+      ],
+    });
+    const byNode = new Map(applied.placements.map((pl) => [pl.nodeId, pl]));
+    expect(byNode.get('n1')!.profileId).toBe(overrideProfile.id);
+    expect(byNode.get('n2')!.profileId).toBeNull();
     await h.destroy();
   });
 
@@ -1598,26 +1788,6 @@ describe('onTopologyChanged', () => {
 const CAM: SourceCatalogEntry = { id: 'cam1', name: 'Cam 1', url: 'http://cam.example/1.m3u8', chno: '1' };
 
 describe('catalog resolution (tvh-miss fallback)', () => {
-  it('a catalog-resolved placement emits a {url} source with EMPTY tsreadex (daemon PAT-probes); weight never merged', async () => {
-    const h = await setup();
-    const p = await h.service.createProfile('p', profilePayload());
-    setNodeSources(h.cache, 'zone1', 'n1', [CAM], 'h1');
-    // "Cam 1" does not exist in zone1's tvh topology — only the catalog has it
-    await h.service.createChannel({
-      channelName: 'Cam 1',
-      channelNumber: '1',
-      profileId: p.id,
-      // weight is a tvheadend subscription concept — must NOT reach a UrlSource
-      placements: [{ instanceId: 'zone1', nodeId: 'n1', weight: 300 }],
-    });
-    const { doc, blocked } = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(blocked).toEqual([]);
-    const session = doc!.sessions[0]!;
-    expect(session.source).toEqual({ url: 'http://cam.example/1.m3u8' });
-    expect(session.tsreadex).toEqual({});
-    await h.destroy();
-  });
-
   it('a placement programNumber override is emitted for a catalog-resolved source', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());

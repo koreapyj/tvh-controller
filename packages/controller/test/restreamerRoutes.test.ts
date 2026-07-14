@@ -1780,6 +1780,56 @@ describe('restreamer cold backup routes', () => {
     expect(badPatch.statusCode).toBe(400);
   });
 
+  it('placement create accepts profileId and echoes it; invalid type -> 400', async () => {
+    const h = await harness();
+    const { channel } = await createChannelWithColdPlacement(h);
+    const overrideProfile = await createProfile(h.app, 'override');
+
+    const created = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/placements`,
+      payload: { instanceId: 'zone2', nodeId: 'n1', profileId: overrideProfile.id, force: true },
+    });
+    expect(created.statusCode).toBe(201);
+    expect((created.json() as { profileId: string | null }).profileId).toBe(overrideProfile.id);
+
+    const badCreate = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/placements`,
+      payload: { instanceId: 'zone2', nodeId: 'n1', profileId: 42, force: true },
+    });
+    expect(badCreate.statusCode).toBe(400);
+  });
+
+  it('PUT placement patch sets and clears profileId; invalid type -> 400', async () => {
+    const h = await harness();
+    const { coldId } = await createChannelWithColdPlacement(h);
+    const overrideProfile = await createProfile(h.app, 'override');
+
+    const set = await h.app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${coldId}`,
+      payload: { profileId: overrideProfile.id },
+    });
+    expect(set.statusCode).toBe(200);
+    expect((set.json() as { profileId: string | null }).profileId).toBe(overrideProfile.id);
+
+    const cleared = await h.app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${coldId}`,
+      payload: { profileId: null },
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect((cleared.json() as { profileId: string | null }).profileId).toBeNull();
+
+    const badPatch = await h.app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${coldId}`,
+      payload: { profileId: 42 },
+    });
+    expect(badPatch.statusCode).toBe(400);
+  });
+
   it('GET channels carries failover:null when no row; a complete row populates failover and per-placement indicators', async () => {
     const h = await harness();
     const { channel, coldId } = await createChannelWithColdPlacement(h);
@@ -2045,6 +2095,50 @@ describe('POST /api/restreamer/channels/:id/apply', () => {
       payload: { placements: [{ instanceId: 'zone2', nodeId: 'n1' }], force: true },
     });
     expect(forced.statusCode).toBe(200);
+  });
+
+  it('persists placement profileId on new and existing placements; invalid type -> 400', async () => {
+    const h = await harness();
+    const channelProfile = await createProfile(h.app, 'channel-profile');
+    const overrideProfile = await createProfile(h.app, 'override-profile');
+    const created = await h.app.inject({
+      method: 'POST',
+      url: '/api/restreamer/channels',
+      payload: {
+        channelName: 'BBB', // resolves via tvh topology on both zone1 and zone2
+        channelNumber: '10',
+        profileId: channelProfile.id,
+        placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const channel = created.json() as RestreamChannel;
+    const before = (await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' })).json() as RestreamChannelWithStatus[];
+    const existingId = before.find((c) => c.id === channel.id)!.placements.find((p) => p.nodeId === 'n1')!.id;
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/apply`,
+      payload: {
+        placements: [
+          { id: existingId, instanceId: 'zone1', nodeId: 'n1', profileId: overrideProfile.id },
+          { instanceId: 'zone2', nodeId: 'n1', profileId: null },
+        ],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const updated = res.json() as RestreamChannelWithStatus;
+    expect(updated.placements.find((p) => p.id === existingId)!.profileId).toBe(overrideProfile.id);
+    expect(updated.placements.find((p) => p.instanceId === 'zone2')!.profileId).toBeNull();
+
+    const bad = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/apply`,
+      payload: {
+        placements: [{ id: existingId, instanceId: 'zone1', nodeId: 'n1', profileId: 42 }],
+      },
+    });
+    expect(bad.statusCode).toBe(400);
   });
 });
 

@@ -100,11 +100,11 @@ function parsePlacementInput(raw: unknown): PlacementInput {
     }
     input.mode = p.mode;
   }
-  if (p.weight !== undefined) {
-    if (p.weight !== null && typeof p.weight !== 'number') {
-      throw httpError(400, 'placement.weight must be a number or null');
+  if (p.profileId !== undefined) {
+    if (p.profileId !== null && typeof p.profileId !== 'string') {
+      throw httpError(400, 'placement.profileId must be a string or null');
     }
-    input.weight = p.weight;
+    input.profileId = p.profileId;
   }
   if (p.programNumber !== undefined) {
     if (p.programNumber !== null && typeof p.programNumber !== 'number') {
@@ -806,8 +806,8 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
         if (p.mode !== undefined && p.mode !== 'hot' && p.mode !== 'cold') {
           throw httpError(400, "placement.mode must be 'hot' or 'cold'");
         }
-        if (p.weight != null && typeof p.weight !== 'number') {
-          throw httpError(400, 'placement.weight must be a number or null');
+        if (p.profileId != null && typeof p.profileId !== 'string') {
+          throw httpError(400, 'placement.profileId must be a string or null');
         }
         if (p.programNumber != null && typeof p.programNumber !== 'number') {
           throw httpError(400, 'placement.programNumber must be a number or null');
@@ -817,7 +817,7 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
           instanceId: requireString(p.instanceId, 'placement.instanceId'),
           nodeId: requireString(p.nodeId, 'placement.nodeId'),
           mode,
-          weight: (p.weight as number | null | undefined) ?? null,
+          profileId: (p.profileId as string | null | undefined) ?? null,
           programNumber: (p.programNumber as number | null | undefined) ?? null,
           enabled: p.enabled === undefined ? true : !!p.enabled,
         };
@@ -887,11 +887,11 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
       }
       patch.mode = b.mode;
     }
-    if (b.weight !== undefined) {
-      if (b.weight !== null && typeof b.weight !== 'number') {
-        throw httpError(400, 'weight must be a number or null');
+    if (b.profileId !== undefined) {
+      if (b.profileId !== null && typeof b.profileId !== 'string') {
+        throw httpError(400, 'profileId must be a string or null');
       }
-      patch.weight = b.weight;
+      patch.profileId = b.profileId;
     }
     if (b.programNumber !== undefined) {
       if (b.programNumber !== null && typeof b.programNumber !== 'number') {

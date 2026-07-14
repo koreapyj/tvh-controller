@@ -121,8 +121,8 @@ export interface RestreamPlacementsTable {
   /** failover order — lower is preferred */
   priority: number;
   enabled: number;
-  /** tvheadend subscription weight override; NULL = daemon default */
-  weight: number | null;
+  /** per-placement profile override; NULL = inherit the channel's profile */
+  profile_id: string | null;
   /** manual program-number (service SID) override; NULL = derived channel→service→sid */
   program_number: number | null;
   /** 'hot' = always encodes; 'cold' = standby, encodes only while an activation row exists */
