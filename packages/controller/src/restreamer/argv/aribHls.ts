@@ -1,19 +1,26 @@
-// ported from restreamer src/pipeline/templates/aribHls.ts — keep in sync;
-// if that file changes, update this port and the golden fixture in
-// test/argv.test.ts together.
+// SOLE owner of 'arib-hls' profile → ffmpeg argv rendering. The daemon
+// (restreamer repo) no longer has an aribHls.ts of its own — the daemon only
+// speaks the wire contract's 'raw-argv' pipeline template now. 'arib-hls' is
+// a controller-owned authoring/storage format for restream profiles (see
+// packages/shared/src/restreamProfile.ts); this module renders a completed
+// AribHlsParams payload into the raw ffmpeg argv that gets pushed as a
+// RawArgvParams doc.
 //
 // Pure params → string[] builder. Must NOT import anything daemon-specific
-// (no filesystem, no process, no runtime context) — the controller uses this
-// to pre-render a 'raw-argv' PipelineParams doc for nodes that advertise the
-// 'raw-argv' template, so the daemon-side filter-graph/var_stream_map logic
-// stays in exactly one place (semantically) even though it now runs in two
-// processes. Must be deterministic: no Date, no randomness, no unordered
-// object iteration — the output feeds a SHA-256 doc-revision hash.
+// (no filesystem, no process, no runtime context). Must be deterministic: no
+// Date, no randomness, no unordered object iteration — the output feeds a
+// SHA-256 doc-revision hash.
 
 import type { AribHlsParams, RawArgvParams } from '@tvhc/shared';
 
 /** software-deinterlace + inverse-telecine chain running on OpenCL, frames mapped back to QSV for the encoder */
 export const IVTC_CHAIN = 'hwmap=derive_device=opencl,ivtc_opencl,hwmap=derive_device=qsv:reverse=1';
+
+/** software yadif deinterlace chain running on OpenCL, frames mapped back to QSV for the encoder */
+export const YADIF_CHAIN = 'hwmap=derive_device=opencl,yadif_opencl,hwmap=derive_device=qsv:reverse=1';
+
+/** software bwdif deinterlace chain running on OpenCL, frames mapped back to QSV for the encoder */
+export const BWDIF_CHAIN = 'hwmap=derive_device=opencl,bwdif_opencl,hwmap=derive_device=qsv:reverse=1';
 
 /** audio bitrate default is index-dependent (see contract note on AribHlsAudio) */
 function defaultAudioBitrate(index: number): string {
@@ -65,6 +72,16 @@ export function buildFilterComplex(params: AribHlsParams, thumbEnabled: boolean)
       video = thumbEnabled
         ? `[0:v]split[1080p][tmpv];[tmpv]fps=1/${interval},hwdownload,format=nv12,${thumbScale}[thumb]`
         : `[0:v]null[1080p]`;
+      break;
+    case 'yadif':
+      video = thumbEnabled
+        ? `[0:v]split[venc][vtmb];[venc]${YADIF_CHAIN}[1080p];[vtmb]deinterlace_qsv,fps=1/${interval},hwdownload,format=nv12,${thumbScale}[thumb]`
+        : `[0:v]${YADIF_CHAIN}[1080p]`;
+      break;
+    case 'bwdif':
+      video = thumbEnabled
+        ? `[0:v]split[venc][vtmb];[venc]${BWDIF_CHAIN}[1080p];[vtmb]deinterlace_qsv,fps=1/${interval},hwdownload,format=nv12,${thumbScale}[thumb]`
+        : `[0:v]${BWDIF_CHAIN}[1080p]`;
       break;
   }
 

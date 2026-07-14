@@ -636,6 +636,22 @@ migrations['018_restream_node_state_raw_argv'] = {
   },
 };
 
+migrations['019_drop_advertised_raw_argv'] = {
+  // raw-argv rendering is now unconditional — every node gets a pre-rendered
+  // raw-argv doc regardless of advertised capabilities, so the sticky
+  // per-node flag added in 018 is moot. Kept as a separate migration (rather
+  // than editing 018) because 018 is already applied in production.
+  async up(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('restream_node_state').dropColumn('advertised_raw_argv').execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .alterTable('restream_node_state')
+      .addColumn('advertised_raw_argv', 'boolean', (c) => c.notNull().defaultTo(0))
+      .execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

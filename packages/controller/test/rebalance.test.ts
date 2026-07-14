@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import type { PipelineParams } from '@tvhc/shared';
+import type { AribHlsParams } from '@tvhc/shared';
 import {
   DEFAULT_HYSTERESIS,
   DEFAULT_STICKY_MS,
@@ -78,7 +78,7 @@ describe('parseBitrateMbps / expectedChannelMbps', () => {
       templateVersion: 1,
       video: { mode: 'ivtc' },
       audio: [{}, {}],
-    } as unknown as PipelineParams;
+    } as unknown as AribHlsParams;
     // (3 + 0.128 + 0.064) * 1.1
     expect(expectedChannelMbps(payload)).toBeCloseTo(3.5112, 6);
 
@@ -87,7 +87,7 @@ describe('parseBitrateMbps / expectedChannelMbps', () => {
       templateVersion: 1,
       video: { mode: 'ivtc', bitrate: '4M' },
       audio: [{ bitrate: '192k' }],
-    } as unknown as PipelineParams;
+    } as unknown as AribHlsParams;
     expect(expectedChannelMbps(explicit)).toBeCloseTo((4 + 0.192) * 1.1, 6);
   });
 });

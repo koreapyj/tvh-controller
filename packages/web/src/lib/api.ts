@@ -41,7 +41,7 @@ import type {
   UploadJob,
   UploadStatus,
   LogLine,
-  PipelineParams,
+  AribHlsParams,
   RestreamChannelWithStatus,
   RestreamPlaylist,
   RestreamProfile,
@@ -306,9 +306,9 @@ export const api = {
     ),
 
   restreamProfiles: () => http<RestreamProfile[]>('GET', '/api/restreamer/profiles'),
-  createRestreamProfile: (name: string, payload: PipelineParams) =>
+  createRestreamProfile: (name: string, payload: AribHlsParams) =>
     http<RestreamProfile>('POST', '/api/restreamer/profiles', { name, payload }),
-  updateRestreamProfile: (id: string, patch: { name?: string; payload?: PipelineParams }) =>
+  updateRestreamProfile: (id: string, patch: { name?: string; payload?: AribHlsParams }) =>
     http<RestreamProfile>('PUT', `/api/restreamer/profiles/${id}`, patch),
   deleteRestreamProfile: (id: string) =>
     http<{ ok: boolean }>('DELETE', `/api/restreamer/profiles/${id}`),

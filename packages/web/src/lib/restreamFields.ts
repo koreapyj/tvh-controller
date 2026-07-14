@@ -61,11 +61,13 @@ export interface ProfileFieldSpec {
   section?: string;
 }
 
-/** video.mode values from the wire contract — selects the filter branch + default GOP */
+/** video.mode values from the profile schema — selects the filter branch + default GOP */
 export const VIDEO_MODE_OPTIONS: ProfileEnumOption[] = [
   { value: 'ivtc', label: 'ivtc (film, 24000/1001)' },
   { value: 'deinterlace', label: 'deinterlace (video, 30000/1001)' },
   { value: 'none', label: 'none (pass frames through)' },
+  { value: 'yadif', label: 'yadif (deinterlace, 30000/1001)' },
+  { value: 'bwdif', label: 'bwdif (deinterlace, 30000/1001)' },
 ];
 
 /**
@@ -245,7 +247,13 @@ export function buildProfilePayload(state: ProfileFormState): BuildProfileResult
     };
   }
   const mode = state.vals['video.mode'];
-  if (mode !== 'ivtc' && mode !== 'deinterlace' && mode !== 'none') {
+  if (
+    mode !== 'ivtc' &&
+    mode !== 'deinterlace' &&
+    mode !== 'none' &&
+    mode !== 'yadif' &&
+    mode !== 'bwdif'
+  ) {
     return { ok: false, error: 'video mode is required' };
   }
   const payload: Record<string, unknown> = {

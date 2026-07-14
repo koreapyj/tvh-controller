@@ -88,11 +88,11 @@ export interface IgnoredOrphansTable {
   ignored_at: ColumnType<Date, string | undefined, never>;
 }
 
-/** named encoding profile; payload is a fully resolved PipelineParams */
+/** named encoding profile; payload is a fully resolved AribHlsParams */
 export interface RestreamProfilesTable {
   id: string;
   name: string;
-  /** PipelineParams JSON (wire contract) — pushed to daemons verbatim */
+  /** AribHlsParams JSON (controller-owned profile schema) — rendered to raw-argv before push */
   payload: string;
   updated_at: ColumnType<Date, string, string>;
 }
@@ -185,8 +185,6 @@ export interface RestreamNodeStateTable {
   node_id: string;
   pushed_hash: string;
   pushed_at: ColumnType<Date, string, string>;
-  /** node has ever advertised {id:'raw-argv',version:1} in /v1/status.templates; sticky — never cleared on downgrade */
-  advertised_raw_argv: Generated<number>;
 }
 
 /** DB-managed master playlist, served at GET /playlists/<slug>.m3u */

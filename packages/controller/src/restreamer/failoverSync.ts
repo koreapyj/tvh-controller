@@ -40,10 +40,10 @@
  */
 
 import type {
+  AribHlsParams,
   FailoverPhase,
   FailoverTriggerReason,
   NodeProbeSettings,
-  PipelineParams,
 } from '@tvhc/shared';
 import type { AppConfig, RestreamerNodeConfig } from '../config.js';
 import type { Db } from '../db/db.js';
@@ -439,14 +439,9 @@ export class FailoverSync {
     let list = 120;
     if (payloadText) {
       try {
-        const payload = JSON.parse(payloadText) as PipelineParams;
-        if (payload.template === 'arib-hls') {
-          seg = payload.hls?.segmentSeconds ?? 5;
-          list = payload.hls?.listSize ?? 120;
-        } else {
-          seg = payload.segmentSeconds ?? 5;
-          list = payload.listSize ?? 120;
-        }
+        const payload = JSON.parse(payloadText) as AribHlsParams;
+        seg = payload.hls?.segmentSeconds ?? 5;
+        list = payload.hls?.listSize ?? 120;
       } catch {
         /* defaults */
       }

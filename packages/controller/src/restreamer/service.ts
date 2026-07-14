@@ -19,7 +19,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { Value } from '@sinclair/typebox/value';
 import {
-  PipelineParams,
+  AribHlsParams,
   RESTREAMER_API_VERSION,
   chanNumberOrder,
   type ChannelFailoverStatus,
@@ -121,19 +121,21 @@ export function sessionsHash(sessions: readonly unknown[]): string {
 }
 
 /**
- * Validate + default-complete a profile payload against the vendored wire
- * contract. Throws a 400-flavored error naming the first offending path.
+ * Validate + default-complete a stored profile payload against the
+ * controller-owned profile schema (formerly the wire contract's 'arib-hls'
+ * template — see restreamProfile.ts). Throws a 400-flavored error naming the
+ * first offending path.
  */
-export function completePipelineParams(raw: unknown): PipelineParams {
-  const completed = Value.Default(PipelineParams, Value.Clone(raw));
-  if (!Value.Check(PipelineParams, completed)) {
-    const first = Value.Errors(PipelineParams, completed).First();
+export function completeProfileParams(raw: unknown): AribHlsParams {
+  const completed = Value.Default(AribHlsParams, Value.Clone(raw));
+  if (!Value.Check(AribHlsParams, completed)) {
+    const first = Value.Errors(AribHlsParams, completed).First();
     throw httpError(
       400,
       `invalid pipeline params${first ? ` at ${first.path || '/'}: ${first.message}` : ''}`,
     );
   }
-  return completed as PipelineParams;
+  return completed as AribHlsParams;
 }
 
 /**
@@ -473,7 +475,7 @@ export class RestreamerService {
     return {
       id: r.id,
       name: r.name,
-      payload: JSON.parse(r.payload) as PipelineParams,
+      payload: JSON.parse(r.payload) as AribHlsParams,
       updatedAt: new Date(r.updated_at).toISOString(),
     };
   }
@@ -504,7 +506,7 @@ export class RestreamerService {
 
   private async createProfileInner(name: string, payload: unknown): Promise<RestreamProfile> {
     if (!name.trim()) throw httpError(400, 'profile name must not be empty');
-    const completed = completePipelineParams(payload);
+    const completed = completeProfileParams(payload);
     await this.assertProfileNameFree(name);
     const id = randomUUID();
     await this.db
@@ -541,7 +543,7 @@ export class RestreamerService {
       await this.assertProfileNameFree(name, id);
     }
     const payload =
-      patch.payload !== undefined ? completePipelineParams(patch.payload) : existing.payload;
+      patch.payload !== undefined ? completeProfileParams(patch.payload) : existing.payload;
     await this.db
       .updateTable('restream_profiles')
       .set({ name, payload: JSON.stringify(payload), updated_at: now() })
@@ -1908,10 +1910,6 @@ export class RestreamerService {
       )
       .execute();
 
-    // read once per doc computation — flipping mid-loop would make sessions
-    // within the same doc inconsistently semantic vs raw-argv
-    const rawCapable = await this.nodeSupportsRawArgv(instanceId, nodeId);
-
     const sessions: DesiredSession[] = [];
     const blocked: BlockedPlacement[] = [];
     for (const row of rows) {
@@ -1963,19 +1961,14 @@ export class RestreamerService {
       // per-placement profile override (row.placement_profile_payload) wins
       // over the channel's own profile when set.
       const semantic = Value.Default(
-        PipelineParams,
+        AribHlsParams,
         JSON.parse(row.placement_profile_payload ?? row.profile_payload),
-      ) as PipelineParams;
-      // profiles are stored/edited as semantic 'arib-hls' params; for nodes
-      // that advertise the 'raw-argv' template, pre-render the equivalent
-      // argv here so the daemon does not need arib-hls's requiredCaps
-      // (qsv/opencl) — it just runs the argv the controller already built.
-      // The `template === 'arib-hls'` guard is defensive: PipelineParams is a
-      // union that technically also admits a stored raw-argv profile; such a
-      // profile is already a valid doc and must pass through unchanged
-      // rather than being fed back into the arib-hls builder.
-      const pipeline: PipelineParams =
-        rawCapable && semantic.template === 'arib-hls' ? buildRawArgvParams(semantic) : semantic;
+      ) as AribHlsParams;
+      // profiles are stored/edited as semantic 'arib-hls' params; every node
+      // now speaks only the wire's 'raw-argv' template, so the controller
+      // always pre-renders the equivalent argv here — the daemon never sees
+      // the semantic payload or needs arib-hls's requiredCaps (qsv/opencl).
+      const pipeline = buildRawArgvParams(semantic);
       sessions.push({
         name: row.slug,
         enabled: true,
@@ -2046,50 +2039,6 @@ export class RestreamerService {
       .where('instance_id', '=', instanceId)
       .where('node_id', '=', nodeId)
       .executeTakeFirst();
-  }
-
-  /** true when this node has ever advertised the 'raw-argv' template (sticky flag) */
-  private async nodeSupportsRawArgv(instanceId: string, nodeId: string): Promise<boolean> {
-    const row = await this.db
-      .selectFrom('restream_node_state')
-      .select('advertised_raw_argv')
-      .where('instance_id', '=', instanceId)
-      .where('node_id', '=', nodeId)
-      .executeTakeFirst();
-    return !!row?.advertised_raw_argv; // coerce sqlite 0/1
-  }
-
-  /**
-   * Record that a node advertised 'raw-argv'@1 in /v1/status.templates.
-   * Sticky by design: once set, never cleared. A daemon downgrade (losing
-   * raw-argv support) is an operational event an admin should notice and
-   * react to explicitly — silently auto-reverting the variant here would
-   * flap every affected session's pipeline (and therefore its doc hash,
-   * restarting the ffmpeg process) the moment a poll happens to race a
-   * daemon restart.
-   */
-  async persistAdvertisedRawArgv(
-    instanceId: string,
-    nodeId: string,
-    templates: { id: string; version: number }[],
-  ): Promise<void> {
-    const supportsRawArgv = templates.some((t) => t.id === 'raw-argv' && t.version === 1);
-    if (!supportsRawArgv) return;
-    // the node may never have been pushed yet (no restream_node_state row) —
-    // pushed_hash/pushed_at are NOT NULL with no push history to fill them;
-    // '' can never equal a real sha256 doc revision, so it naturally forces
-    // the next real push to proceed as if nothing had been pushed.
-    await this.db
-      .insertInto('restream_node_state')
-      .values({
-        instance_id: instanceId,
-        node_id: nodeId,
-        pushed_hash: '',
-        pushed_at: now(),
-        advertised_raw_argv: 1,
-      })
-      .onDuplicateKeyUpdate({ advertised_raw_argv: 1 })
-      .execute();
   }
 
   // ---------- push ----------
@@ -2427,10 +2376,6 @@ export class RestreamerService {
       onSourcesChanged: (instanceId, nodeId) => {
         this.onSourcesChanged(instanceId, nodeId);
       },
-      // sticky capability flag — fires every successful poll; the write is
-      // idempotent (a no-op once already set) so no debounce is needed
-      onTemplatesObserved: (instanceId, nodeId, templates) =>
-        this.persistAdvertisedRawArgv(instanceId, nodeId, templates),
       // probe state is pulled at status-build time — the engine is the single
       // source of truth; patching it in afterwards would be wiped every poll
       getProbes: (instanceId, nodeId) => this.probeEngine.nodeProbeStatus(instanceId, nodeId),

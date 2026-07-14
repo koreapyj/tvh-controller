@@ -376,7 +376,8 @@ describe('profiles', () => {
     expect(node.puts()).toHaveLength(2);
     expect(node.puts()[1]!.revision).not.toBe(node.puts()[0]!.revision);
     const session = node.desired!.sessions[0]!;
-    expect((session.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe('4M');
+    const argv = (session.pipeline as RawArgvParams).ffmpegArgv;
+    expect(argv[argv.indexOf('-b:v:0') + 1]).toBe('4M');
     await h.destroy();
   });
 
@@ -433,7 +434,8 @@ describe('profiles', () => {
     });
     expect(node.puts()).toHaveLength(2);
     const session = node.desired!.sessions[0]!;
-    expect((session.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe('9M');
+    const argv = (session.pipeline as RawArgvParams).ffmpegArgv;
+    expect(argv[argv.indexOf('-b:v:0') + 1]).toBe('9M');
     await h.destroy();
   });
 });
@@ -758,22 +760,22 @@ describe('desired doc determinism and push', () => {
     // no override yet — both nodes use the channel profile (fallback path)
     expect(n1Placement.profileId).toBeNull();
 
+    function pipelineBitrate(pipeline: unknown): string | undefined {
+      const argv = (pipeline as RawArgvParams).ffmpegArgv;
+      const i = argv.indexOf('-b:v:0');
+      return i === -1 ? undefined : argv[i + 1];
+    }
+
     const before = await h.service.computeNodeDoc('zone1', 'n1');
     const baselineRevision = before.doc!.revision;
-    expect((before.doc!.sessions[0]!.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe(
-      '3M',
-    );
+    expect(pipelineBitrate(before.doc!.sessions[0]!.pipeline)).toBe('3M');
 
     // override n2 only — n1's doc (and revision) must be unaffected
     await h.service.updatePlacement(n2Placement.id, { profileId: profileB.id });
     const n2Doc = await h.service.computeNodeDoc('zone1', 'n2');
-    expect((n2Doc.doc!.sessions[0]!.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe(
-      '6M',
-    );
+    expect(pipelineBitrate(n2Doc.doc!.sessions[0]!.pipeline)).toBe('6M');
     const n1DocAfter = await h.service.computeNodeDoc('zone1', 'n1');
-    expect((n1DocAfter.doc!.sessions[0]!.pipeline as { video: { bitrate?: string } }).video.bitrate).toBe(
-      '3M',
-    );
+    expect(pipelineBitrate(n1DocAfter.doc!.sessions[0]!.pipeline)).toBe('3M');
     expect(n1DocAfter.doc!.revision).toBe(baselineRevision);
 
     // override n1 too, then clear it — the doc reverts to the exact original hash
@@ -2447,32 +2449,17 @@ describe('RestreamerService: node push failed/healed event-log emission (site #7
   });
 });
 
-// ---------- raw-argv variant gating ----------
+// ---------- raw-argv rendering ----------
 
 /**
  * Profiles/placements stay semantic ('arib-hls') in the DB and UI throughout.
- * These tests cover the *rendering* layer only: whether computeNodeDoc emits
- * the stored semantic pipeline as-is, or pre-renders it into a 'raw-argv' doc
- * for nodes that have (stickily) advertised support for that template.
+ * Every node now speaks only the wire's 'raw-argv' template — there is no
+ * per-node capability gating any more, so computeNodeDoc unconditionally
+ * pre-renders the stored semantic profile into a 'raw-argv' doc.
  */
-describe('raw-argv variant gating', () => {
-  it('a node that has never advertised raw-argv gets the semantic arib-hls doc (regression)', async () => {
+describe('raw-argv rendering', () => {
+  it('computeNodeDoc always pre-renders the stored profile into a raw-argv doc matching buildRawArgvParams', async () => {
     const h = await setup();
-    const p = await h.service.createProfile('p', profilePayload());
-    await h.service.createChannel({
-      channelName: 'AT-X',
-      channelNumber: '9.1',
-      profileId: p.id,
-      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
-    });
-    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(doc!.sessions[0]!.pipeline).toMatchObject({ template: 'arib-hls' });
-    await h.destroy();
-  });
-
-  it('a raw-argv-capable node gets a pre-rendered raw-argv doc matching buildRawArgvParams', async () => {
-    const h = await setup();
-    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
     const p = await h.service.createProfile('p', profilePayload());
     await h.service.createChannel({
       channelName: 'AT-X',
@@ -2495,7 +2482,6 @@ describe('raw-argv variant gating', () => {
 
   it('doc revision for a raw-argv-rendered node is deterministic across repeated computes', async () => {
     const h = await setup();
-    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
     const p = await h.service.createProfile('p', profilePayload());
     await h.service.createChannel({
       channelName: 'AT-X',
@@ -2510,9 +2496,8 @@ describe('raw-argv variant gating', () => {
     await h.destroy();
   });
 
-  it('mixed fleet: only the raw-argv-capable node gets rendered argv; the other stays semantic and both push cleanly', async () => {
+  it('every node in a fleet gets rendered raw-argv, and both push cleanly', async () => {
     const h = await setup();
-    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
     const p = await h.service.createProfile('p', profilePayload());
     await h.service.createChannel({
       channelName: 'AT-X',
@@ -2526,7 +2511,7 @@ describe('raw-argv variant gating', () => {
     const n1 = h.nodes.get('zone1/n1')!;
     const n2 = h.nodes.get('zone1/n2')!;
     expect(n1.desired!.sessions[0]!.pipeline).toMatchObject({ template: 'raw-argv' });
-    expect(n2.desired!.sessions[0]!.pipeline).toMatchObject({ template: 'arib-hls' });
+    expect(n2.desired!.sessions[0]!.pipeline).toMatchObject({ template: 'raw-argv' });
 
     const pushed1 = await h.service.pushNode('zone1', 'n1', true);
     const pushed2 = await h.service.pushNode('zone1', 'n2', true);
@@ -2535,16 +2520,9 @@ describe('raw-argv variant gating', () => {
     await h.destroy();
   });
 
-  it('the flag is sticky: a later poll without raw-argv in the template list does not clear it', async () => {
+  it('a yadif-mode profile renders the yadif_opencl OpenCL sandwich into the pushed doc', async () => {
     const h = await setup();
-    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
-    // simulate a subsequent poll of a daemon that (for whatever reason) no
-    // longer lists raw-argv — the flag must NOT be cleared by this
-    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'arib-hls', version: 1 }]);
-    const row = await nodeStateRow(h.db, 'zone1', 'n1');
-    expect(row!.advertised_raw_argv).toBe(1);
-
-    const p = await h.service.createProfile('p', profilePayload());
+    const p = await h.service.createProfile('p', profilePayload({ mode: 'yadif' }));
     await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
@@ -2552,64 +2530,12 @@ describe('raw-argv variant gating', () => {
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
     const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(doc!.sessions[0]!.pipeline).toMatchObject({ template: 'raw-argv' });
-    await h.destroy();
-  });
-
-  it('persistAdvertisedRawArgv upserts a fresh row when the node has never been pushed', async () => {
-    const h = await setup();
-    expect(await nodeStateRow(h.db, 'zone1', 'n2')).toBeUndefined();
-    await h.service.persistAdvertisedRawArgv('zone1', 'n2', [{ id: 'raw-argv', version: 1 }]);
-    const row = await nodeStateRow(h.db, 'zone1', 'n2');
-    expect(row).toMatchObject({ advertised_raw_argv: 1, pushed_hash: '' });
-
-    // the '' placeholder can never equal a real sha256 doc revision, so the
-    // first genuine push after this must proceed as an ordinary push
-    const p = await h.service.createProfile('p', profilePayload());
-    await h.service.createChannel({
-      channelName: 'AT-X',
-      channelNumber: '9.1',
-      profileId: p.id,
-      placements: [{ instanceId: 'zone1', nodeId: 'n2' }],
-    });
-    const n2 = h.nodes.get('zone1/n2')!;
-    expect(n2.puts()).toHaveLength(1);
-    await h.destroy();
-  });
-
-  it('a wrong template version does not set the sticky flag', async () => {
-    const h = await setup();
-    await h.service.persistAdvertisedRawArgv('zone1', 'n1', [{ id: 'raw-argv', version: 2 }]);
-    expect(await nodeStateRow(h.db, 'zone1', 'n1')).toBeUndefined();
-
-    const p = await h.service.createProfile('p', profilePayload());
-    await h.service.createChannel({
-      channelName: 'AT-X',
-      channelNumber: '9.1',
-      profileId: p.id,
-      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
-    });
-    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(doc!.sessions[0]!.pipeline).toMatchObject({ template: 'arib-hls' });
-    await h.destroy();
-  });
-
-  it('pollerHooks().onTemplatesObserved is wired to persistAdvertisedRawArgv', async () => {
-    const h = await setup();
-    const hooks = h.service.pollerHooks();
-    await hooks.onTemplatesObserved!('zone1', 'n1', [{ id: 'raw-argv', version: 1 }]);
-    const row = await nodeStateRow(h.db, 'zone1', 'n1');
-    expect(row!.advertised_raw_argv).toBe(1);
-
-    const p = await h.service.createProfile('p', profilePayload());
-    await h.service.createChannel({
-      channelName: 'AT-X',
-      channelNumber: '9.1',
-      profileId: p.id,
-      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
-    });
-    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(doc!.sessions[0]!.pipeline).toMatchObject({ template: 'raw-argv' });
+    const pipeline = doc!.sessions[0]!.pipeline as RawArgvParams;
+    expect(pipeline.template).toBe('raw-argv');
+    const filterComplex = pipeline.ffmpegArgv[pipeline.ffmpegArgv.indexOf('-filter_complex') + 1];
+    expect(filterComplex).toContain(
+      'hwmap=derive_device=opencl,yadif_opencl,hwmap=derive_device=qsv:reverse=1',
+    );
     await h.destroy();
   });
 });

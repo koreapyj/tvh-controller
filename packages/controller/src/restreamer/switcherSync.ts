@@ -30,7 +30,7 @@
 
 import { RESTREAMER_API_VERSION } from '@tvhc/shared';
 import type {
-  PipelineParams,
+  AribHlsParams,
   SwitcherChannel,
   SwitcherChannelStatus,
   SwitcherDesiredState,
@@ -238,13 +238,10 @@ export class SwitcherSync {
         });
         continue;
       }
-      const payload = JSON.parse(g.profilePayload) as PipelineParams;
+      const payload = JSON.parse(g.profilePayload) as AribHlsParams;
       channels.push({
         slug: g.slug,
-        segmentSeconds:
-          payload.template === 'arib-hls'
-            ? (payload.hls?.segmentSeconds ?? 5)
-            : (payload.segmentSeconds ?? 5),
+        segmentSeconds: payload.hls?.segmentSeconds ?? 5,
         upstreams,
       });
     }
@@ -426,7 +423,7 @@ export class SwitcherSync {
       if (!found) continue; // never rebalance a channel the switcher doesn't know yet
       switcherBySlug.set(g.slug, found.switcherId);
       const health = new Map(found.channel.upstreams.map((u) => [u.id, u.healthy]));
-      const payload = JSON.parse(g.profilePayload) as PipelineParams;
+      const payload = JSON.parse(g.profilePayload) as AribHlsParams;
       channels.push({
         slug: g.slug,
         channelId: g.channelId,

@@ -28,7 +28,7 @@ function nodeStatus(overrides: Partial<StatusResponse> = {}): StatusResponse {
     startedAt: '2026-07-06T00:00:00Z',
     uptimeSec: 42,
     capabilities: ['qsv'],
-    templates: [{ id: 'arib-hls', version: 1 }],
+    templates: [{ id: 'raw-argv', version: 1 }],
     desiredRevision: 'rev-1',
     sessions: [],
     ...overrides,
@@ -181,12 +181,12 @@ describe('RestreamerPoller', () => {
     it('a successful poll carries capabilities and templates through into the status', async () => {
       const { cache, status, poller } = setup();
       status.mockResolvedValue(
-        nodeStatus({ capabilities: ['qsv', 'opencl'], templates: [{ id: 'arib-hls', version: 1 }, { id: 'raw-argv', version: 1 }] }),
+        nodeStatus({ capabilities: ['qsv', 'opencl'], templates: [{ id: 'raw-argv', version: 1 }] }),
       );
       await poller.pollOnce();
       expect(cache.get('i1').restreamers[0]).toMatchObject({
         capabilities: ['qsv', 'opencl'],
-        templates: [{ id: 'arib-hls', version: 1 }, { id: 'raw-argv', version: 1 }],
+        templates: [{ id: 'raw-argv', version: 1 }],
       });
     });
 
@@ -195,37 +195,6 @@ describe('RestreamerPoller', () => {
       status.mockRejectedValue(new Error('down'));
       await poller.pollOnce();
       expect(cache.get('i1').restreamers[0]).toMatchObject({ capabilities: null, templates: null });
-    });
-
-    describe('onTemplatesObserved', () => {
-      it('fires on every successful poll, unconditionally, with the node templates', async () => {
-        const onTemplatesObserved = vi.fn();
-        const { status, poller } = setup({ onTemplatesObserved });
-        status.mockResolvedValue(nodeStatus({ templates: [{ id: 'arib-hls', version: 1 }] }));
-        await poller.pollOnce();
-        expect(onTemplatesObserved).toHaveBeenCalledTimes(1);
-        expect(onTemplatesObserved).toHaveBeenCalledWith('i1', 'n1', [{ id: 'arib-hls', version: 1 }]);
-
-        // fires again on an identical second successful poll — no debounce/dedupe
-        await poller.pollOnce();
-        expect(onTemplatesObserved).toHaveBeenCalledTimes(2);
-      });
-
-      it('does not fire on a failed poll', async () => {
-        const onTemplatesObserved = vi.fn();
-        const { status, poller } = setup({ onTemplatesObserved });
-        status.mockRejectedValue(new Error('down'));
-        await poller.pollOnce();
-        expect(onTemplatesObserved).not.toHaveBeenCalled();
-      });
-
-      it('a rejecting hook is swallowed and does not fail the poll', async () => {
-        const onTemplatesObserved = vi.fn(() => Promise.reject(new Error('persist failed')));
-        const { status, poller } = setup({ onTemplatesObserved });
-        status.mockResolvedValue(nodeStatus());
-        await expect(poller.pollOnce()).resolves.toBeUndefined();
-        expect(onTemplatesObserved).toHaveBeenCalledTimes(1);
-      });
     });
   });
 

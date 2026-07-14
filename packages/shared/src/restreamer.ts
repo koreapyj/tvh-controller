@@ -23,21 +23,24 @@
  */
 
 import type {
-  PipelineParams,
   SessionStatus,
   SourceCatalogEntry,
   SwitchReason,
   SwitcherChannelStatus,
 } from './restreamer-contract.js';
+import type { AribHlsParams } from './restreamProfile.js';
 
 /**
- * Named encoding profile. `payload` is a fully resolved PipelineParams from
- * the wire contract — the daemon never resolves profile names.
+ * Named encoding profile. `payload` is a fully resolved AribHlsParams — the
+ * controller-owned profile schema (formerly the wire contract's 'arib-hls'
+ * template; see ./restreamProfile.ts). The controller renders this into a
+ * raw ffmpeg argv before pushing it to a node; the daemon never resolves
+ * profile names or sees the semantic shape.
  */
 export interface RestreamProfile {
   id: string;
   name: string;
-  payload: PipelineParams;
+  payload: AribHlsParams;
   updatedAt: string;
 }
 

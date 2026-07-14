@@ -1,7 +1,9 @@
 /*
- * GOLDEN TEST — ported from restreamer test/argv.test.ts — keep in sync; if
- * that file's fixtures change, update packages/controller/src/restreamer/argv/aribHls.ts
- * and this file together.
+ * GOLDEN TEST for packages/controller/src/restreamer/argv/aribHls.ts, the
+ * SOLE remaining owner of arib-hls profile→argv rendering (the daemon repo
+ * dropped the semantic 'arib-hls' template — it only understands pre-rendered
+ * raw-argv docs now, see restreamer/src/contract/v1.ts). Update both files
+ * together when the rendering logic changes.
  *
  * Same production at-x fixtures (restreamer.sh run as `restreamer at-x` with
  * profile.d/at-x: PID=333, MODE=ivtc; restreamer.conf: SERVE_DIR=/media), but
@@ -215,6 +217,30 @@ describe('video modes', () => {
     params.video.gop = '60000/1001';
     expect(argValue(build(params, '{OUT_DIR}'), '-g:v:0')).toBe('60000/1001');
   });
+
+  it('yadif: OpenCL sandwich filter chain and GOP 30000/1001', () => {
+    const params = atXParams();
+    params.video.mode = 'yadif';
+    const argv = build(params, '{OUT_DIR}');
+    expect(argValue(argv, '-filter_complex')).toBe(
+      '[0:v]split[venc][vtmb];[venc]hwmap=derive_device=opencl,yadif_opencl,hwmap=derive_device=qsv:reverse=1[1080p];[vtmb]deinterlace_qsv,fps=1/2,hwdownload,format=nv12,scale=w=1280:h=720[thumb];[0:a:0]volume=5dB[audio0];[0:a:1]volume=5dB[audio1]',
+    );
+    expect(argValue(argv, '-g:v:0')).toBe('30000/1001');
+  });
+
+  it('bwdif: OpenCL sandwich filter chain and GOP 30000/1001', () => {
+    const params = atXParams();
+    params.video.mode = 'bwdif';
+    const argv = build(params, '{OUT_DIR}');
+    expect(argValue(argv, '-filter_complex')).toBe(
+      '[0:v]split[venc][vtmb];[venc]hwmap=derive_device=opencl,bwdif_opencl,hwmap=derive_device=qsv:reverse=1[1080p];[vtmb]deinterlace_qsv,fps=1/2,hwdownload,format=nv12,scale=w=1280:h=720[thumb];[0:a:0]volume=5dB[audio0];[0:a:1]volume=5dB[audio1]',
+    );
+    expect(argValue(argv, '-g:v:0')).toBe('30000/1001');
+  });
+
+  it('ivtc chain stays byte-identical after adding yadif/bwdif (regression guard)', () => {
+    expect(buildFilterComplex(atXParams(), true)).toBe(PROD_FILTER);
+  });
 });
 
 describe('audio', () => {
@@ -302,6 +328,24 @@ describe('thumbnail', () => {
     params.thumbnail = { enabled: false };
     expect(argValue(build(params, '{OUT_DIR}'), '-filter_complex')).toBe(
       '[0:v]vpp_qsv=deinterlace=advanced:rate=frame[1080p];[0:a:0]volume=5dB[audio0];[0:a:1]volume=5dB[audio1]',
+    );
+  });
+
+  it('disabled + yadif: chain goes straight to [1080p]', () => {
+    const params = atXParams();
+    params.video.mode = 'yadif';
+    params.thumbnail = { enabled: false };
+    expect(argValue(build(params, '{OUT_DIR}'), '-filter_complex')).toBe(
+      '[0:v]hwmap=derive_device=opencl,yadif_opencl,hwmap=derive_device=qsv:reverse=1[1080p];[0:a:0]volume=5dB[audio0];[0:a:1]volume=5dB[audio1]',
+    );
+  });
+
+  it('disabled + bwdif: chain goes straight to [1080p]', () => {
+    const params = atXParams();
+    params.video.mode = 'bwdif';
+    params.thumbnail = { enabled: false };
+    expect(argValue(build(params, '{OUT_DIR}'), '-filter_complex')).toBe(
+      '[0:v]hwmap=derive_device=opencl,bwdif_opencl,hwmap=derive_device=qsv:reverse=1[1080p];[0:a:0]volume=5dB[audio0];[0:a:1]volume=5dB[audio1]',
     );
   });
 

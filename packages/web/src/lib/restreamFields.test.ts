@@ -76,7 +76,13 @@ describe('PROFILE_FIELDS', () => {
   });
 
   it('every VIDEO_MODE_OPTIONS value validates against the contract', () => {
-    expect(VIDEO_MODE_OPTIONS.map((o) => o.value)).toEqual(['ivtc', 'deinterlace', 'none']);
+    expect(VIDEO_MODE_OPTIONS.map((o) => o.value)).toEqual([
+      'ivtc',
+      'deinterlace',
+      'none',
+      'yadif',
+      'bwdif',
+    ]);
     for (const o of VIDEO_MODE_OPTIONS) {
       const p = defaultProfilePayload();
       p.video.mode = o.value as AribHlsParamsT['video']['mode'];
