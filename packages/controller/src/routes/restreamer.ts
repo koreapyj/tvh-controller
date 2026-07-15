@@ -350,8 +350,9 @@ function resolveEntryIdentity(
 
 /**
  * Render one DB-managed master playlist in the production channels.m3u
- * format: members that are enabled and currently RUNNING on at least one
- * enabled placement's node, sorted by chanNumberOrder.
+ * format: members that are enabled, sorted by chanNumberOrder. Channels stay
+ * advertised while their encode is down so client channel lists / EPG stay
+ * stable.
  */
 async function renderPlaylistM3u(ctx: AppContext, slug: string, baseUrl: string): Promise<string> {
   const service = requireDb(ctx.restreamer, 'restream playlists');
@@ -359,10 +360,7 @@ async function renderPlaylistM3u(ctx: AppContext, slug: string, baseUrl: string)
   if (!playlist) throw httpError(404, `playlist "${slug}" not found`);
 
   const members = (await service.listChannels()).filter(
-    (c) =>
-      c.enabled &&
-      c.playlistIds.includes(playlist.id) &&
-      c.placements.some((p) => p.enabled && p.session?.state === 'running'),
+    (c) => c.enabled && c.playlistIds.includes(playlist.id),
   );
 
   const entries = members
@@ -484,9 +482,8 @@ function renderProgramme(item: UnifiedEpgEvent, channelId: string): string[] {
 
 /**
  * Render one DB-managed master playlist's XMLTV document. Member selection
- * intentionally differs from the M3U: every enabled playlist member, with no
- * running-placement requirement and no entryUrl filter — EPG stays stable
- * across channel restarts, unlike the viewer-facing stream list.
+ * differs from the M3U only in the entryUrl filter: every enabled playlist
+ * member is listed even when it has no usable entry URL.
  */
 async function renderPlaylistXmltv(ctx: AppContext, slug: string, baseUrl: string): Promise<string> {
   const service = requireDb(ctx.restreamer, 'restream playlists');

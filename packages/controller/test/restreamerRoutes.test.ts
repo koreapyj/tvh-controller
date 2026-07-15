@@ -688,7 +688,7 @@ describe('write-time availability and catalog-resolved identity (routes)', () =>
       force: true,
     });
 
-    // sessions running so the entries render — named for each channel's placement id
+    // sessions are named for each channel's placement id, attached after creation
     const withStatus = (
       await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' })
     ).json() as RestreamChannelWithStatus[];
@@ -1186,7 +1186,7 @@ describe('restreamer playlist routes', () => {
 });
 
 describe('GET /playlists/:slug.m3u', () => {
-  /** playlist with AT-X (single placement), BBB (redundant), CCC (not running) */
+  /** playlist with AT-X (single placement), BBB (redundant), CCC (backoff session — still advertised) */
   async function seedM3uFixture(
     h: Harness,
   ): Promise<{ atxPlacementId: string; bbbZone1PlacementId: string }> {
@@ -1214,7 +1214,7 @@ describe('GET /playlists/:slug.m3u', () => {
         { instanceId: 'zone2', nodeId: 'n1' },
       ],
     });
-    // member but its session is not running -> excluded
+    // backoff session on its only placement -> still advertised, not deleted
     const ccc = await post({
       channelName: 'CCC',
       channelNumber: '3',
@@ -1245,7 +1245,7 @@ describe('GET /playlists/:slug.m3u', () => {
     return { atxPlacementId, bbbZone1PlacementId };
   }
 
-  it('renders the prod format: header, EXTINF attrs, URL rule, sort, running filter', async () => {
+  it('renders the prod format: header, EXTINF attrs, URL rule, sort', async () => {
     const h = await harness();
     await seedM3uFixture(h);
 
@@ -1256,19 +1256,23 @@ describe('GET /playlists/:slug.m3u', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.headers['content-type']).toBe('audio/x-mpegurl');
-    // sorted by chanNumberOrder: "9.1" before "10" (numeric, not lexical);
-    // CCC ("3") would sort first but is excluded (session not running);
-    // a switcher is configured -> EVERY entry (single-placement AT-X included)
-    // points at the switcher publicUrl — uniform viewer URLs;
-    // relative imagecache icon -> controller logo proxy against the request
-    // base (no forwarded headers, no configured publicUrl here); absolute
-    // icon (BBB) passes through verbatim; tvg-id is the generated stable id,
-    // never the tvh uuid, so it matches the XMLTV <channel id> for the same entry
+    // sorted by chanNumberOrder: CCC ("3") first, then "9.1", then "10"
+    // (numeric, not lexical); CCC's session is in backoff yet still renders —
+    // channels stay advertised regardless of encode state, with its logo
+    // falling back to zone2's icon (see logo-fallback tests); a switcher is
+    // configured -> EVERY entry (single-placement AT-X included) points at
+    // the switcher publicUrl — uniform viewer URLs; relative imagecache icon
+    // -> controller logo proxy against the request base (no forwarded
+    // headers, no configured publicUrl here); absolute icon (BBB) passes
+    // through verbatim; tvg-id is the generated stable id, never the tvh
+    // uuid, so it matches the XMLTV <channel id> for the same entry
     expect(res.body).toBe(
       [
         '#EXTM3U url-tvg=http://ctrl.example/xmltv/tv.xml',
         '#PLAYLIST:Mock TV',
         '#KODIPROP:mimetype=application/x-mpegURL',
+        `#EXTINF:-1 tvg-id="${channelStableId('CCC', '3')}" tvg-chno="3" x-url="ccc" tvg-logo="http://ctrl.example/logos/zone2/imagecache/777",CCC`,
+        'http://sw.example/hls/ccc/playlist.m3u8',
         `#EXTINF:-1 tvg-id="${channelStableId('AT-X', '9.1')}" tvg-chno="9.1" x-url="at-x" tvg-logo="http://ctrl.example/logos/zone1/imagecache/32736",AT-X`,
         'http://sw.example/hls/at-x/playlist.m3u8',
         `#EXTINF:-1 tvg-id="${channelStableId('BBB', '10')}" tvg-chno="10" x-url="bbb" tvg-logo="http://icons.example/bbb.png",BBB`,
@@ -1364,9 +1368,9 @@ describe('GET /xmltv/:slug.xml', () => {
 
   /**
    * AT-X (9.1, single placement), BBB (10, redundant zone1+zone2), CCC (3,
-   * enabled but never given a running session — present in .xml, absent from
-   * .m3u), DDD (disabled member — excluded from both), EEE (enabled, not a
-   * playlist member — excluded from both).
+   * enabled member with no enabled placement — present in .xml, absent from
+   * .m3u via the entryUrl filter), DDD (disabled member — excluded from
+   * both), EEE (enabled, not a playlist member — excluded from both).
    */
   async function seedXmltvFixture(h: Harness): Promise<RestreamPlaylist> {
     const profile = await createProfile(h.app);
@@ -1398,7 +1402,7 @@ describe('GET /xmltv/:slug.xml', () => {
       channelNumber: '3',
       profileId: profile.id,
       playlistIds: [playlist.id],
-      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', enabled: false }],
     });
     await post({
       channelName: 'DDD',
@@ -1426,7 +1430,7 @@ describe('GET /xmltv/:slug.xml', () => {
     return { zone1: zone1Fn, zone2: zone2Fn };
   }
 
-  it('members = all enabled playlist members (running state ignored); disabled/non-members excluded', async () => {
+  it('members = all enabled playlist members; disabled/non-members excluded', async () => {
     const h = await harness();
     await seedXmltvFixture(h);
     stubEpg(h, []);
@@ -1436,7 +1440,7 @@ describe('GET /xmltv/:slug.xml', () => {
     expect(res.headers['content-type']).toBe('application/xml; charset=utf-8');
     expect(res.body).toContain(`<channel id="${channelStableId('AT-X', '9.1')}">`);
     expect(res.body).toContain(`<channel id="${channelStableId('BBB', '10')}">`);
-    // CCC has no running session anywhere -> the .m3u would omit it, .xml must not
+    // CCC has no enabled placement anywhere -> the .m3u omits it (entryUrl filter), .xml must not
     expect(res.body).toContain(`<channel id="${channelStableId('CCC', '3')}">`);
     expect(res.body).not.toContain('DDD');
     expect(res.body).not.toContain('EEE');
