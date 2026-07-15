@@ -51,6 +51,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let busyReset = $state(false);
   let busyRestart = $state(false);
 
+  // session.name is a bare placement uuid post-rename; channelSlug (resolved
+  // controller-side) is what a human should see first, with the uuid kept
+  // around (muted / tooltip) to disambiguate two placements of the same
+  // channel mid-cutover.
+  const displayName = $derived(session.channelSlug ?? session.name);
+
   $effect(() => {
     const es = new EventSource(sessionLogStreamUrl(instanceId, nodeId, session.name));
     es.addEventListener('open', () => {
@@ -98,7 +104,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 
   async function restart(): Promise<void> {
-    if (!confirm(`Restart session "${session.name}"? Playback glitches briefly.`)) return;
+    if (!confirm(`Restart session "${displayName}"? Playback glitches briefly.`)) return;
     busyRestart = true;
     try {
       await api.restartRestreamSession(instanceId, nodeId, session.name);
@@ -113,9 +119,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <svelte:window onkeydown={(e) => e.key === 'Escape' && onclose()} />
 
 <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && onclose()}>
-  <div class="modal" role="dialog" aria-modal="true" aria-label={`Session ${session.name}`}>
+  <div class="modal" role="dialog" aria-modal="true" aria-label={`Session ${displayName}`}>
     <h2 style="margin-top:0">
-      {session.name}
+      {displayName}
+      {#if session.channelSlug}<span class="muted small" title={session.name}>{session.name}</span>{/if}
       <span class="badge {sessionStateBadge(session.state)}">{session.state}</span>
     </h2>
 

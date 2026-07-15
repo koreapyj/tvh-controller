@@ -256,6 +256,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     void run(() => api.deleteRestreamChannel(c.id));
   }
 
+  /** dismiss the ⚠ blocked badge: stops showing a past attempt's reason, does not retry */
+  function dismissBlocked(c: RestreamChannelWithStatus): void {
+    void run(() => api.clearRestreamFailoverBlocked(c.id));
+  }
+
   function forceSwitch(c: RestreamChannelWithStatus, placementId: string, label: string): void {
     if (c.placements.filter((p) => p.enabled).length < 2) return; // not redundant — nothing to switch
     if (c.activePlacementId === placementId) return;
@@ -529,9 +534,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                   <td class="small">
                     <button
                       class="linklike"
+                      title={s.name}
                       onclick={() => (sessionModal = { instanceId: n.instanceId, nodeId: n.nodeId, name: s.name })}
                     >
-                      {s.name}
+                      {#if s.channelSlug}
+                        {s.channelSlug}<span class="muted"> · {s.name.slice(0, 8)}</span>
+                      {:else}
+                        {s.name}
+                      {/if}
                     </button>
                   </td>
                   <td>
@@ -625,6 +635,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {chanLabel(c.channelName, c.channelNumber)}
           {#if live.failoverBlocked}
             <span class="badge warn" title="failover blocked: {live.failoverBlocked}">blocked</span>
+            <button
+              class="linklike muted"
+              disabled={busy}
+              aria-label="dismiss blocked reason"
+              title="dismiss — clears the badge without retrying the failover"
+              onclick={() => dismissBlocked(c)}
+            >×</button>
           {/if}
           {#if c.comment}<div class="muted small">{c.comment}</div>{/if}
         </td>

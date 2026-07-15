@@ -202,6 +202,19 @@ export class FailoverSync {
     return this.blocked.get(channelId) ?? null;
   }
 
+  /**
+   * Explicit operator dismiss of the ⚠ blocked badge. UI-only: it does not
+   * touch the retrigger backoff or attempt a new failover, it just stops
+   * showing a message about a past attempt (requestFailover already covers
+   * "try again" — a subsequent attempt overwrites the message on its own
+   * failure, or clears it on success via beginNext).
+   */
+  clearBlocked(channelId: string): boolean {
+    const had = this.blocked.delete(channelId);
+    if (had) this.hooks.publishChannel(channelId);
+    return had;
+  }
+
   activeChannelId(): string | null {
     return this.active;
   }
@@ -515,6 +528,20 @@ export class FailoverSync {
       if (!channelOk || !toOk) {
         // FK cascades cover hard deletes; this covers disable/mode churn.
         // Mid-procedure this is an abort — conservative and loss-minimal.
+        if (row.trigger_reason === 'cutover' && to) {
+          // `to` is a transient clone that fell out of a valid cutover
+          // target here (its channel or the clone itself got disabled,
+          // rather than hard-deleted — a hard delete already leaves `to`
+          // undefined, and its row dies via the same FK cascade
+          // independently). Same leak class as requestReset's mid-cutover
+          // abort branch: reclaim it now instead of leaving it to encode
+          // forever until the next controller-restart orphan sweep. `from`'s
+          // frozen/snapshot profile pin is left alone — it's still
+          // referenced by `from`'s own live, non-transient placement row, so
+          // the startup orphan sweep for transient profiles won't reclaim it
+          // either.
+          await this.hooks.deleteCutoverPlacement?.(row.to_placement_id);
+        }
         await this.deleteRow(channelId);
         data.rows.delete(channelId);
         if (this.active === channelId) this.clearActive();
@@ -546,6 +573,26 @@ export class FailoverSync {
         }
       }
     }
+
+    // stale blocked reasons for channels gone entirely (disabled or
+    // hard-deleted): beginNext sets `blocked` when a failover attempt fails
+    // to even START, which most of the time never creates a failover_state
+    // row — so a channel can go straight from "enabled, no eligible
+    // candidate" to disabled without ever getting one for the loop above to
+    // catch. scanTriggers can't reach these either, since it only walks
+    // data.channels (enabled channels). This sweep is the only place that
+    // does — it also keeps listChannels() (which does not filter by enabled)
+    // from surfacing a permanently stale "blocked" badge for a channel the
+    // operator turned off.
+    // Publish directly (not via `changed`, which also drives pushNodes/
+    // pushSwitchers) — nothing about node/switcher state changed here, only
+    // an in-memory bookkeeping entry for a channel that is no longer enabled.
+    for (const channelId of [...this.blocked.keys()]) {
+      if (data.channels.has(channelId)) continue;
+      this.blocked.delete(channelId);
+      this.retriggerBackoff.delete(channelId);
+      this.hooks.publishChannel(channelId);
+    }
   }
 
   /** probe-driven trigger scan → enqueue (instance-level fan-out included) */
@@ -560,7 +607,17 @@ export class FailoverSync {
       if (backoff && nowMs < backoff.untilMs) continue;
 
       const active = this.activePlacementOf(data, channelId);
-      if (!active) continue;
+      if (!active) {
+        // no active placement to evaluate a trigger against (every placement
+        // disabled since blocked was last set, or an all-cold channel with no
+        // placement to be "active" at all) — there's no trigger being
+        // evaluated, so any recorded blocked reason can't describe anything
+        // failing right now. (Channels gone entirely — disabled/hard-deleted
+        // — never reach this loop, since data.channels only holds enabled
+        // channels; rowHygiene's stale-blocked sweep covers those instead.)
+        this.clearStaleBlocked(channelId);
+        continue;
+      }
       const key = nk(active.instance_id, active.node_id);
 
       let reason: FailoverTriggerReason | null = null;
@@ -582,12 +639,28 @@ export class FailoverSync {
         detail = lag.detail;
       }
       if (!reason) {
-        // trigger cleared — forget the backoff so a future incident is fresh
-        this.retriggerBackoff.delete(channelId);
+        // trigger cleared (or never existed) — forget the backoff so a
+        // future incident is fresh, and drop any blocked reason recorded by
+        // the last attempt: it documented why THAT trigger couldn't act, and
+        // nothing is failing now for it to describe.
+        this.clearStaleBlocked(channelId);
         continue;
       }
       this.enqueue({ channelId, reason, detail, triggerNodeId });
     }
+  }
+
+  /**
+   * Drop a stale blocked reason (+ its retrigger backoff) once no trigger is
+   * actively failing for the channel. `blocked` documents why the LAST
+   * failover attempt couldn't act; once nothing is failing that record no
+   * longer describes anything actionable. Publishes only when an entry
+   * actually existed, so a healthy/inactive channel doesn't churn the SSE
+   * stream every tick.
+   */
+  private clearStaleBlocked(channelId: string): void {
+    this.retriggerBackoff.delete(channelId);
+    if (this.blocked.delete(channelId)) this.hooks.publishChannel(channelId);
   }
 
   private enqueue(item: QueueItem): void {
@@ -637,6 +710,13 @@ export class FailoverSync {
         const cand = this.candidateOf(data, target);
         if (!cand.admission.ok) {
           this.blocked.set(item.channelId, `${target.id}: ${cand.admission.detail}`);
+          // same backoff as the other two blocked-setting sites: an explicit
+          // target (manual switch / reset) is rejected on ITS OWN admission,
+          // which says nothing about whether the ACTIVE placement's trigger
+          // is failing — scanTriggers would otherwise see "no reason" against
+          // the (probably healthy) active placement and clear this message
+          // within a tick, even though the rejection reason hasn't changed.
+          this.bumpBackoff(item.channelId);
           this.hooks.publishChannel(item.channelId);
           return;
         }
@@ -1087,7 +1167,23 @@ export class FailoverSync {
     if (!row) throw httpError(409, 'no failover state to reset');
 
     if (!pastCommitPoint(row.phase) && midProcedure(row.phase)) {
-      // before the commit point — revert loss-free: viewers were never moved
+      // before the commit point — revert loss-free: viewers were never moved.
+      // For a cutover row this is the same abort as abortCutover (the
+      // trigger never got as far as automatic exhaustion — an operator
+      // pressed reset instead) so it needs the same clone reclaim: to_placement_id
+      // is a transient clone, never a normal candidate, and nothing else will
+      // ever drive or clean it up once the row is gone — without this it
+      // leaks an ever-encoding clone until the next controller-restart orphan
+      // sweep. `from` is deliberately left pinned to its frozen/snapshot
+      // profile, same as abortCutover: retry-safe, a later profile edit
+      // re-triggers the pin. No event log for the reclaim: unlike the
+      // automatic-abort path (which logs a warning because nothing else
+      // reports the outcome), this abort is a direct result of the operator's
+      // own reset action, and per the event-log rule user-initiated actions
+      // are never logged.
+      if (row.trigger_reason === 'cutover') {
+        await this.hooks.deleteCutoverPlacement?.(row.to_placement_id);
+      }
       await this.deleteRow(channelId);
       data.rows.delete(channelId);
       if (this.active === channelId) this.clearActive();

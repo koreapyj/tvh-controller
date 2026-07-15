@@ -400,6 +400,14 @@ export class RestreamerService {
   private readonly pushProblems = new Map<string, string | null>();
   /** brief cache for the per-node probe settings map (probe base tick is 5s) */
   private probeSettingsCache: { at: number; map: Map<string, NodeProbeSettings> } | null = null;
+  /**
+   * brief cache for placementId -> channel slug (session display enrichment,
+   * site #8 + web). Populated on demand from a single query shared across
+   * every node's poll tick rather than a per-tick/per-session lookup; a few
+   * seconds of staleness after a channel/placement CRUD is fine — the next
+   * poll tick heals it.
+   */
+  private placementSlugCache: { at: number; map: Map<string, string> } | null = null;
   /** a switch was just ordered — main.ts wires this to SwitcherPoller.pollOnce */
   onSwitchIssued: (() => void) | null = null;
 
@@ -2927,12 +2935,15 @@ export class RestreamerService {
       // probe state is pulled at status-build time — the engine is the single
       // source of truth; patching it in afterwards would be wiped every poll
       getProbes: (instanceId, nodeId) => this.probeEngine.nodeProbeStatus(instanceId, nodeId),
-      enrichSessions: (_instanceId, _nodeId, sessions) => {
-        // post-rename the session name IS the placement id — no lookup needed
+      enrichSessions: async (_instanceId, _nodeId, sessions) => {
+        // post-rename the session name IS the placement id — feeds both the
+        // probe-engine lookup (no lookup needed there) and the slug map below
+        const slugMap = await this.placementSlugMap();
         return sessions.map((s) => {
           const lagProbe = this.probeEngine.lagStatus(s.name);
           return {
             ...s,
+            channelSlug: slugMap.get(s.name) ?? null,
             ...(lagProbe ? { lagProbe } : {}),
           };
         });
@@ -3042,6 +3053,26 @@ export class RestreamerService {
       });
     }
     return { nodes: [...nodes.values()], placements };
+  }
+
+  /**
+   * placementId -> channel slug, briefly cached. Backs the session
+   * `channelSlug` display enrichment (site #8's event message + the web
+   * node-card session table) without a per-tick DB query.
+   */
+  private async placementSlugMap(): Promise<Map<string, string>> {
+    const nowMs = Date.now();
+    if (this.placementSlugCache && nowMs - this.placementSlugCache.at < 4_000) {
+      return this.placementSlugCache.map;
+    }
+    const rows = await this.db
+      .selectFrom('restream_placements as p')
+      .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
+      .select(['p.id', 'c.slug'])
+      .execute();
+    const map = new Map(rows.map((r) => [r.id, r.slug]));
+    this.placementSlugCache = { at: nowMs, map };
+    return map;
   }
 
   /** all nodes' probe settings (stored overrides over defaults), briefly cached */
@@ -3236,6 +3267,21 @@ export class RestreamerService {
     const result = this.serialize(() => this.failoverSync.requestReset(channelId, { force }));
     void result.then(() => this.failoverTick()).catch(() => {});
     return result;
+  }
+
+  /**
+   * Operator dismiss of the ⚠ blocked badge — see FailoverSync.clearBlocked.
+   * User-initiated, so (per the non-interactive-only event-log rule) this
+   * never logs an event. Looked up via getChannel (unfiltered by enabled,
+   * like listChannels) rather than FailoverSync's own loadData, since a
+   * disabled channel can still carry a stale blocked reason worth dismissing.
+   */
+  clearFailoverBlocked(channelId: string): Promise<boolean> {
+    return this.serialize(async () => {
+      const existing = await this.getChannel(channelId);
+      if (!existing) throw httpError(404, `restream channel ${channelId} not found`);
+      return this.failoverSync.clearBlocked(channelId);
+    });
   }
 
   // ---------- channel status publication ----------

@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { Kysely } from 'kysely';
 import type {
+  EnrichedSessionStatus,
   NodeProbeSettings,
   RestreamerNodeStatus,
   SessionStatus,
@@ -70,8 +71,17 @@ function makeConfig(): AppConfig {
   };
 }
 
-function sess(name: string, opts: Partial<SessionStatus> = {}): SessionStatus {
-  return { name, state: 'running', enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0, ...opts };
+function sess(name: string, opts: Partial<SessionStatus> = {}): EnrichedSessionStatus {
+  return {
+    name,
+    state: 'running',
+    enabled: true,
+    configHash: 'h',
+    restarts: 0,
+    consecutiveFailures: 0,
+    channelSlug: null,
+    ...opts,
+  };
 }
 
 function nodeStatusFixture(
@@ -952,6 +962,82 @@ describe('FailoverSync: rowHygiene (draining expiry)', () => {
   });
 });
 
+// ---------- 7b. blocked auto-clear and explicit clearBlocked() ----------
+
+describe('FailoverSync: blocked auto-clear and explicit clearBlocked()', () => {
+  it('auto-clears a stale blocked reason once the trigger that set it heals', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+
+    h.snapshot.liveness.set('zoneA/n1', failing());
+    await h.sync.tick(); // trigger fires; single placement -> no candidate -> blocked set
+    expect(h.sync.blockedReason(chanId)).not.toBeNull();
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+
+    h.publishChannel.mockClear();
+    h.advanceNow(RETRIGGER_BACKOFF_MIN_MS + 1_000);
+    h.snapshot.liveness.delete('zoneA/n1'); // heals on its own
+    await h.sync.tick();
+
+    expect(h.sync.blockedReason(chanId)).toBeNull();
+    expect(h.publishChannel).toHaveBeenCalledWith(chanId);
+    expect(h.publishChannel).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not clear blocked while the trigger that set it is still failing', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+
+    h.snapshot.liveness.set('zoneA/n1', failing());
+    await h.sync.tick();
+    expect(h.sync.blockedReason(chanId)).not.toBeNull();
+
+    h.publishChannel.mockClear();
+    h.advanceNow(RETRIGGER_BACKOFF_MIN_MS + 1_000);
+    await h.sync.tick(); // trigger still failing -> re-enqueues, re-blocks, but never spuriously clears
+    expect(h.sync.blockedReason(chanId)).not.toBeNull();
+  });
+
+  it('clearBlocked() clears an existing entry and returns false when nothing to clear', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    expect(h.sync.clearBlocked(chanId)).toBe(false);
+    expect(h.publishChannel).not.toHaveBeenCalled();
+
+    await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+    h.snapshot.liveness.set('zoneA/n1', failing());
+    await h.sync.tick();
+    expect(h.sync.blockedReason(chanId)).not.toBeNull();
+
+    h.publishChannel.mockClear();
+    expect(h.sync.clearBlocked(chanId)).toBe(true);
+    expect(h.sync.blockedReason(chanId)).toBeNull();
+    expect(h.publishChannel).toHaveBeenCalledWith(chanId);
+    expect(h.publishChannel).toHaveBeenCalledTimes(1);
+
+    expect(h.sync.clearBlocked(chanId)).toBe(false);
+  });
+
+  it('drops a stale blocked reason once its channel is disabled entirely (no failover_state row to catch it)', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+
+    h.snapshot.liveness.set('zoneA/n1', failing());
+    await h.sync.tick();
+    expect(h.sync.blockedReason(chanId)).not.toBeNull();
+
+    await h.db.updateTable('restream_channels').set({ enabled: 0 }).where('id', '=', chanId).execute();
+    h.publishChannel.mockClear();
+    await h.sync.tick(); // channel no longer in data.channels -> rowHygiene's sweep catches it
+    expect(h.sync.blockedReason(chanId)).toBeNull();
+    expect(h.publishChannel).toHaveBeenCalledWith(chanId);
+    expect(h.publishChannel).toHaveBeenCalledTimes(1);
+  });
+});
+
 // ---------- 8. event-log emission (site #4) ----------
 
 describe('FailoverSync: event-log emission (site #4)', () => {
@@ -1243,6 +1329,149 @@ describe('FailoverSync: cutover drain-expiry cleanup', () => {
   });
 });
 
+// ---------- 9b. reset mid-cutover must not leak the clone ----------
+//
+// requestReset's loss-free (pre-commit-point) abort branch is generic — it
+// predates cutover entirely — so before this fix it would delete the
+// failover_state row without ever calling deleteCutoverPlacement, leaking the
+// transient clone (it keeps encoding forever, reclaimed only by the next
+// controller-restart orphan sweep) and leaving `from` pinned to its
+// snapshot/frozen profile with nothing left to unpin it. An operator
+// hammering "reset" mid-cutover must get the exact same cleanup as the
+// automatic abortCutover path.
+
+describe('FailoverSync: requestReset during an in-flight cutover (loss-free — mirrors abortCutover)', () => {
+  it('reset before the commit point deletes the row, reclaims the clone, leaves `from` untouched, and logs nothing', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    // `from`: hot, currently serving
+    const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+    // the cutover clone: same node as `from`, transient (mirrors createCutoverClone)
+    const cloneId = await insertPlacement(h.db, {
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 2,
+      transient: true,
+    });
+    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess(aId)] });
+    seedSwitcherStatus(h.cache, 'sw1', [swChan('chan1', aId, [{ id: aId, healthy: true }])]);
+
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: cloneId,
+      phase: 'awaiting-lag',
+      triggerReason: 'cutover',
+      suppressFrom: true,
+    });
+
+    const outcome = await h.sync.requestReset(chanId);
+    expect(outcome).toEqual<ResetOutcome>({ ok: true, aborted: true });
+
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledTimes(1);
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledWith(cloneId);
+    expect(h.markCutoverComplete).not.toHaveBeenCalled();
+
+    // `from` was never suppressed/switched away from -- the switcher's own
+    // report (unchanged throughout) still shows it active, and no switch was
+    // ever issued
+    expect(h.cache.switchers.get('sw1')!.channels[0]!.activeUpstreamId).toBe(aId);
+    expect(h.switcher.switches()).toHaveLength(0);
+
+    // the RESET is the user-initiated action here (unlike automatic
+    // abortCutover, which logs a warning because nothing else reports the
+    // outcome) -- per the event-log rule, no event is emitted
+    expect(h.logs).toHaveLength(0);
+  });
+
+  it('reset at the commit point (switch-ordered+) still rejects mid-procedure -- no cleanup, nothing to leave', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+    const cloneId = await insertPlacement(h.db, {
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 2,
+      transient: true,
+    });
+    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess(aId)] });
+    seedSwitcherStatus(h.cache, 'sw1', [swChan('chan1', aId, [{ id: aId, healthy: true }])]);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: cloneId,
+      phase: 'awaiting-switch-confirm',
+      triggerReason: 'cutover',
+      suppressFrom: true,
+    });
+
+    const outcome = await h.sync.requestReset(chanId);
+    expect(outcome).toMatchObject({ rejected: 'rejected-mid-procedure' });
+    expect(await failoverRow(h.db, chanId)).toMatchObject({ phase: 'awaiting-switch-confirm' });
+    expect(h.deleteCutoverPlacement).not.toHaveBeenCalled();
+  });
+});
+
+describe('FailoverSync: rowHygiene reclaims a cutover clone that falls out of validity (same leak class as requestReset)', () => {
+  it('reclaims the clone via deleteCutoverPlacement when it gets disabled out from under an in-flight cutover', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+    const cloneId = await insertPlacement(h.db, {
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 2,
+      transient: true,
+    });
+    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess(aId)] });
+    seedSwitcherStatus(h.cache, 'sw1', [swChan('chan1', aId, [{ id: aId, healthy: true }])]);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: cloneId,
+      phase: 'awaiting-lag',
+      triggerReason: 'cutover',
+      suppressFrom: true,
+    });
+
+    // "vanished" here means disabled, not hard-deleted: a hard delete of the
+    // placement row cascades the failover_state row with it independently,
+    // so this branch never even sees it. A disable (or the clone's channel
+    // being turned off) is what actually reaches this code path.
+    await h.db.updateTable('restream_placements').set({ enabled: 0 }).where('id', '=', cloneId).execute();
+
+    await h.sync.tick();
+
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledTimes(1);
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledWith(cloneId);
+    expect(h.markCutoverComplete).not.toHaveBeenCalled();
+  });
+
+  it('does not call deleteCutoverPlacement for a non-cutover row caught by the same branch', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'awaiting-lag',
+      triggerReason: 'lag',
+    });
+
+    await h.db.updateTable('restream_placements').set({ enabled: 0 }).where('id', '=', bId).execute();
+
+    await h.sync.tick();
+
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+    expect(h.deleteCutoverPlacement).not.toHaveBeenCalled();
+  });
+});
+
 // ---------- 10. activePlacementOf never infers a transient clone as "active" ----------
 //
 // Regression for the live E2E bug: createCutoverClone copies `from`'s
@@ -1331,5 +1560,82 @@ describe('FailoverSync: activePlacementOf never infers a transient clone as "act
 
     expect(h.sync.activeChannelId()).toBeNull();
     expect(await failoverRow(h.db, chanId)).toBeUndefined();
+  });
+});
+
+// ---------- 12. reset-all recovery regression (fleet-wide probe-failure incident, end to end) ----------
+//
+// This is the operator's actual recovery move for a stuck-fleet incident:
+// hit reset on every affected channel. It must never get stuck behind
+// retriggerBackoff (that Map is scanTriggers-only) and a failed admission
+// attempt must leave the channel retryable, not wedged.
+
+describe('FailoverSync: reset-all recovery flow after a fleet-wide probe-failure incident', () => {
+  it('requires-confirm -> force queues -> admission-reject sets blocked+backoff but stays retryable -> immediate retry succeeds once the node heals', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+    const bId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n2', priority: 2 });
+    // currently failed over to B; A's node is fleet-wide unreachable -- the incident
+    seedNode(h.cache, 'zoneA', 'n1', { reachable: false, error: 'unreachable' });
+    seedNode(h.cache, 'zoneA', 'n2', { sessions: [sess(bId)] });
+    seedSwitcherStatus(h.cache, 'sw1', [swChan('chan1', bId, [{ id: bId, healthy: true }])]);
+
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'complete',
+      triggerReason: 'liveness',
+      triggerNodeId: 'n1',
+      suppressFrom: true,
+    });
+    h.snapshot.liveness.set('zoneA/n1', failing()); // original trigger still failing
+
+    // 1. plain reset -- trigger still failing -> requires-confirm
+    const first = await h.sync.requestReset(chanId);
+    expect(first).toMatchObject({ rejected: 'requires-confirm' });
+
+    // 2. force reset -- bypasses the trigger check, queues the fail-back
+    const forced = await h.sync.requestReset(chanId, { force: true });
+    expect(forced).toEqual<ResetOutcome>({ ok: true, queued: true });
+    expect(await failoverRow(h.db, chanId)).toMatchObject({ phase: 'complete' }); // not begun yet
+
+    // 3. beginNext dequeues -- target (A) is on the still-unreachable node ->
+    //    admission rejects: blocked + backoff, but the queue slot is freed
+    //    and the untouched row stays exactly as it was -- NOT stuck.
+    await h.sync.tick();
+    expect(h.sync.blockedReason(chanId)).not.toBeNull();
+    expect(h.sync.blockedReason(chanId)).toContain('node-unreachable');
+    expect(await failoverRow(h.db, chanId)).toMatchObject({ phase: 'complete', to_placement_id: bId });
+    expect(h.sync.activeChannelId()).toBeNull();
+
+    // 4. operator retries immediately -- no clock advance, proving the retry
+    //    is NOT gated by retriggerBackoff (that Map is scanTriggers-only) --
+    //    this is the exact "hammer reset" recovery motion.
+    const retry = await h.sync.requestReset(chanId, { force: true });
+    expect(retry).toEqual<ResetOutcome>({ ok: true, queued: true });
+
+    // 5. the node has since come back -- admission now passes
+    seedNode(h.cache, 'zoneA', 'n1', { reachable: true, sessions: [] });
+    await h.sync.tick(); // begin -> bringing-up auto-advances -> awaiting-lag (A has no lag measurement yet)
+    let row = await failoverRow(h.db, chanId);
+    expect(row).toMatchObject({
+      from_placement_id: bId,
+      to_placement_id: aId,
+      trigger_reason: 'reset',
+      phase: 'awaiting-lag',
+    });
+    expect(h.sync.blockedReason(chanId)).toBeNull(); // cleared the instant the retry was admitted
+
+    // drive it home: lag discovered, switch confirmed
+    h.snapshot.lag.set(aId, lagOk(2));
+    await h.sync.tick(); // -> awaiting-switch-confirm, switch issued
+    expect(h.switcher.switches()).toContainEqual(expect.objectContaining({ slug: 'chan1', upstreamId: aId }));
+    h.cache.switchers.get('sw1')!.channels[0]!.activeUpstreamId = aId;
+    await h.sync.tick(); // confirm -> complete (B is a healthy hot outgoing -> suppress_from=0 -> never stopped -> complete deletes the row)
+    row = await failoverRow(h.db, chanId);
+    expect(row).toBeUndefined();
+    expect(h.sync.activeChannelId()).toBeNull();
   });
 });

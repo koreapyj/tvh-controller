@@ -977,6 +977,16 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
     return service.requestManualSwitch(req.params.id, placementId);
   });
 
+  // Operator dismiss of the ⚠ blocked badge — UI-only, does not touch the
+  // failover queue/backoff or trigger a new attempt.
+  app.post<{ Params: { id: string } }>(
+    '/api/restreamer/channels/:id/failover/clear-blocked',
+    async (req) => {
+      const cleared = await svc().clearFailoverBlocked(req.params.id);
+      return { ok: true, cleared };
+    },
+  );
+
   // ---------- master playlist M3U ----------
   // The viewer-facing path is registered as an explicit route, so it wins over
   // the SPA not-found fallback in main.ts; the /api twin is for the UI.

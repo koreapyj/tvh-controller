@@ -230,6 +230,13 @@ export interface RestreamPlaylist {
 /** SessionStatus enriched with the controller's channel-level probe state */
 export type EnrichedSessionStatus = SessionStatus & {
   lagProbe?: LagProbeStatus;
+  /**
+   * Channel slug for display — the session `name` is a placement id (a bare
+   * UUID) post-rename, so this is what the UI shows a human. null = the
+   * session name doesn't resolve to a known placement (e.g. an orphan
+   * awaiting cleanup, or enrichment ran with no resolver available).
+   */
+  channelSlug: string | null;
 };
 
 /** one restreamer node's polled status (SSE `restreamer` events) */

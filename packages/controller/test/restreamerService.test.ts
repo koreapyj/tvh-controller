@@ -11,9 +11,9 @@ import type { Kysely } from 'kysely';
 import type {
   AribHlsParams,
   DesiredState,
+  EnrichedSessionStatus,
   RawArgvParams,
   RestreamProfile,
-  SessionStatus,
   SourceCatalogEntry,
   SseEvent,
   SwitcherNodeStatus,
@@ -178,11 +178,11 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
   return { db, destroy, cache, events, service, nodes, pollers, config, logs };
 }
 
-function sessionStatus(name: string): SessionStatus {
-  return { name, state: 'running', enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0 };
+function sessionStatus(name: string): EnrichedSessionStatus {
+  return { name, state: 'running', enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0, channelSlug: null };
 }
 
-function seedNodeStatusEntry(cache: InstanceCache, instanceId: string, nodeId: string, sessions: SessionStatus[] = []): void {
+function seedNodeStatusEntry(cache: InstanceCache, instanceId: string, nodeId: string, sessions: EnrichedSessionStatus[] = []): void {
   cache.get(instanceId).restreamers.push({
     instanceId,
     nodeId,
@@ -2792,6 +2792,27 @@ describe('poller hooks', () => {
     const h = await setup();
     h.cache.get('zone1').topology = null;
     expect(await h.service.getPendingPush('zone1', 'n1')).toBe(false);
+    await h.destroy();
+  });
+
+  it('enrichSessions resolves channelSlug for a known placement and null for an unknown session name', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const placementId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    const hooks = h.service.pollerHooks();
+    const enriched = await hooks.enrichSessions!('zone1', 'n1', [
+      sessionStatus(placementId),
+      sessionStatus('orphan-uuid'),
+    ]);
+    expect(enriched.find((s) => s.name === placementId)?.channelSlug).toBe('at-x');
+    expect(enriched.find((s) => s.name === 'orphan-uuid')?.channelSlug).toBeNull();
     await h.destroy();
   });
 });

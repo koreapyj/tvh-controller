@@ -640,6 +640,22 @@ describe('RestreamerPoller', () => {
       expect(logs).toHaveLength(1);
       expect(logs[0]!.message).toContain('restarts=1');
     });
+
+    it('includes the channel slug in the message when the enrichSessions hook resolves one', async () => {
+      const enrichSessions = vi.fn(async (_i: string, _n: string, sessions: SessionStatus[]) =>
+        sessions.map((s) => ({ ...s, channelSlug: s.name === 'at-x' ? 'at-x-slug' : null })),
+      );
+      const { logs, status, poller } = setup({ enrichSessions });
+      status.mockResolvedValue(nodeStatus({ sessions: [sess('at-x', { restarts: 2 })] }));
+      await poller.pollOnce(); // baseline — pre-existing restarts=2 must not log
+      expect(logs).toHaveLength(0);
+
+      status.mockResolvedValue(nodeStatus({ sessions: [sess('at-x', { restarts: 3 })] }));
+      await poller.pollOnce(); // restarts increased
+      expect(logs).toHaveLength(1);
+      expect(logs[0]!.message).toContain('"at-x"');
+      expect(logs[0]!.message).toContain('("at-x-slug")');
+    });
   });
 });
 

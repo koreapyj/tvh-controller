@@ -351,6 +351,9 @@ export const api = {
       `/api/restreamer/channels/${id}/switch`,
       body,
     ),
+  /** operator dismiss of the ⚠ blocked badge (does not retry the failover) */
+  clearRestreamFailoverBlocked: (id: string) =>
+    http<{ ok: boolean; cleared: boolean }>('POST', `/api/restreamer/channels/${id}/failover/clear-blocked`),
 
   restreamPlaylists: () => http<RestreamPlaylist[]>('GET', '/api/restreamer/playlists'),
   createRestreamPlaylist: (input: RestreamPlaylistInput) =>

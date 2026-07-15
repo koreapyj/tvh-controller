@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import {
   channelStableId,
+  type EnrichedSessionStatus,
   type NodeProbeSettings,
   type RestreamChannel,
   type RestreamChannelWithStatus,
@@ -142,15 +143,15 @@ function profilePayload(): unknown {
   return { template: 'arib-hls', templateVersion: 1, video: { mode: 'ivtc' }, audio: [{}] };
 }
 
-function sessionStatus(name: string, state: SessionStatus['state'] = 'running'): SessionStatus {
-  return { name, state, enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0 };
+function sessionStatus(name: string, state: SessionStatus['state'] = 'running'): EnrichedSessionStatus {
+  return { name, state, enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0, channelSlug: null };
 }
 
 function seedNodeStatus(
   cache: InstanceCache,
   instanceId: string,
   nodeId: string,
-  sessions: SessionStatus[] = [],
+  sessions: EnrichedSessionStatus[] = [],
   sources: SourceCatalogEntry[] | null = null,
 ): void {
   cache.get(instanceId).restreamers = [
@@ -187,7 +188,7 @@ function setSessions(
   cache: InstanceCache,
   instanceId: string,
   nodeId: string,
-  sessions: SessionStatus[],
+  sessions: EnrichedSessionStatus[],
 ): void {
   const entry = cache.get(instanceId).restreamers.find((r) => r.nodeId === nodeId);
   if (entry) entry.sessions = sessions;
@@ -1057,6 +1058,58 @@ describe('POST /api/restreamer/channels/:id/switch', () => {
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: true, queued: true });
+  });
+
+  // ---------- {failover/clear-blocked} — operator dismiss of the badge ----------
+
+  describe('POST /api/restreamer/channels/:id/failover/clear-blocked', () => {
+    it('200 {ok:true, cleared:true} when a blocked reason exists, then {cleared:false} on retry', async () => {
+      const h = await harness();
+      const { channel, placements } = await seedRedundantChannel(h);
+      seedSwitcherStatus(h, [
+        {
+          slug: 'bbb',
+          activeUpstreamId: placements[0]!.id,
+          upstreams: placements.map((p) => ({ id: p.id, healthy: true })),
+        },
+      ]);
+      // deliberately skip seedAdmission: the target's node is never polled, so
+      // beginNext's admission gate rejects it and sets `blocked`
+      const switchRes = await h.app.inject({
+        method: 'POST',
+        url: `/api/restreamer/channels/${channel.id}/switch`,
+        payload: { placementId: placements[1]!.id },
+      });
+      expect(switchRes.statusCode).toBe(200);
+      await h.ctx.restreamer!.failoverTick();
+
+      const list = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+      const chan = (list.json() as RestreamChannelWithStatus[]).find((c) => c.id === channel.id)!;
+      expect(chan.failoverBlocked).not.toBeNull();
+
+      const clear1 = await h.app.inject({
+        method: 'POST',
+        url: `/api/restreamer/channels/${channel.id}/failover/clear-blocked`,
+      });
+      expect(clear1.statusCode).toBe(200);
+      expect(clear1.json()).toEqual({ ok: true, cleared: true });
+
+      const clear2 = await h.app.inject({
+        method: 'POST',
+        url: `/api/restreamer/channels/${channel.id}/failover/clear-blocked`,
+      });
+      expect(clear2.statusCode).toBe(200);
+      expect(clear2.json()).toEqual({ ok: true, cleared: false });
+    });
+
+    it('404 for an unknown channel', async () => {
+      const h = await harness();
+      const res = await h.app.inject({
+        method: 'POST',
+        url: '/api/restreamer/channels/ghost/failover/clear-blocked',
+      });
+      expect(res.statusCode).toBe(404);
+    });
   });
 });
 

@@ -101,6 +101,11 @@ function statusKey(status: RestreamerNodeStatus | SwitcherNodeStatus): string {
   );
 }
 
+/** no enrichSessions hook (or it threw): pass sessions through with channelSlug unknown */
+function bareEnrich(sessions: SessionStatus[]): EnrichedSessionStatus[] {
+  return sessions.map((s) => ({ ...s, channelSlug: null }));
+}
+
 /**
  * Polls one restreamer daemon node's `/v1/status`, keeps its entry in
  * `snap.restreamers` fresh, and publishes an SSE `restreamer` event when
@@ -273,7 +278,7 @@ export class RestreamerPoller {
           type: 'warning',
           service: 'restreamer',
           source: `node.${this.instanceId}.${this.node.id}`,
-          message: `session "${s.name}" restarted (restarts=${s.restarts}${
+          message: `session "${s.name}"${s.channelSlug ? ` ("${s.channelSlug}")` : ''} restarted (restarts=${s.restarts}${
             exitClass ? `, last exit: ${exitClass}` : ''
           })`,
         });
@@ -304,9 +309,12 @@ export class RestreamerPoller {
 
   private async enrichSessionsSafe(sessions: SessionStatus[]): Promise<EnrichedSessionStatus[]> {
     try {
-      return (await this.hooks.enrichSessions?.(this.instanceId, this.node.id, sessions)) ?? sessions;
+      return (
+        (await this.hooks.enrichSessions?.(this.instanceId, this.node.id, sessions)) ??
+        bareEnrich(sessions)
+      );
     } catch {
-      return sessions;
+      return bareEnrich(sessions);
     }
   }
 
