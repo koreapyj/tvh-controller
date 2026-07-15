@@ -57,9 +57,9 @@ function nodeTarget(
   instanceId: string,
   nodeId: string,
   serveUrl: string | null,
-  slugs: string[],
+  sessionNames: string[],
 ): NodeProbeTarget {
-  return { instanceId, nodeId, serveUrl, slugs };
+  return { instanceId, nodeId, serveUrl, sessionNames };
 }
 
 function placementTarget(
@@ -229,7 +229,7 @@ describe('ProbeEngine: liveness', () => {
     expect(live.detail).toBe('no response within 5s');
   });
 
-  it('a zero-slug node has its probe state deleted (nodeProbeStatus null)', async () => {
+  it('a zero-session node has its probe state deleted (nodeProbeStatus null)', async () => {
     const s = setup();
     s.setTargets({ nodes: [nodeTarget('z1', 'n1', 'http://node1', ['ch1'])], placements: [] });
     s.setSettings(new Map([[nk('z1', 'n1'), cfg()]]));

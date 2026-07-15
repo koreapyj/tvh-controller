@@ -115,21 +115,26 @@ function seedNode(
   else snap.restreamers.push(status);
 }
 
-/** adds one session to a node's cached status without clobbering sessions of other channels already there */
-function addSession(cache: InstanceCache, instanceId: string, nodeId: string, slug: string): void {
+/**
+ * adds one session to a node's cached status without clobbering sessions of
+ * other channels already there. `sessionName` is a placement id in
+ * production (sessions are named after the placement, not the channel slug)
+ * — callers must pass the relevant placement's id.
+ */
+function addSession(cache: InstanceCache, instanceId: string, nodeId: string, sessionName: string): void {
   const snap = cache.get(instanceId);
   let entry = snap.restreamers.find((r) => r.nodeId === nodeId);
   if (!entry) {
     entry = nodeStatusFixture(instanceId, nodeId);
     snap.restreamers.push(entry);
   }
-  entry.sessions = [...entry.sessions, sess(slug)];
+  entry.sessions = [...entry.sessions, sess(sessionName)];
 }
 
-/** removes one channel's session from a node's cached status, leaving any others intact */
-function removeSession(cache: InstanceCache, instanceId: string, nodeId: string, slug: string): void {
+/** removes one placement's session from a node's cached status, leaving any others intact */
+function removeSession(cache: InstanceCache, instanceId: string, nodeId: string, sessionName: string): void {
   const entry = cache.get(instanceId).restreamers.find((r) => r.nodeId === nodeId);
-  if (entry) entry.sessions = entry.sessions.filter((s) => s.name !== slug);
+  if (entry) entry.sessions = entry.sessions.filter((s) => s.name !== sessionName);
 }
 
 /** merges (by slug) into any existing status for this switcher, rather than clobbering other channels' entries */
@@ -266,6 +271,7 @@ async function insertPlacement(
     priority?: number;
     enabled?: boolean;
     mode?: 'hot' | 'cold';
+    transient?: boolean;
   },
 ): Promise<string> {
   const id = fields.id ?? randomUUID();
@@ -281,6 +287,7 @@ async function insertPlacement(
       mode: fields.mode ?? 'hot',
       profile_id: null,
       program_number: null,
+      transient: fields.transient ? 1 : 0,
       updated_at: TS,
     })
     .execute();
@@ -348,6 +355,8 @@ interface Harness {
   pushSwitchers: ReturnType<typeof vi.fn>;
   publishChannel: ReturnType<typeof vi.fn>;
   onSwitchIssued: ReturnType<typeof vi.fn>;
+  markCutoverComplete: ReturnType<typeof vi.fn>;
+  deleteCutoverPlacement: ReturnType<typeof vi.fn>;
   advanceNow: (ms: number) => void;
   nowMs: () => number;
   logs: LoggedEvent[];
@@ -373,6 +382,8 @@ async function setup(): Promise<Harness> {
   const pushSwitchers = vi.fn(async () => {});
   const publishChannel = vi.fn((_channelId: string) => {});
   const onSwitchIssued = vi.fn(() => {});
+  const markCutoverComplete = vi.fn(async (_placementId: string) => {});
+  const deleteCutoverPlacement = vi.fn(async (_placementId: string) => {});
   const logs: LoggedEvent[] = [];
 
   let ms = Date.parse('2026-06-01T00:00:00.000Z');
@@ -383,7 +394,7 @@ async function setup(): Promise<Harness> {
     switcherClients,
     () => snapshot as unknown as ProbeSnapshot,
     async () => settingsMap,
-    { pushNodes, pushSwitchers, publishChannel, onSwitchIssued },
+    { pushNodes, pushSwitchers, publishChannel, onSwitchIssued, markCutoverComplete, deleteCutoverPlacement },
     () => new Date(ms),
     { log: (e) => logs.push(e) },
   );
@@ -401,6 +412,8 @@ async function setup(): Promise<Harness> {
     pushSwitchers,
     publishChannel,
     onSwitchIssued,
+    markCutoverComplete,
+    deleteCutoverPlacement,
     advanceNow: (delta: number) => {
       ms += delta;
     },
@@ -414,8 +427,8 @@ async function seedTwoPlacementChannel(h: Harness, slug = 'chan1') {
   const chanId = await insertChannel(h.db, { slug });
   const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
   const bId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n2', priority: 2 });
-  addSession(h.cache, 'zoneA', 'n1', slug);
-  addSession(h.cache, 'zoneA', 'n2', slug);
+  addSession(h.cache, 'zoneA', 'n1', aId);
+  addSession(h.cache, 'zoneA', 'n2', bId);
   seedSwitcherStatus(h.cache, 'sw1', [
     swChan(slug, aId, [
       { id: aId, healthy: true },
@@ -472,6 +485,41 @@ describe('FailoverSync: full automatic procedure (lag trigger through completion
   });
 });
 
+// ---------- 1b. oldSessionGone matches the FROM placement id precisely (site #9) ----------
+
+describe('FailoverSync: oldSessionGone matches the FROM placement id precisely (site #9 regression)', () => {
+  it('stays at awaiting-stop-confirm while a session named for the FROM placement id is present; an unrelated session name does not fool it', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    h.snapshot.lag.set(aId, lagFail(40));
+
+    await h.sync.tick(); // BEGIN -> awaiting-lag
+    h.snapshot.lag.set(bId, lagOk(5));
+    await h.sync.tick(); // -> awaiting-switch-confirm, switch issued
+    h.cache.switchers.get('sw1')!.channels[0]!.activeUpstreamId = bId;
+    await h.sync.tick(); // -> stopping-old -> awaiting-stop-confirm (A's session, named aId, still present)
+    let row = await failoverRow(h.db, chanId);
+    expect(row!.phase).toBe('awaiting-stop-confirm');
+
+    // tick again with A's own session unchanged — still present by placement
+    // id, so the procedure must still be waiting
+    await h.sync.tick();
+    row = await failoverRow(h.db, chanId);
+    expect(row!.phase).toBe('awaiting-stop-confirm');
+
+    // A's node's session list is swapped for one with an unrelated name (e.g.
+    // a stale/decoy entry) rather than emptied outright — the node still has
+    // *a* session running, but not one named aId. The match is strictly by
+    // placement id (from.id), so this correctly counts as "A's own session
+    // gone" (a broken "does this node have any session at all" check would
+    // wrongly keep waiting here).
+    h.cache.get('zoneA').restreamers.find((r) => r.nodeId === 'n1')!.sessions = [sess('some-other-name')];
+    await h.sync.tick();
+    row = await failoverRow(h.db, chanId);
+    expect(row!.phase).toBe('complete');
+  });
+});
+
 // ---------- 2. strict FIFO ----------
 
 describe('FailoverSync: strict global FIFO', () => {
@@ -493,7 +541,7 @@ describe('FailoverSync: strict global FIFO', () => {
     await h.sync.tick(); // -> awaiting-switch-confirm, switch issued
     h.cache.switchers.get('sw1')!.channels.find((c) => c.slug === 'chan1')!.activeUpstreamId = chan1.bId;
     await h.sync.tick(); // -> awaiting-stop-confirm
-    removeSession(h.cache, 'zoneA', 'n1', 'chan1'); // chan2's session on the same node is untouched
+    removeSession(h.cache, 'zoneA', 'n1', chan1.aId); // chan2's session on the same node is untouched
     await h.sync.tick(); // -> complete, active released
 
     expect((await failoverRow(h.db, chan1.chanId))!.phase).toBe('complete');
@@ -531,7 +579,7 @@ describe('FailoverSync: lag-discovery timeout retarget and exhaustion', () => {
     const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
     const bId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n2', priority: 2 });
     const cId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneB', nodeId: 'n1', priority: 3 });
-    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess('chan1')] });
+    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess(aId)] });
     seedNode(h.cache, 'zoneA', 'n2', { sessions: [] });
     seedNode(h.cache, 'zoneB', 'n1', { sessions: [] });
     seedSwitcherStatus(h.cache, 'sw1', [swChan('chan1', aId, [{ id: aId, healthy: true }])]);
@@ -651,7 +699,7 @@ describe('FailoverSync: requestReset', () => {
       triggerReason: 'lag',
       suppressFrom: true,
     });
-    addSession(h.cache, 'zoneA', 'n1', 'tvtokyo'); // the cold is what's running
+    addSession(h.cache, 'zoneA', 'n1', coldId); // the cold is what's running
     seedNode(h.cache, 'zoneA', 'n2'); // hot's node reachable, no session (stopped)
     seedSwitcherStatus(h.cache, 'sw1', [
       swChan('tvtokyo', coldId, [
@@ -700,7 +748,7 @@ describe('FailoverSync: requestReset', () => {
       triggerReason: 'manual',
       suppressFrom: true,
     });
-    addSession(h.cache, 'zoneA', 'n1', 'allcold');
+    addSession(h.cache, 'zoneA', 'n1', c1);
     seedSwitcherStatus(h.cache, 'sw1', [
       swChan('allcold', c1, [
         { id: c1, healthy: true },
@@ -796,7 +844,7 @@ describe('FailoverSync: requestReset', () => {
         { id: bId, healthy: true },
       ]),
     ]);
-    removeSession(h.cache, 'zoneA', 'n2', 'chan1'); // B's encode stopped
+    removeSession(h.cache, 'zoneA', 'n2', bId); // B's encode stopped
     await h.sync.tick(); // confirm → stopping-old → stop-confirm → complete
 
     // manual-to-natural = fail-back: no standing failover state remains
@@ -937,7 +985,7 @@ describe('FailoverSync: event-log emission (site #4)', () => {
     const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
     const bId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n2', priority: 2 });
     const cId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneB', nodeId: 'n1', priority: 3 });
-    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess('chan1')] });
+    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess(aId)] });
     seedNode(h.cache, 'zoneA', 'n2', { sessions: [] });
     seedNode(h.cache, 'zoneB', 'n1', { sessions: [] });
     seedSwitcherStatus(h.cache, 'sw1', [swChan('chan1', aId, [{ id: aId, healthy: true }])]);
@@ -977,7 +1025,7 @@ describe('FailoverSync: event-log emission (site #4)', () => {
         { id: bId, healthy: true },
       ]),
     ]);
-    removeSession(h.cache, 'zoneA', 'n2', 'chan1');
+    removeSession(h.cache, 'zoneA', 'n2', bId);
     await h.sync.tick(); // confirm -> stopping-old -> stop-confirm -> complete
 
     expect(h.logs).toHaveLength(0);
@@ -1000,5 +1048,288 @@ describe('FailoverSync: event-log emission (site #4)', () => {
     await h.sync.tick(); // begins a 'reset' procedure
 
     expect(h.logs).toHaveLength(0);
+  });
+});
+
+// ---------- 9. cutover (Stage B.2) ----------
+//
+// Stage B.2 ships no trigger wiring — a cutover row is always created
+// directly (either via seedFailoverRowDirect + reconcileOnStartup(), which
+// adopts a directly-seeded mid-procedure row as the active procedure without
+// going through beginNext, or via requestFailover's ordinary explicit-target
+// path, which is exercised once below to confirm reason:'cutover' needs no
+// special-casing there).
+
+describe('FailoverSync: cutover completion', () => {
+  it('drives an explicit cutover through to complete, promoting the clone and entering draining', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+
+    const queued = await h.sync.requestFailover(chanId, { toPlacementId: bId, reason: 'cutover', force: true });
+    expect(queued).toEqual({ ok: true, queued: true });
+    h.snapshot.lag.set(bId, lagOk(2)); // clone's lag already discovered -- crosses bringing-up -> issue-switch in one tick
+    await h.sync.tick(); // begin -> awaiting-switch-confirm, switch issued
+    let row = await failoverRow(h.db, chanId);
+    expect(row).toMatchObject({
+      phase: 'awaiting-switch-confirm',
+      trigger_reason: 'cutover',
+      to_placement_id: bId,
+      from_placement_id: aId,
+    });
+    expect(h.switcher.switches()).toHaveLength(1);
+
+    h.cache.switchers.get('sw1')!.channels[0]!.activeUpstreamId = bId;
+    await h.sync.tick(); // confirm -> stopping-old -> awaiting-stop-confirm (A's session still present)
+    row = await failoverRow(h.db, chanId);
+    expect(row!.phase).toBe('awaiting-stop-confirm');
+    expect(h.markCutoverComplete).not.toHaveBeenCalled();
+
+    removeSession(h.cache, 'zoneA', 'n1', aId);
+    await h.sync.tick(); // -> complete -> finishCutover -> draining
+
+    row = await failoverRow(h.db, chanId);
+    expect(row!.phase).toBe('draining');
+    expect(row!.drain_until).not.toBeNull();
+    expect(row!.to_placement_id).toBe(bId);
+    expect(h.sync.activeChannelId()).toBeNull();
+
+    // The clone is NOT promoted yet at the complete -> draining transition:
+    // `from` (aId) still holds the (channel, instance, node) triple with
+    // transient=0, and promoting the clone (also on that triple) before
+    // `from` is removed would collide with the unique index. Promotion is
+    // deferred to the drain-expiry sweep, right after `from` is deleted.
+    expect(h.markCutoverComplete).not.toHaveBeenCalled();
+    expect(h.deleteCutoverPlacement).not.toHaveBeenCalled();
+
+    const normals = h.logs.filter((l) => l.type === 'normal');
+    expect(normals).toHaveLength(1);
+    expect(normals[0]!.message).toMatch(/cutover COMPLETE/);
+    expect(normals[0]!.message).toContain(bId);
+    expect(normals[0]!.message).toContain(aId);
+
+    // advance past the drain window -- rowHygiene() now deletes `from` and,
+    // only once that's done, promotes the clone to permanent
+    h.advanceNow(600_001);
+    await h.sync.tick();
+
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledTimes(1);
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledWith(aId);
+    expect(h.markCutoverComplete).toHaveBeenCalledTimes(1);
+    expect(h.markCutoverComplete).toHaveBeenCalledWith(bId);
+  });
+});
+
+describe('FailoverSync: cutover abort (loss-free, never retargets)', () => {
+  it('aborts a cutover whose clone never becomes healthy, deleting only the clone and leaving `from` untouched -- even with an eligible cold standby on another node', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    // `from`: hot, currently serving
+    const aId = await insertPlacement(h.db, { channelId: chanId, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+    // the cutover clone: same node as `from`, transient (mirrors createCutoverClone)
+    const cloneId = await insertPlacement(h.db, {
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 2,
+      transient: true,
+    });
+    // a healthy, otherwise-eligible cold standby on a DIFFERENT node -- would
+    // win a normal candidate-search retarget; must be left completely alone
+    const coldId = await insertPlacement(h.db, {
+      channelId: chanId,
+      instanceId: 'zoneB',
+      nodeId: 'n1',
+      priority: 3,
+      mode: 'cold',
+    });
+    seedNode(h.cache, 'zoneA', 'n1', { sessions: [sess(aId)] });
+    seedNode(h.cache, 'zoneB', 'n1', { sessions: [] });
+    seedSwitcherStatus(h.cache, 'sw1', [swChan('chan1', aId, [{ id: aId, healthy: true }])]);
+
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: cloneId,
+      phase: 'awaiting-lag',
+      triggerReason: 'cutover',
+      suppressFrom: true,
+    });
+    await h.sync.reconcileOnStartup(); // adopt the directly-seeded row as the active procedure
+    expect(h.sync.activeChannelId()).toBe(chanId);
+
+    // clone never gets a lag measurement -- past the discovery timeout, an
+    // ordinary automatic procedure would retarget onto `coldId` here
+    h.advanceNow(LAG_DISCOVERY_TIMEOUT_MS + 1_000);
+    await h.sync.tick();
+
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+    expect(h.sync.activeChannelId()).toBeNull();
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledTimes(1);
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledWith(cloneId);
+    expect(h.markCutoverComplete).not.toHaveBeenCalled();
+
+    // `from` was never suppressed/switched away from -- the switcher's own
+    // report (unchanged throughout) still shows it active
+    expect(h.cache.switchers.get('sw1')!.channels[0]!.activeUpstreamId).toBe(aId);
+
+    const warnings = h.logs.filter((l) => l.type === 'warning');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]!.message).toMatch(/cutover ABORTED/);
+    expect(warnings[0]!.message).toContain(cloneId);
+    expect(warnings[0]!.message).toContain(aId);
+  });
+});
+
+describe('FailoverSync: cutover drain-expiry cleanup', () => {
+  it('calls deleteCutoverPlacement(from) and markCutoverComplete(to) together when an expired draining cutover row is cleaned up', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'draining',
+      triggerReason: 'cutover',
+      drainUntil: '2020-01-01 00:00:00',
+    });
+
+    await h.sync.tick();
+
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledTimes(1);
+    expect(h.deleteCutoverPlacement).toHaveBeenCalledWith(aId);
+    // the clone can only be promoted to permanent once `from` no longer
+    // holds the (channel, instance, node) triple -- both hooks fire in the
+    // same drain-expiry sweep, delete first, then promote
+    expect(h.markCutoverComplete).toHaveBeenCalledTimes(1);
+    expect(h.markCutoverComplete).toHaveBeenCalledWith(bId);
+  });
+
+  it('does not call deleteCutoverPlacement for an expired non-cutover draining row', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'draining',
+      triggerReason: 'manual',
+      drainUntil: '2020-01-01 00:00:00',
+    });
+
+    await h.sync.tick();
+
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+    expect(h.deleteCutoverPlacement).not.toHaveBeenCalled();
+  });
+
+  it('leaves an unexpired draining cutover row alone (no cleanup, no deletion)', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'draining',
+      triggerReason: 'cutover',
+      drainUntil: '2099-01-01 00:00:00',
+    });
+
+    await h.sync.tick();
+
+    expect(await failoverRow(h.db, chanId)).toBeDefined();
+    expect(h.deleteCutoverPlacement).not.toHaveBeenCalled();
+  });
+});
+
+// ---------- 10. activePlacementOf never infers a transient clone as "active" ----------
+//
+// Regression for the live E2E bug: createCutoverClone copies `from`'s
+// priority and always uses mode:'hot', so a freshly-created clone TIES with
+// `from` in the (priority, id) order activePlacementOf's third fallback
+// falls back to before any failover row or switcher report names either one.
+// Whichever of the two has the lexically smaller id used to win that tie —
+// if it picked the clone, requestFailover's already-active early-exit would
+// silently drop the cutover request: no row ever created, so nothing ever
+// drives the clone to completion or cleans it up, and `from` never gets
+// unpinned from a frozen snapshot profile. The fix excludes transient
+// placements from that fallback outright.
+
+describe('FailoverSync: activePlacementOf never infers a transient clone as "active" (tie-break regression)', () => {
+  /** clone id sorts lexically BEFORE from's id -- the exact ordering that used to win the coin flip */
+  const CLONE_ID = '0aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  const FROM_ID = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+
+  async function seedTiedCloneChannel(h: Harness, slug = 'chan1') {
+    const chanId = await insertChannel(h.db, { slug });
+    // `from`: real, currently-serving placement
+    await insertPlacement(h.db, {
+      id: FROM_ID,
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 1,
+      mode: 'hot',
+    });
+    // the cutover clone: same priority (copied from `from`), also 'hot',
+    // transient -- mirrors createCutoverClone exactly. No failover row and no
+    // switcher report name either placement yet (freshly created channel /
+    // switcher briefly behind), so only the third (priority, id) fallback
+    // can resolve "active".
+    await insertPlacement(h.db, {
+      id: CLONE_ID,
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 1,
+      mode: 'hot',
+      transient: true,
+    });
+    return { chanId };
+  }
+
+  it('requestFailover(cutover, toPlacementId: clone) enqueues instead of silently no-op-ing as already-active', async () => {
+    const h = await setup();
+    const { chanId } = await seedTiedCloneChannel(h);
+
+    const result = await h.sync.requestFailover(chanId, {
+      toPlacementId: CLONE_ID,
+      reason: 'cutover',
+      force: true, // same-node clone admission isn't under test here (mirrors the "cutover completion" test)
+    });
+    expect(result).toEqual({ ok: true, queued: true });
+
+    await h.sync.tick(); // begin -> bringing-up auto-advances -> awaiting-lag (clone has no lag measurement yet)
+    const row = await failoverRow(h.db, chanId);
+    expect(row).toMatchObject({
+      from_placement_id: FROM_ID,
+      to_placement_id: CLONE_ID,
+      phase: 'awaiting-lag',
+      trigger_reason: 'cutover',
+    });
+  });
+
+  it('scanTriggers skips a channel whose only enabled hot placement is transient (no crash, no spurious trigger)', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'chan1' });
+    // ONLY a transient placement -- no real placement exists at all (a more
+    // extreme degenerate case than the tie-break above: activePlacementOf
+    // must resolve to null rather than falling through to the clone anyway).
+    await insertPlacement(h.db, {
+      id: CLONE_ID,
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 1,
+      mode: 'hot',
+      transient: true,
+    });
+    h.snapshot.liveness.set('zoneA/n1', failing());
+
+    await expect(h.sync.tick()).resolves.toBeUndefined();
+
+    expect(h.sync.activeChannelId()).toBeNull();
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
   });
 });

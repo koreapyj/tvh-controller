@@ -88,6 +88,10 @@ export interface FailoverSyncHooks {
   publishChannel(channelId: string): void;
   /** a switch was just ordered — poke the switcher poller so confirmation isn't stuck behind its 15s cadence */
   onSwitchIssued?(): void;
+  /** cutover complete: promote the clone (transient=1 -> 0) into a permanent, ordinary placement */
+  markCutoverComplete?(placementId: string): Promise<void>;
+  /** cutover abort/drain cleanup: delete a placement (+ its orphaned transient profile, if any) */
+  deleteCutoverPlacement?(placementId: string): Promise<void>;
 }
 
 export type ResetOutcome =
@@ -120,6 +124,8 @@ interface PlacementRow {
   priority: number;
   enabled: number;
   mode: string;
+  /** 1 = a cutover-owned transient clone — machinery-owned, never inferred as "active" */
+  transient: number;
 }
 
 type FailoverRow = Omit<
@@ -219,7 +225,7 @@ export class FailoverSync {
         .execute(),
       this.db
         .selectFrom('restream_placements')
-        .select(['id', 'channel_id', 'instance_id', 'node_id', 'priority', 'enabled', 'mode'])
+        .select(['id', 'channel_id', 'instance_id', 'node_id', 'priority', 'enabled', 'mode', 'transient'])
         .orderBy('priority')
         .orderBy('id')
         .execute(),
@@ -262,6 +268,16 @@ export class FailoverSync {
    * wins (it IS the selection once a procedure exists), else the switcher's
    * reported active upstream, else the preferred (lowest-(priority,id))
    * enabled hot placement.
+   *
+   * The third fallback NEVER returns a transient (cutover-owned) placement,
+   * even if it's the only hot one: a transient clone is machinery-owned and
+   * only ever "active" by way of an explicit failover-row target or the
+   * switcher's own report (the two prior fallbacks) — never inferred from
+   * bare priority order. A cutover clone starts out tied with `from` on
+   * (priority, mode='hot'), so without this guard the tie-break (lexically
+   * smallest id) is a coin flip: if it ever picked the clone, requestFailover
+   * would see the cutover's own target as already-active and silently drop
+   * the request, leaking the clone and pinning `from` forever.
    */
   private activePlacementOf(data: TickData, channelId: string): PlacementRow | null {
     const row = data.rows.get(channelId);
@@ -280,7 +296,20 @@ export class FailoverSync {
       }
     }
     const list = data.placementsByChannel.get(channelId) ?? [];
-    return list.find((p) => !!p.enabled && p.mode === 'hot') ?? null;
+    return list.find((p) => !!p.enabled && p.mode === 'hot' && !p.transient) ?? null;
+  }
+
+  /**
+   * The channel's steady-state ("natural") placement: preferred enabled hot,
+   * else the first enabled placement (all-cold channel) — same blind spot as
+   * activePlacementOf's third fallback, so transient placements are excluded
+   * here too. Used only to decide whether a completed/reset procedure landed
+   * back on the channel's real steady state, never as a failover candidate
+   * source.
+   */
+  private naturalPlacementOf(placements: PlacementRow[]): PlacementRow | null {
+    const real = placements.filter((p) => !p.transient);
+    return real.find((p) => p.mode === 'hot') ?? real[0] ?? null;
   }
 
   private switcherReport(slug: string): {
@@ -496,6 +525,21 @@ export class FailoverSync {
       if (row.phase === 'draining') {
         const until = asMs(row.drain_until);
         if (until === null || nowMs >= until) {
+          if (row.trigger_reason === 'cutover') {
+            // the retired encode's drain window elapsed — remove it (and its
+            // frozen/snapshot profile, if orphaned) now that the switcher has
+            // long since stopped sending it viewers. The clone can only be
+            // promoted to transient=0 AFTER `from` is gone: createCutoverClone
+            // always places it on `from`'s exact (channel_id, instance_id,
+            // node_id) triple, and the unique index is scoped over
+            // `transient` — promoting the clone while `from`'s transient=0
+            // row still holds that triple would collide with it. deleteRow
+            // below only clears the failover_state row, not the placement.
+            if (row.from_placement_id) {
+              await this.hooks.deleteCutoverPlacement?.(row.from_placement_id);
+            }
+            await this.hooks.markCutoverComplete?.(row.to_placement_id);
+          }
           await this.deleteRow(channelId);
           data.rows.delete(channelId);
           changed.add(channelId);
@@ -775,7 +819,7 @@ export class FailoverSync {
         ? (this.cache.get(from.instance_id).restreamers.find((r) => r.nodeId === from.node_id) ?? null)
         : null;
       oldSessionGone =
-        status?.reachable === true && !status.sessions.some((s) => s.name === channel.slug);
+        status?.reachable === true && !status.sessions.some((s) => s.name === from.id);
     }
 
     return {
@@ -811,6 +855,13 @@ export class FailoverSync {
     const row = await this.loadRow(channelId);
     if (!row) {
       this.clearActive();
+      return;
+    }
+    if (row.trigger_reason === 'cutover') {
+      // the clone is the ONLY acceptable target for a cutover — never fall
+      // through to the normal candidate search and retarget onto some other
+      // standby placement (even a healthy, eligible one on another node)
+      await this.abortCutover(data, channelId, row, changed);
       return;
     }
     const placements = (data.placementsByChannel.get(channelId) ?? []).filter((p) => !!p.enabled);
@@ -865,6 +916,10 @@ export class FailoverSync {
     row: FailoverRow,
     changed: Set<string>,
   ): Promise<void> {
+    if (row.trigger_reason === 'cutover') {
+      await this.finishCutover(data, channelId, row, changed);
+      return;
+    }
     // site #4: automatic failover lifecycle (complete) — skip manual/reset
     if (row.trigger_reason !== 'manual' && row.trigger_reason !== 'reset') {
       const slug = data.channels.get(channelId)?.slug ?? channelId;
@@ -882,7 +937,7 @@ export class FailoverSync {
     // Automatic failovers and rebalances keep their row: that IS the
     // persisted "failover occurred" state the Reset button keys on.
     const placements = (data.placementsByChannel.get(channelId) ?? []).filter((p) => !!p.enabled);
-    const natural = placements.find((p) => p.mode === 'hot') ?? placements[0] ?? null;
+    const natural = this.naturalPlacementOf(placements);
     const isFailback =
       row.trigger_reason === 'reset' ||
       (row.trigger_reason === 'manual' && natural !== null && row.to_placement_id === natural.id);
@@ -913,6 +968,79 @@ export class FailoverSync {
     this.retriggerBackoff.delete(channelId);
     this.clearActive();
     changed.add(channelId);
+    this.hooks.publishChannel(channelId);
+  }
+
+  /**
+   * A cutover in awaiting-lag never reaches here without a healthy clone —
+   * the clone is the ONLY acceptable target, so if it never becomes healthy
+   * the procedure aborts loss-free instead (see retargetOrAbort). `from` was
+   * never suppressed (the switch was never issued), so nothing was ever lost.
+   * No bumpBackoff/this.blocked — a cutover is a one-shot, explicitly
+   * requested procedure, not part of the automatic-retry loop those throttle.
+   */
+  private async abortCutover(
+    data: TickData,
+    channelId: string,
+    row: FailoverRow,
+    changed: Set<string>,
+  ): Promise<void> {
+    const slug = data.channels.get(channelId)?.slug ?? channelId;
+    await this.hooks.deleteCutoverPlacement?.(row.to_placement_id);
+    await this.deleteRow(channelId);
+    data.rows.delete(channelId);
+    this.clearActive();
+    changed.add(channelId);
+    console.error(`restreamer: cutover ABORTED for channel ${channelId} — new encode never became healthy`);
+    this.events.log({
+      type: 'warning',
+      service: 'restreamer',
+      source: 'controller',
+      message:
+        `cutover ABORTED for "${slug}" — new encode ${row.to_placement_id} never became healthy; ` +
+        `still serving ${row.from_placement_id ?? '(none)'}`,
+    });
+  }
+
+  /**
+   * Cutover reached complete: move straight to 'draining', reusing the same
+   * drainGraceMs retained-window mechanism as a cold-outgoing automatic
+   * failover — the retiring `from` keeps encoding, still resolvable from this
+   * row, until the switcher's retained HLS window has fully drained;
+   * rowHygiene's draining-expiry branch then retires `from` AND promotes the
+   * clone (transient -> permanent) together via deleteCutoverPlacement /
+   * markCutoverComplete. The promotion is deliberately NOT done here: `from`
+   * and the clone share the same (channel_id, instance_id, node_id) triple
+   * (createCutoverClone always places it there), and the unique index is
+   * scoped over `transient` — promoting the clone to transient=0 while
+   * `from`'s transient=0 row is still present would collide with it. Unlike
+   * the generic site #4 path this ALWAYS logs — cutover is never
+   * 'manual'/'reset', so it's never eligible for that skip.
+   */
+  private async finishCutover(
+    data: TickData,
+    channelId: string,
+    row: FailoverRow,
+    changed: Set<string>,
+  ): Promise<void> {
+    const slug = data.channels.get(channelId)?.slug ?? channelId;
+    const until = new Date(this.now().getTime() + this.drainGraceMs(data, channelId))
+      .toISOString()
+      .slice(0, 19)
+      .replace('T', ' ');
+    await this.setPhase(channelId, 'draining', until);
+    this.retriggerBackoff.delete(channelId);
+    this.clearActive();
+    changed.add(channelId);
+    console.error(`restreamer: cutover COMPLETE for channel ${channelId} — now serving ${row.to_placement_id}`);
+    this.events.log({
+      type: 'normal',
+      service: 'restreamer',
+      source: 'controller',
+      message:
+        `cutover COMPLETE for "${slug}" — now serving ${row.to_placement_id}; ` +
+        `${row.from_placement_id ?? '(none)'} retiring`,
+    });
     this.hooks.publishChannel(channelId);
   }
 
@@ -992,7 +1120,7 @@ export class FailoverSync {
     // steady state runs the HOT placements — cold priorities are failover
     // CANDIDATE order, not steady-state preference. Fail back to the first
     // enabled hot; an all-cold channel keeps a cold "activation" instead.
-    const natural = placements.find((p) => p.mode === 'hot') ?? placements[0] ?? null;
+    const natural = this.naturalPlacementOf(placements);
     if (!natural) throw httpError(409, 'channel has no enabled placements');
     if (natural.id === row.to_placement_id) {
       if (natural.mode === 'cold') {

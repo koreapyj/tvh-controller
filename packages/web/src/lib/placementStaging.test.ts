@@ -37,6 +37,7 @@ function placement(over: Partial<RestreamPlacement> = {}): RestreamPlacement {
     profileId: null,
     programNumber: null,
     updatedAt: '2026-01-01T00:00:00.000Z',
+    transient: false,
     ...over,
   };
 }
@@ -65,6 +66,15 @@ describe('seedStagedPlacements', () => {
     ]);
     expect(seeded[0]).toMatchObject({ programNumber: '' });
     expect(seeded[1]).toMatchObject({ programNumber: '3' });
+  });
+
+  it('excludes cutover-owned transient clones (Stage B.3) — never surfaced for manual editing', () => {
+    const seeded = seedStagedPlacements([
+      placement({ id: 'a', priority: 1, transient: false }),
+      placement({ id: 'clone', priority: 1, transient: true }),
+      placement({ id: 'b', priority: 2, transient: false }),
+    ]);
+    expect(seeded.map((p) => p.id)).toEqual(['a', 'b']);
   });
 
   it('formats null profileId as a blank string (inherit channel default), else the id', () => {
@@ -186,5 +196,19 @@ describe('removedPlacementIds', () => {
 
   it('reports every original id when all placements are removed', () => {
     expect(removedPlacementIds(original, [])).toEqual(['a', 'b', 'c']);
+  });
+
+  it('never reports a transient clone as removed, even though it was never staged (Stage B.3)', () => {
+    const withClone = [...original, placement({ id: 'clone', transient: true })];
+    const staged: StagedPlacement[] = original.map((p): StagedPlacement => ({
+      id: p.id,
+      instanceId: p.instanceId,
+      nodeId: p.nodeId,
+      mode: p.mode,
+      programNumber: '',
+      profileId: '',
+      enabled: p.enabled,
+    }));
+    expect(removedPlacementIds(withClone, staged)).toEqual([]);
   });
 });

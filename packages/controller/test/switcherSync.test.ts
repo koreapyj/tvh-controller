@@ -216,14 +216,15 @@ describe('computeSwitcherDoc', () => {
     expect(doc.channels.map((c) => c.slug)).toEqual(['at-x', 'bbb']);
     const singlePlacement = (await h.service.listChannels()).find((c) => c.id === single.id)!
       .placements[0]!;
+    // upstream URL path segment is the placement id, not the channel slug
     expect(doc.channels[0]!.upstreams).toEqual([
-      { id: singlePlacement.id, url: 'http://hls.zone1-n1/at-x', priority: 1 },
+      { id: singlePlacement.id, url: `http://hls.zone1-n1/${singlePlacement.id}`, priority: 1 },
     ]);
     const ch = doc.channels[1]!;
     expect(ch.segmentSeconds).toBe(5); // contract default
     expect(ch.upstreams).toEqual([
-      { id: placements[0]!.id, url: 'http://hls.zone1-n1/bbb', priority: 1 },
-      { id: placements[1]!.id, url: 'http://hls.zone2-n1/bbb', priority: 2 },
+      { id: placements[0]!.id, url: `http://hls.zone1-n1/${placements[0]!.id}`, priority: 1 },
+      { id: placements[1]!.id, url: `http://hls.zone2-n1/${placements[1]!.id}`, priority: 2 },
     ]);
     expect(doc.revision).toBe(sessionsHash(doc.channels));
 
@@ -249,10 +250,12 @@ describe('computeSwitcherDoc', () => {
       ],
     });
 
+    const n1PlacementId = (await h.service.listChannels()).find((c) => c.id === chan.id)!
+      .placements.find((pl) => pl.nodeId === 'n1')!.id;
     const { doc, blocked } = await h.service.computeSwitcherDoc();
     expect(doc.channels.map((c) => c.slug)).toEqual(['at-x']);
     expect(doc.channels[0]!.upstreams).toEqual([
-      { id: expect.any(String), url: 'http://hls.zone1-n1/at-x', priority: 1 },
+      { id: n1PlacementId, url: `http://hls.zone1-n1/${n1PlacementId}`, priority: 1 },
     ]);
     expect(blocked).toHaveLength(1);
     expect(blocked[0]!.reason).toContain('has no serveUrl');
@@ -322,6 +325,51 @@ describe('computeSwitcherDoc', () => {
     });
     const { doc } = await h.service.computeSwitcherDoc();
     expect(doc.channels[0]!.segmentSeconds).toBe(6);
+    await h.destroy();
+  });
+
+  it('two placements on nodes sharing the same serveUrl (shared cache) still get distinct upstream URLs from the placement id', async () => {
+    // n1 and n3 are configured with the IDENTICAL serveUrl (e.g. both fronted
+    // by the same cache host) — under the old slug-keyed URL scheme this
+    // collided (`${serveUrl}/${slug}` identical for both); placement ids fix it.
+    const h = await setup({
+      instances: [
+        {
+          id: 'zone1',
+          name: 'zone1',
+          url: 'http://zone1:9981',
+          restreamer: {
+            nodes: [
+              { id: 'n1', url: 'http://zone1-n1:5580', serveUrl: 'http://hls.zone1-n1', egressMbps: 10 },
+              { id: 'n3', url: 'http://zone1-n3:5580', serveUrl: 'http://hls.zone1-n1', egressMbps: 10 },
+            ],
+          },
+        },
+      ],
+    });
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone1', nodeId: 'n3' },
+      ],
+    });
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    const n1Placement = placements.find((pl) => pl.nodeId === 'n1')!;
+    const n3Placement = placements.find((pl) => pl.nodeId === 'n3')!;
+    expect(n1Placement.id).not.toBe(n3Placement.id);
+
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'at-x')!;
+    const urls = ch.upstreams.map((u) => u.url);
+    expect(new Set(urls).size).toBe(urls.length); // no collision despite identical serveUrl
+    expect(ch.upstreams).toEqual([
+      { id: n1Placement.id, url: `http://hls.zone1-n1/${n1Placement.id}`, priority: 1 },
+      { id: n3Placement.id, url: `http://hls.zone1-n1/${n3Placement.id}`, priority: 2 },
+    ]);
     await h.destroy();
   });
 });

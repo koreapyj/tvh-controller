@@ -42,6 +42,8 @@ export interface RestreamProfile {
   name: string;
   payload: AribHlsParams;
   updatedAt: string;
+  /** true = a cutover-owned snapshot of a base profile's pre-edit payload; never listed for manual selection */
+  transient: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +118,8 @@ export type FailoverTriggerReason =
   | 'lag'
   | 'manual'
   | 'reset'
-  | 'rebalance';
+  | 'rebalance'
+  | 'cutover';
 
 /**
  * UI indicator for one placement badge: yellow transitions
@@ -160,6 +163,8 @@ export interface RestreamPlacement {
   /** manual program-number (service SID) override; null = derived channel→service→sid */
   programNumber: number | null;
   updatedAt: string;
+  /** true = a cutover-owned transient clone of another placement; never user-created */
+  transient: boolean;
 }
 
 /** logical restream channel: one slug, one channel identity, one profile, 1..N placements */

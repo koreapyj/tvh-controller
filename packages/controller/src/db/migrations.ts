@@ -16,7 +16,7 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import { Kysely, Migrator, sql, type Migration, type MigrationProvider } from 'kysely';
+import { Kysely, Migrator, SqliteAdapter, sql, type Migration, type MigrationProvider } from 'kysely';
 
 const migrations: Record<string, Migration> = {
   '001_initial': {
@@ -652,6 +652,286 @@ migrations['019_drop_advertised_raw_argv'] = {
   },
 };
 
+/**
+ * Kysely re-exports both dialect adapters from its top-level package, so a
+ * plain `instanceof` check is enough to branch migration DDL by dialect —
+ * no probe query needed. (mysql2-backed prod always uses MysqlAdapter; the
+ * hermetic test suite always uses SqliteAdapter via better-sqlite3.)
+ */
+function isSqliteDb(db: Kysely<unknown>): boolean {
+  return db.getExecutor().adapter instanceof SqliteAdapter;
+}
+
+type PlacementUniqueCol = 'channel_id' | 'instance_id' | 'node_id' | 'transient';
+
+/**
+ * True if `table.column` already exists on the live schema. Used to make
+ * ALTER TABLE ADD COLUMN steps resumable (see 020_placement_transient):
+ * MySQL/MariaDB DDL auto-commits per statement, so a process that dies
+ * mid-migration can leave a column already added with no record of it
+ * beyond the live schema itself — re-running the plain addColumn() then
+ * dies on "Duplicate column name" forever.
+ */
+async function columnExists(db: Kysely<unknown>, table: string, column: string): Promise<boolean> {
+  if (isSqliteDb(db)) {
+    const result = await sql<{ name: string }>`
+      select name from pragma_table_info(${table}) where name = ${column}
+    `.execute(db);
+    return result.rows.length > 0;
+  }
+  const result = await sql<{ one: number }>`
+    select 1 as one from information_schema.columns
+    where table_schema = database() and table_name = ${table} and column_name = ${column}
+  `.execute(db);
+  return result.rows.length > 0;
+}
+
+function sameColumnOrder(actual: readonly string[], target: readonly string[]): boolean {
+  return actual.length === target.length && actual.every((col, i) => col === target[i]);
+}
+
+/**
+ * True if an index named `indexName` (plain or unique) already exists on
+ * `table` — MySQL/MariaDB only (see 020_placement_transient's
+ * idx_placements_channel_id below for why one is needed; never called on
+ * the sqlite path, which has no equivalent index-by-name lookup — see
+ * placementsUniqueIndexColumns' doc comment for why).
+ */
+async function indexExists(db: Kysely<unknown>, table: string, indexName: string): Promise<boolean> {
+  const result = await sql<{ one: number }>`
+    select 1 as one from information_schema.statistics
+    where table_schema = database() and table_name = ${table} and index_name = ${indexName}
+    limit 1
+  `.execute(db);
+  return result.rows.length > 0;
+}
+
+/**
+ * Column list (in index order) of uq_placements_channel_node on
+ * restream_placements — [] if the index doesn't currently exist.
+ *
+ * MySQL/MariaDB: the constraint is implemented as a plain index, queryable
+ * straight from information_schema.
+ *
+ * SQLite: a named `CONSTRAINT ... UNIQUE (...)` on a CREATE TABLE does NOT
+ * carry its name onto the resulting index — SQLite always names it
+ * `sqlite_autoindex_<table>_<n>` regardless (verified empirically), so
+ * PRAGMA index_list/index_info can't be looked up by our constraint name.
+ * The constraint's column list is read back from the CREATE TABLE DDL text
+ * in sqlite_master instead.
+ */
+async function placementsUniqueIndexColumns(db: Kysely<unknown>): Promise<string[]> {
+  if (isSqliteDb(db)) {
+    const result = await sql<{ sql: string | null }>`
+      select sql from sqlite_master where type = 'table' and name = 'restream_placements'
+    `.execute(db);
+    const ddl = result.rows[0]?.sql ?? '';
+    const match = /constraint\s+"?uq_placements_channel_node"?\s+unique\s*\(([^)]*)\)/i.exec(ddl);
+    if (!match) return [];
+    return match[1]!.split(',').map((c) => c.trim().replace(/^"|"$/g, ''));
+  }
+  const result = await sql<{ column_name: string }>`
+    select column_name from information_schema.statistics
+    where table_schema = database()
+      and table_name = 'restream_placements'
+      and index_name = 'uq_placements_channel_node'
+    order by seq_in_index
+  `.execute(db);
+  return result.rows.map((r) => r.column_name);
+}
+
+/**
+ * SQLite has supported native ALTER TABLE ADD/DROP COLUMN since 3.35, but
+ * has never supported dropping or altering a named table constraint — the
+ * only way to change one is the standard 12-step rebuild (new table, copy
+ * rows, drop old, rename). restream_failover_state holds FKs into this
+ * table (from_placement_id/to_placement_id), so foreign key enforcement is
+ * suspended for the duration; verified empirically that FK rows and their
+ * CASCADE/SET NULL behavior survive the rebuild intact.
+ *
+ * `restream_placements_new` is dropped first in case a previous run of this
+ * rebuild died between creating it and the final rename — see
+ * 020_placement_transient for why a partial run is a real possibility.
+ */
+async function rebuildPlacementsUniqueConstraint(
+  db: Kysely<unknown>,
+  uniqueCols: PlacementUniqueCol[],
+): Promise<void> {
+  await sql`PRAGMA foreign_keys = OFF`.execute(db);
+  try {
+    await sql`drop table if exists restream_placements_new`.execute(db);
+    await db.schema
+      .createTable('restream_placements_new')
+      .addColumn('id', 'varchar(36)', (c) => c.primaryKey())
+      .addColumn('channel_id', 'varchar(36)', (c) =>
+        c.notNull().references('restream_channels.id').onDelete('cascade'),
+      )
+      .addColumn('instance_id', 'varchar(64)', (c) => c.notNull())
+      .addColumn('node_id', 'varchar(64)', (c) => c.notNull())
+      .addColumn('priority', 'integer', (c) => c.notNull())
+      .addColumn('enabled', 'boolean', (c) => c.notNull().defaultTo(1))
+      .addColumn('program_number', 'integer')
+      .addColumn('updated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .addColumn('mode', 'varchar(8)', (c) => c.notNull().defaultTo('hot'))
+      .addColumn('profile_id', 'varchar(36)')
+      .addColumn('transient', 'boolean', (c) => c.notNull().defaultTo(0))
+      .addUniqueConstraint('uq_placements_channel_node', uniqueCols)
+      .execute();
+
+    await sql`
+      insert into restream_placements_new
+        (id, channel_id, instance_id, node_id, priority, enabled, program_number, updated_at, mode, profile_id, transient)
+      select id, channel_id, instance_id, node_id, priority, enabled, program_number, updated_at, mode, profile_id, transient
+      from restream_placements
+    `.execute(db);
+
+    await db.schema.dropTable('restream_placements').execute();
+    await sql`alter table restream_placements_new rename to restream_placements`.execute(db);
+  } finally {
+    await sql`PRAGMA foreign_keys = ON`.execute(db);
+  }
+}
+
+migrations['020_placement_transient'] = {
+  // Zero-downtime "cutover" (profile change without a visible drop): a
+  // transient CLONE placement is inserted on the exact same
+  // (channel_id, instance_id, node_id) as the placement it is replacing,
+  // briefly coexisting with it while the new profile's encode spins up and
+  // proves itself healthy. `transient` marks rows OWNED by this lifecycle
+  // (never user-created, never surfaced in the profile picker) so the apply
+  // sweep and listProfiles() can exclude them.
+  /*
+   * Resumable by design. MySQL/MariaDB DDL auto-commits per statement — the
+   * migrator cannot roll back a half-applied multi-statement migration on
+   * that dialect. If the process dies partway through up() (crash, deploy
+   * timeout, connection loss), the migrator records the run as failed but
+   * whatever DDL already landed stays landed. The next boot retries up()
+   * from the top: a naive re-run of `ADD COLUMN transient` then dies on
+   * "Duplicate column name", masking whatever actually killed the first
+   * attempt and wedging the deployment on every subsequent boot.
+   *
+   * Each step below therefore checks the live schema first and no-ops if
+   * that step's effect is already present, so a fresh run and a resumed run
+   * take the identical path — there's no separate "first attempt" code path
+   * to keep in sync. This costs one extra introspection query per step, only
+   * ever paid once (at migration time), against no ongoing cost.
+   */
+  async up(db: Kysely<unknown>): Promise<void> {
+    if (!(await columnExists(db, 'restream_placements', 'transient'))) {
+      await db.schema
+        .alterTable('restream_placements')
+        .addColumn('transient', 'boolean', (c) => c.notNull().defaultTo(0))
+        .execute();
+    }
+    if (!(await columnExists(db, 'restream_profiles', 'transient'))) {
+      await db.schema
+        .alterTable('restream_profiles')
+        .addColumn('transient', 'boolean', (c) => c.notNull().defaultTo(0))
+        .execute();
+    }
+
+    // uq_placements_channel_node (008) would otherwise reject the transient
+    // clone's same-node insert outright. Widen it to include `transient`
+    // rather than dropping it: this still lets the DB itself enforce the
+    // pre-existing transient=0 invariant (see
+    // restreamerSchema.test.ts::'enforces UNIQUE(...) on placements'), while
+    // admitting exactly one transient=1 row alongside it per node. The
+    // transient=0 (public-CRUD) uniqueness check itself continues to live at
+    // the app level in addPlacementInner/applyChannelChangesInner — this is
+    // pure defense in depth plus the carve-out cutover needs.
+    const widenedCols: PlacementUniqueCol[] = ['channel_id', 'instance_id', 'node_id', 'transient'];
+    if (isSqliteDb(db)) {
+      if (!sameColumnOrder(await placementsUniqueIndexColumns(db), widenedCols)) {
+        await rebuildPlacementsUniqueConstraint(db, widenedCols);
+      }
+    } else {
+      // MySQL: a UNIQUE constraint is implemented as an index, and generic
+      // `DROP CONSTRAINT` for non-CHECK/FK constraints only works on
+      // 8.0.19+ — DROP INDEX / ADD UNIQUE INDEX is the portable form back
+      // to MySQL 4.x, so raw SQL is used here instead of the schema
+      // builder's dropConstraint()/addUniqueConstraint() (which compile to
+      // `DROP CONSTRAINT` / `ADD CONSTRAINT ... UNIQUE`).
+      //
+      // MySQL vs MariaDB divergence that this index exists to paper over:
+      // channel_id's column-level `.references('restream_channels.id')`
+      // (008_restreamer) compiles to an inline `REFERENCES` clause on the
+      // column definition. MySQL parses that syntax and silently ignores it
+      // — no FK is actually created (verified on MySQL 8: SHOW CREATE TABLE
+      // has no FOREIGN KEY line, and deleting a channel leaves its
+      // placements orphaned). MariaDB 10.2.1+ instead HONORS the exact same
+      // inline REFERENCES clause and creates a real FK (channel_id ->
+      // restream_channels.id, ON DELETE CASCADE). Prod runs MariaDB, so
+      // that FK is real there, and InnoDB refuses to drop whichever index
+      // is currently satisfying it unless some other index already leads
+      // with the FK's column. uq_placements_channel_node (channel_id,
+      // instance_id, node_id[, transient]) is the only index that does, so
+      // `DROP INDEX uq_placements_channel_node` below fails with "needed in
+      // a foreign key constraint" the moment it's the sole anchor — which
+      // is exactly what happened in prod. Ensuring this plain, permanent
+      // stand-in index exists FIRST gives the FK somewhere else to anchor
+      // to, so the drop always succeeds; on FK-less MySQL it's simply an
+      // extra harmless index. It is never dropped again — not even in
+      // down() below — so every future migration that touches
+      // uq_placements_channel_node inherits the same protection for free.
+      if (!(await indexExists(db, 'restream_placements', 'idx_placements_channel_id'))) {
+        await sql`create index idx_placements_channel_id on restream_placements (channel_id)`.execute(
+          db,
+        );
+      }
+
+      if (!sameColumnOrder(await placementsUniqueIndexColumns(db), widenedCols)) {
+        // A previous partial run may have already dropped the 3-column
+        // index without getting to re-add the widened one — only drop it if
+        // it's still there, otherwise ADD UNIQUE INDEX would be adding it on
+        // top of nothing and that's the whole story.
+        const existing = await placementsUniqueIndexColumns(db);
+        if (existing.length > 0) {
+          await sql`alter table restream_placements drop index uq_placements_channel_node`.execute(db);
+        }
+        await sql`alter table restream_placements add unique index uq_placements_channel_node (channel_id, instance_id, node_id, transient)`.execute(
+          db,
+        );
+      }
+    }
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    // symmetric resumability with up() — cheap given the helpers already
+    // exist, even though down() is not part of the normal boot path.
+    const narrowCols: PlacementUniqueCol[] = ['channel_id', 'instance_id', 'node_id'];
+    if (isSqliteDb(db)) {
+      if (!sameColumnOrder(await placementsUniqueIndexColumns(db), narrowCols)) {
+        await rebuildPlacementsUniqueConstraint(db, narrowCols);
+      }
+    } else {
+      // Same MySQL-vs-MariaDB inline-REFERENCES trap as up() above (see the
+      // long comment there): ensure idx_placements_channel_id exists before
+      // dropping uq_placements_channel_node, so MariaDB's real FK always has
+      // somewhere else to anchor to. Left in place afterward, same as up().
+      if (!(await indexExists(db, 'restream_placements', 'idx_placements_channel_id'))) {
+        await sql`create index idx_placements_channel_id on restream_placements (channel_id)`.execute(
+          db,
+        );
+      }
+
+      if (!sameColumnOrder(await placementsUniqueIndexColumns(db), narrowCols)) {
+        const existing = await placementsUniqueIndexColumns(db);
+        if (existing.length > 0) {
+          await sql`alter table restream_placements drop index uq_placements_channel_node`.execute(db);
+        }
+        await sql`alter table restream_placements add unique index uq_placements_channel_node (channel_id, instance_id, node_id)`.execute(
+          db,
+        );
+      }
+    }
+    if (await columnExists(db, 'restream_profiles', 'transient')) {
+      await db.schema.alterTable('restream_profiles').dropColumn('transient').execute();
+    }
+    if (await columnExists(db, 'restream_placements', 'transient')) {
+      await db.schema.alterTable('restream_placements').dropColumn('transient').execute();
+    }
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;
@@ -680,4 +960,17 @@ export async function migrateTo<T>(db: Kysely<T>, targetMigrationName: string): 
     const failed = results?.find((r) => r.status === 'Error');
     throw new Error(`migration ${failed?.migrationName ?? ''} failed: ${String(error)}`);
   }
+}
+
+/**
+ * Test-only: run a single migration's up() directly against a db, bypassing
+ * the migrator's bookkeeping (its migration-history table). Lets a test
+ * replay up() a second time on an already-migrated db — or against a db
+ * mutated with raw SQL to simulate a partially-applied prior run — without
+ * needing a real interrupted MySQL boot to reproduce it.
+ */
+export async function runMigrationUp<T>(db: Kysely<T>, migrationName: string): Promise<void> {
+  const migration = migrations[migrationName];
+  if (!migration) throw new Error(`unknown migration: ${migrationName}`);
+  await migration.up(db as Kysely<unknown>);
 }

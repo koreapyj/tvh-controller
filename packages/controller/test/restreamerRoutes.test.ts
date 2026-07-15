@@ -176,6 +176,23 @@ function seedNodeStatus(
   ];
 }
 
+/**
+ * Mutates an already-seeded node's session list in place (rather than
+ * appending a duplicate restreamers[] entry via seedNodeStatus). Needed
+ * whenever session names must be a placement's id, which only exists after
+ * the channel/placement is created — so catalog data goes in up front via
+ * seedNodeStatus, and sessions are attached afterward via this helper.
+ */
+function setSessions(
+  cache: InstanceCache,
+  instanceId: string,
+  nodeId: string,
+  sessions: SessionStatus[],
+): void {
+  const entry = cache.get(instanceId).restreamers.find((r) => r.nodeId === nodeId);
+  if (entry) entry.sessions = sessions;
+}
+
 interface Harness {
   app: FastifyInstance;
   ctx: AppContext;
@@ -294,6 +311,14 @@ async function createPlaylist(
   return res.json() as RestreamPlaylist;
 }
 
+/** looks up one channel's placement id on a specific instance via a live GET — sessions are named for placement ids, not the channel slug */
+async function placementId(h: Harness, channelId: string, instanceId: string): Promise<string> {
+  const list = (
+    await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' })
+  ).json() as RestreamChannelWithStatus[];
+  return list.find((c) => c.id === channelId)!.placements.find((p) => p.instanceId === instanceId)!.id;
+}
+
 // ---------- profiles ----------
 
 describe('restreamer profile routes', () => {
@@ -343,7 +368,7 @@ describe('restreamer channel routes', () => {
   it('create + list returns the WithStatus shape', async () => {
     const { app, cache } = await harness();
     const profile = await createProfile(app);
-    seedNodeStatus(cache, 'zone1', 'n1', [sessionStatus('at-x')]);
+    seedNodeStatus(cache, 'zone1', 'n1', []);
 
     const created = await app.inject({
       method: 'POST',
@@ -362,6 +387,11 @@ describe('restreamer channel routes', () => {
     // the sourceType/sourceKey model is gone — the DTO no longer carries them
     expect(channel).not.toHaveProperty('sourceType');
     expect(channel).not.toHaveProperty('sourceKey');
+
+    // the running session is named after the placement id, not the channel slug
+    const before = await app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const placementId = (before.json() as RestreamChannelWithStatus[])[0]!.placements[0]!.id;
+    setSessions(cache, 'zone1', 'n1', [sessionStatus(placementId)]);
 
     const list = await app.inject({ method: 'GET', url: '/api/restreamer/channels' });
     expect(list.statusCode).toBe(200);
@@ -621,21 +651,16 @@ describe('write-time availability and catalog-resolved identity (routes)', () =>
     const profile = await createProfile(h.app);
     const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'TV' });
     // the catalog must be in the cache BEFORE the "Cam 1" create (write-time
-    // availability checks it) — sessions running so the entries render
-    seedNodeStatus(
-      h.cache,
-      'zone1',
-      'n1',
-      [sessionStatus('at-x'), sessionStatus('cam-1'), sessionStatus('cam-9')],
-      [CAM],
-    );
+    // availability checks it); sessions are attached AFTER creation, once
+    // each channel's placement id (the session name) is known
+    seedNodeStatus(h.cache, 'zone1', 'n1', [], [CAM]);
 
     const post = async (payload: Record<string, unknown>) => {
       const res = await h.app.inject({ method: 'POST', url: '/api/restreamer/channels', payload });
       expect(res.statusCode).toBe(201);
       return res.json() as RestreamChannel;
     };
-    await post({
+    const atx = await post({
       channelName: 'AT-X',
       channelNumber: '9.1',
       profileId: profile.id,
@@ -643,7 +668,7 @@ describe('write-time availability and catalog-resolved identity (routes)', () =>
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
     // "Cam 1" is absent from zone1's tvh topology — resolves via the node catalog
-    await post({
+    const cam1 = await post({
       channelName: 'Cam 1',
       channelNumber: '5', // matches CAM's chno exactly
       profileId: profile.id,
@@ -651,13 +676,25 @@ describe('write-time availability and catalog-resolved identity (routes)', () =>
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
     // resolves nowhere (neither tvh nor the catalog) → identity falls back to nulls
-    await post({
+    const cam9 = await post({
       channelName: 'Cam 9',
       profileId: profile.id,
       playlistIds: [playlist.id],
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
       force: true,
     });
+
+    // sessions running so the entries render — named for each channel's placement id
+    const withStatus = (
+      await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' })
+    ).json() as RestreamChannelWithStatus[];
+    const placementIdOf = (channelId: string) =>
+      withStatus.find((c) => c.id === channelId)!.placements[0]!.id;
+    setSessions(h.cache, 'zone1', 'n1', [
+      sessionStatus(placementIdOf(atx.id)),
+      sessionStatus(placementIdOf(cam1.id)),
+      sessionStatus(placementIdOf(cam9.id)),
+    ]);
 
     const res = await h.app.inject({
       method: 'GET',
@@ -1094,7 +1131,9 @@ describe('restreamer playlist routes', () => {
 
 describe('GET /playlists/:slug.m3u', () => {
   /** playlist with AT-X (single placement), BBB (redundant), CCC (not running) */
-  async function seedM3uFixture(h: Harness): Promise<void> {
+  async function seedM3uFixture(
+    h: Harness,
+  ): Promise<{ atxPlacementId: string; bbbZone1PlacementId: string }> {
     const profile = await createProfile(h.app);
     const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'Mock TV' });
     const post = async (payload: Record<string, unknown>) => {
@@ -1102,14 +1141,14 @@ describe('GET /playlists/:slug.m3u', () => {
       expect(res.statusCode).toBe(201);
       return res.json() as RestreamChannel;
     };
-    await post({
+    const atx = await post({
       channelName: 'AT-X',
       channelNumber: '9.1',
       profileId: profile.id,
       playlistIds: [playlist.id],
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
-    await post({
+    const bbb = await post({
       channelName: 'BBB',
       channelNumber: '10',
       profileId: profile.id,
@@ -1120,19 +1159,34 @@ describe('GET /playlists/:slug.m3u', () => {
       ],
     });
     // member but its session is not running -> excluded
-    await post({
+    const ccc = await post({
       channelName: 'CCC',
       channelNumber: '3',
       profileId: profile.id,
       playlistIds: [playlist.id],
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
+
+    // sessions are named for each placement's id, not the channel slug
+    const withStatus = (
+      await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' })
+    ).json() as RestreamChannelWithStatus[];
+    const placementsOf = (channelId: string) =>
+      withStatus.find((c) => c.id === channelId)!.placements;
+    const atxPlacementId = placementsOf(atx.id)[0]!.id;
+    const bbbPlacements = placementsOf(bbb.id);
+    const bbbZone1PlacementId = bbbPlacements.find((p) => p.instanceId === 'zone1')!.id;
+    const bbbZone2PlacementId = bbbPlacements.find((p) => p.instanceId === 'zone2')!.id;
+    const cccPlacementId = placementsOf(ccc.id)[0]!.id;
+
     seedNodeStatus(h.cache, 'zone1', 'n1', [
-      sessionStatus('at-x'),
-      sessionStatus('bbb'),
-      sessionStatus('ccc', 'backoff'),
+      sessionStatus(atxPlacementId),
+      sessionStatus(bbbZone1PlacementId),
+      sessionStatus(cccPlacementId, 'backoff'),
     ]);
-    seedNodeStatus(h.cache, 'zone2', 'n1', [sessionStatus('bbb')]);
+    seedNodeStatus(h.cache, 'zone2', 'n1', [sessionStatus(bbbZone2PlacementId)]);
+
+    return { atxPlacementId, bbbZone1PlacementId };
   }
 
   it('renders the prod format: header, EXTINF attrs, URL rule, sort, running filter', async () => {
@@ -1225,12 +1279,13 @@ describe('GET /playlists/:slug.m3u', () => {
 
   it('uses direct node serveUrls without a switcher (single and redundant alike)', async () => {
     const h = await harness({ restreamer: undefined });
-    await seedM3uFixture(h);
+    const { atxPlacementId, bbbZone1PlacementId } = await seedM3uFixture(h);
     const res = await h.app.inject({ method: 'GET', url: '/playlists/tv.m3u' });
     expect(res.statusCode).toBe(200);
-    expect(res.body).toContain('http://hls.zone1-n1/at-x/playlist.m3u8');
+    // URL path segment is the placement id, not the channel slug
+    expect(res.body).toContain(`http://hls.zone1-n1/${atxPlacementId}/playlist.m3u8`);
     // redundant channel: first placement whose node has a serveUrl
-    expect(res.body).toContain('http://hls.zone1-n1/bbb/playlist.m3u8');
+    expect(res.body).toContain(`http://hls.zone1-n1/${bbbZone1PlacementId}/playlist.m3u8`);
     expect(res.body).not.toContain('sw.example');
   });
 
@@ -1466,7 +1521,7 @@ describe('logo fallback across zones and catalogs (M3U + XMLTV)', () => {
   async function createCcc(
     h: Harness,
     placements: Array<{ instanceId: string; nodeId: string }>,
-  ): Promise<void> {
+  ): Promise<RestreamChannel> {
     const profile = await createProfile(h.app);
     const playlist = await createPlaylist(h.app, { slug: 'tv', title: 'Mock TV' });
     const res = await h.app.inject({
@@ -1481,15 +1536,16 @@ describe('logo fallback across zones and catalogs (M3U + XMLTV)', () => {
       },
     });
     expect(res.statusCode).toBe(201);
+    return res.json() as RestreamChannel;
   }
 
   it('rule 1: scans past a resolving placement with no icon to a later placement\'s zone icon', async () => {
     const h = await harness();
-    await createCcc(h, [
+    const ccc = await createCcc(h, [
       { instanceId: 'zone1', nodeId: 'n1' },
       { instanceId: 'zone2', nodeId: 'n1' },
     ]);
-    seedNodeStatus(h.cache, 'zone1', 'n1', [sessionStatus('ccc')]);
+    seedNodeStatus(h.cache, 'zone1', 'n1', [sessionStatus(await placementId(h, ccc.id, 'zone1'))]);
 
     const m3u = await h.app.inject({
       method: 'GET',
@@ -1513,8 +1569,8 @@ describe('logo fallback across zones and catalogs (M3U + XMLTV)', () => {
 
   it('rule 2: a zone with NO placement for the channel still supplies the logo via its tvh topology', async () => {
     const h = await harness();
-    await createCcc(h, [{ instanceId: 'zone1', nodeId: 'n1' }]); // zone2 has no placement at all
-    seedNodeStatus(h.cache, 'zone1', 'n1', [sessionStatus('ccc')]);
+    const ccc = await createCcc(h, [{ instanceId: 'zone1', nodeId: 'n1' }]); // zone2 has no placement at all
+    seedNodeStatus(h.cache, 'zone1', 'n1', [sessionStatus(await placementId(h, ccc.id, 'zone1'))]);
 
     const m3u = await h.app.inject({
       method: 'GET',
@@ -1540,11 +1596,12 @@ describe('logo fallback across zones and catalogs (M3U + XMLTV)', () => {
     // zone1/n1's catalog resolves the identity (chno match) but its own entry
     // has no logo; zone2/n1 is NOT a placement of this channel, yet its
     // catalog carries the same (name, chno) WITH a logo
+    // sessions are attached after creation once the placement id is known (see below)
     seedNodeStatus(
       h.cache,
       'zone1',
       'n1',
-      [sessionStatus('ghost-cam')],
+      [],
       [{ id: 'ghost-z1', name: 'Ghost Cam', url: 'http://cam.example/ghost1.m3u8', chno: '77' }],
     );
     seedNodeStatus(
@@ -1575,6 +1632,8 @@ describe('logo fallback across zones and catalogs (M3U + XMLTV)', () => {
       },
     });
     expect(created.statusCode).toBe(201);
+    const ghostCam = created.json() as RestreamChannel;
+    setSessions(h.cache, 'zone1', 'n1', [sessionStatus(await placementId(h, ghostCam.id, 'zone1'))]);
 
     const m3u = await h.app.inject({
       method: 'GET',
@@ -1727,7 +1786,12 @@ describe('restreamer cold backup routes', () => {
   async function seedFailoverRow(
     h: Harness,
     channelId: string,
-    fields: { fromPlacementId: string | null; toPlacementId: string; suppressFrom?: boolean },
+    fields: {
+      fromPlacementId: string | null;
+      toPlacementId: string;
+      suppressFrom?: boolean;
+      phase?: string;
+    },
   ): Promise<void> {
     await h.ctx.db!
       .insertInto('restream_failover_state')
@@ -1735,7 +1799,7 @@ describe('restreamer cold backup routes', () => {
         channel_id: channelId,
         from_placement_id: fields.fromPlacementId,
         to_placement_id: fields.toPlacementId,
-        phase: 'complete',
+        phase: fields.phase ?? 'complete',
         trigger_reason: 'manual',
         trigger_node_id: null,
         trigger_detail: null,
@@ -1876,6 +1940,91 @@ describe('restreamer cold backup routes', () => {
       url: `/api/restreamer/channels/${channel.id}/cold/deactivate`,
     });
     expect(res.statusCode).toBe(404);
+  });
+
+  it('PUT placement on a mid-procedure placement 409s; force:true passes through', async () => {
+    const h = await harness();
+    const { channel, coldId } = await createChannelWithColdPlacement(h);
+    const list = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const hotId = (list.json() as RestreamChannelWithStatus[])
+      .find((c) => c.id === channel.id)!
+      .placements.find((p) => p.id !== coldId)!.id;
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: hotId,
+      toPlacementId: coldId,
+      phase: 'bringing-up',
+    });
+
+    const denied = await h.app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${coldId}`,
+      payload: { priority: 7 },
+    });
+    expect(denied.statusCode).toBe(409);
+    expect((denied.json() as { message: string }).message).toContain('failover in progress');
+
+    const forced = await h.app.inject({
+      method: 'PUT',
+      url: `/api/restreamer/placements/${coldId}`,
+      payload: { priority: 7, force: true },
+    });
+    expect(forced.statusCode).toBe(200);
+    expect((forced.json() as { priority: number }).priority).toBe(7);
+  });
+
+  it('DELETE placement on a mid-procedure placement 409s; body {force:true} passes through', async () => {
+    const h = await harness();
+    const { channel, coldId } = await createChannelWithColdPlacement(h);
+    const list = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const hotId = (list.json() as RestreamChannelWithStatus[])
+      .find((c) => c.id === channel.id)!
+      .placements.find((p) => p.id !== coldId)!.id;
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: hotId,
+      toPlacementId: coldId,
+      phase: 'awaiting-lag',
+    });
+
+    const denied = await h.app.inject({
+      method: 'DELETE',
+      url: `/api/restreamer/placements/${coldId}`,
+    });
+    expect(denied.statusCode).toBe(409);
+    expect((denied.json() as { message: string }).message).toContain('failover in progress');
+
+    const forced = await h.app.inject({
+      method: 'DELETE',
+      url: `/api/restreamer/placements/${coldId}`,
+      payload: { force: true },
+    });
+    expect(forced.statusCode).toBe(200);
+    expect(forced.json()).toEqual({ ok: true });
+  });
+
+  it('apply delete-sweep leaves a mid-procedure placement in place (route level)', async () => {
+    const h = await harness();
+    const { channel, coldId } = await createChannelWithColdPlacement(h);
+    const list = await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' });
+    const hot = (list.json() as RestreamChannelWithStatus[])
+      .find((c) => c.id === channel.id)!
+      .placements.find((p) => p.id !== coldId)!;
+    // first activation: only the cold placement is pinned by the procedure
+    await seedFailoverRow(h, channel.id, {
+      fromPlacementId: null,
+      toPlacementId: coldId,
+      phase: 'switch-ordered',
+    });
+
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/restreamer/channels/${channel.id}/apply`,
+      payload: {
+        placements: [{ id: hot.id, instanceId: hot.instanceId, nodeId: hot.nodeId }],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const ids = (res.json() as RestreamChannelWithStatus).placements.map((p) => p.id).sort();
+    expect(ids).toEqual([hot.id, coldId].sort());
   });
 });
 
@@ -2098,7 +2247,9 @@ describe('POST /api/restreamer/channels/:id/apply', () => {
   });
 
   it('persists placement profileId on new and existing placements; invalid type -> 400', async () => {
-    const h = await harness();
+    // no switcher -- this tests the DIRECT-write path; Stage B.3's
+    // switcher-fronted cutover routing is covered in restreamerService.test.ts
+    const h = await harness({ restreamer: { switchers: [] } });
     const channelProfile = await createProfile(h.app, 'channel-profile');
     const overrideProfile = await createProfile(h.app, 'override-profile');
     const created = await h.app.inject({

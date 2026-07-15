@@ -180,7 +180,7 @@ function entryUrl(config: AppConfig, channel: RestreamChannelWithStatus): string
   if (sw) return `${sw.publicUrl}/hls/${channel.slug}/playlist.m3u8`;
   for (const p of enabled) {
     const serveUrl = nodeServeUrl(config, p.instanceId, p.nodeId);
-    if (serveUrl) return `${serveUrl}/${channel.slug}/playlist.m3u8`;
+    if (serveUrl) return `${serveUrl}/${p.id}/playlist.m3u8`;
   }
   return null;
 }
@@ -904,7 +904,9 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
   });
 
   app.delete<{ Params: { id: string } }>('/api/restreamer/placements/:id', async (req) => {
-    await svc().deletePlacement(req.params.id);
+    // body is optional; { force: true } bypasses the mid-procedure guard
+    const force = req.body == null ? false : !!asObject(req.body, 'request body').force;
+    await svc().deletePlacement(req.params.id, force);
     return { ok: true };
   });
 

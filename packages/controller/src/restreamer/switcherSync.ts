@@ -186,7 +186,7 @@ export class SwitcherSync {
   /**
    * Global switcher desired doc (one doc, pushed to every configured
    * switcher). Channels = enabled channels with ≥1 enabled placement;
-   * upstreams = placements in priority order at `<node serveUrl>/<slug>`.
+   * upstreams = placements in priority order at `<node serveUrl>/<placement id>`.
    * Placements on unknown or serveUrl-less nodes are skipped with a reason; a
    * channel needs ≥1 usable upstream or it is skipped with a reason too.
    * Unlike node docs this never defers — no topology resolution is involved.
@@ -225,7 +225,7 @@ export class SwitcherSync {
         }
         upstreams.push({
           id: p.placementId,
-          url: `${nodeCfg.serveUrl}/${g.slug}`,
+          url: `${nodeCfg.serveUrl}/${p.placementId}`,
           priority: p.priority,
         });
       }

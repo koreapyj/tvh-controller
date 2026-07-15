@@ -50,9 +50,15 @@ export interface StagedPlacementInput {
   enabled: boolean;
 }
 
-/** seed the staging array from a channel's current placements, in priority order */
+/**
+ * seed the staging array from a channel's current placements, in priority
+ * order — cutover-owned transient clones (Stage B.3) are never user-created
+ * and are excluded from manual editing entirely; they come and go on their
+ * own lifecycle (createCutoverClone / markCutoverComplete / drain-expiry)
+ */
 export function seedStagedPlacements(placements: RestreamPlacement[]): StagedPlacement[] {
-  return [...placements]
+  return placements
+    .filter((p) => !p.transient)
     .sort((a, b) => a.priority - b.priority || a.id.localeCompare(b.id))
     .map((p) => ({
       id: p.id,
@@ -106,8 +112,18 @@ export function buildPlacementsPayload(staged: StagedPlacement[]): BuildPlacemen
   return { ok: true, placements };
 }
 
-/** ids present in the original placement set but no longer in the staged rows (server deletes these) */
+/**
+ * ids present in the original placement set but no longer in the staged rows
+ * (server deletes these). Transient clones are excluded up front — they were
+ * never seeded into the staging rows in the first place (seedStagedPlacements
+ * filters them too), so without this filter every one would look "removed"
+ * and the apply call would ask the server to delete a cutover-owned clone
+ * out from under an in-flight procedure.
+ */
 export function removedPlacementIds(original: RestreamPlacement[], staged: StagedPlacement[]): string[] {
   const stagedIds = new Set(staged.map((p) => p.id).filter((id): id is string => id !== undefined));
-  return original.filter((p) => !stagedIds.has(p.id)).map((p) => p.id);
+  return original
+    .filter((p) => !p.transient)
+    .filter((p) => !stagedIds.has(p.id))
+    .map((p) => p.id);
 }

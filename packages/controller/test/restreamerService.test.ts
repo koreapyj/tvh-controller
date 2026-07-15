@@ -359,7 +359,9 @@ describe('profiles', () => {
   });
 
   it('updateProfile with a payload change re-pushes every node hosting the profile', async () => {
-    const h = await setup();
+    // no switcher -- this tests the DIRECT-write path; the switcher-fronted
+    // cutover path (Stage B.3) is covered separately in its own describe block
+    const h = await setup({ restreamer: { switchers: [] } });
     const profile = await h.service.createProfile('p', profilePayload());
     await h.service.createChannel({
       channelName: 'AT-X',
@@ -393,7 +395,8 @@ describe('profiles', () => {
   });
 
   it('deleteProfile is blocked with 409 while only a placement overrides it (channel uses a different profile)', async () => {
-    const h = await setup();
+    // no switcher -- this tests the DIRECT-write path (see comment above)
+    const h = await setup({ restreamer: { switchers: [] } });
     const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
     const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
     await h.service.createChannel({
@@ -412,7 +415,8 @@ describe('profiles', () => {
   });
 
   it('updateProfile re-pushes a node whose only link to the profile is a placement override', async () => {
-    const h = await setup();
+    // no switcher -- this tests the DIRECT-write path (see comment above)
+    const h = await setup({ restreamer: { switchers: [] } });
     const channelProfile = await h.service.createProfile(
       'channel-profile',
       profilePayload({ mode: 'ivtc', bitrate: '3M' }),
@@ -649,7 +653,6 @@ describe('desired doc determinism and push', () => {
   it('same inputs produce the same revision and a stable session order', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
-    // created in reverse-alphabetical order — doc must sort by name
     await h.service.createChannel({
       channelName: 'BS11',
       channelNumber: '11',
@@ -662,14 +665,21 @@ describe('desired doc determinism and push', () => {
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
+    // session names are placement ids (uuids) now, not slugs — the doc still
+    // sorts by name, so the expected order is the ids sorted lexically
+    const channels = await h.service.listChannels();
+    const bs11Id = channels.find((c) => c.slug === 'bs11')!.placements[0]!.id;
+    const atxId = channels.find((c) => c.slug === 'at-x')!.placements[0]!.id;
+    const expectedOrder = [bs11Id, atxId].sort((x, y) => x.localeCompare(y));
+
     const a = await h.service.computeNodeDoc('zone1', 'n1');
     const b = await h.service.computeNodeDoc('zone1', 'n1');
     expect(a.doc!.revision).toBe(b.doc!.revision);
-    expect(a.doc!.sessions.map((s) => s.name)).toEqual(['at-x', 'bs11']);
+    expect(a.doc!.sessions.map((s) => s.name)).toEqual(expectedOrder);
     expect(a.doc!.revision).toBe(sessionsHash(a.doc!.sessions));
     expect(a.doc!.apiVersion).toBe(1);
-    const session = a.doc!.sessions[0]!;
-    expect(session).toMatchObject({ name: 'at-x', enabled: true });
+    const session = a.doc!.sessions.find((s) => s.name === atxId)!;
+    expect(session).toMatchObject({ name: atxId, enabled: true });
     await h.destroy();
   });
 
@@ -742,7 +752,9 @@ describe('desired doc determinism and push', () => {
   });
 
   it('a per-placement profile override changes only that placement\'s pipeline; clearing it reverts the doc revision', async () => {
-    const h = await setup();
+    // no switcher -- this tests the DIRECT-write path; Stage B.3's cutover
+    // routing (switcher-fronted) has its own describe block with equivalent coverage
+    const h = await setup({ restreamer: { switchers: [] } });
     const profileA = await h.service.createProfile('profile-a', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
     const profileB = await h.service.createProfile('profile-b', profilePayload({ mode: 'ivtc', bitrate: '6M' }));
     await h.service.createChannel({
@@ -787,6 +799,31 @@ describe('desired doc determinism and push', () => {
     expect(revertedDoc.doc!.revision).toBe(baselineRevision);
     await h.destroy();
   });
+
+  it('two placements of one channel on DIFFERENT nodes each resolve their own session name (placement id)', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone1', nodeId: 'n2' },
+      ],
+    });
+    const placements = (await h.service.listChannels())[0]!.placements;
+    const n1Placement = placements.find((pl) => pl.nodeId === 'n1')!;
+    const n2Placement = placements.find((pl) => pl.nodeId === 'n2')!;
+    expect(n1Placement.id).not.toBe(n2Placement.id);
+
+    const n1Doc = await h.service.computeNodeDoc('zone1', 'n1');
+    const n2Doc = await h.service.computeNodeDoc('zone1', 'n2');
+    // each node's session is named after ITS OWN placement, never the other's
+    expect(n1Doc.doc!.sessions.map((s) => s.name)).toEqual([n1Placement.id]);
+    expect(n2Doc.doc!.sessions.map((s) => s.name)).toEqual([n2Placement.id]);
+    await h.destroy();
+  });
 });
 
 // ---------- blocked / defer semantics ----------
@@ -803,7 +840,7 @@ describe('blocked and defer semantics', () => {
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
       force: true, // unresolvable on purpose — pre-provisioned blocked placement
     });
-    await h.service.createChannel({
+    const atx = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
       profileId: p.id,
@@ -814,7 +851,9 @@ describe('blocked and defer semantics', () => {
     expect(result.action).toBe('pushed');
     expect(result.blocked).toHaveLength(1);
     expect(result.blocked[0]!.slug).toBe('ghost');
-    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['at-x']);
+    const atxPlacementId = (await h.service.listChannels()).find((c) => c.id === atx.id)!
+      .placements[0]!.id;
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual([atxPlacementId]);
     await h.destroy();
   });
 
@@ -830,6 +869,7 @@ describe('blocked and defer semantics', () => {
     });
     const node = h.nodes.get('zone1/n1')!;
     expect(node.desired!.sessions).toHaveLength(1);
+    const placementId = node.desired!.sessions[0]!.name;
     const putsBefore = node.puts().length;
 
     // the channel vanishes from the topology (rename to something unresolvable;
@@ -842,7 +882,7 @@ describe('blocked and defer semantics', () => {
     );
     // the running session was NOT torn down
     expect(node.puts().length).toBe(putsBefore);
-    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['at-x']);
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual([placementId]);
     await h.destroy();
   });
 
@@ -940,7 +980,8 @@ describe('blocked and defer semantics', () => {
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
     const node = h.nodes.get('zone1/n1')!;
-    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['cam-1']);
+    const placementId = node.desired!.sessions[0]!.name;
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual([placementId]);
     const putsBefore = node.puts().length;
 
     h.cache.get('zone1').topology = null; // this zone's tvh stops answering...
@@ -952,7 +993,7 @@ describe('blocked and defer semantics', () => {
       'topology not loaded for instance zone1 and channel "Cam 1" (#1) not in node zone1/n1\'s sources catalog',
     );
     expect(node.puts().length).toBe(putsBefore); // running session left untouched
-    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['cam-1']);
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual([placementId]);
     await h.destroy();
   });
 
@@ -1132,7 +1173,8 @@ describe('channel and placement CRUD', () => {
     const placement = (await h.service.listChannels())[0]!.placements[0]!;
     await h.service.updatePlacement(placement.id, { nodeId: 'n2' });
     expect(n1.desired!.sessions).toHaveLength(0); // torn down on the old node
-    expect(n2.desired!.sessions.map((s) => s.name)).toEqual(['at-x']); // started on the new one
+    // moving a placement keeps its id, so the session name is unchanged
+    expect(n2.desired!.sessions.map((s) => s.name)).toEqual([placement.id]); // started on the new one
     expect((await h.service.getChannel(chan.id))).not.toBeNull();
     await h.destroy();
   });
@@ -1177,7 +1219,8 @@ describe('channel and placement CRUD', () => {
   });
 
   it('updatePlacement profileId round-trips; null clears the override (inherits the channel profile)', async () => {
-    const h = await setup();
+    // no switcher -- this tests the DIRECT-write path (see comment above)
+    const h = await setup({ restreamer: { switchers: [] } });
     const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
     const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
     const chan = await h.service.createChannel({ channelName: 'AT-X', profileId: channelProfile.id });
@@ -1193,7 +1236,8 @@ describe('channel and placement CRUD', () => {
   });
 
   it('applyChannelChanges persists profileId on new and existing placements', async () => {
-    const h = await setup();
+    // no switcher -- this tests the DIRECT-write path (see comment above)
+    const h = await setup({ restreamer: { switchers: [] } });
     const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
     const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
     const chan = await h.service.createChannel({ channelName: 'AT-X', profileId: channelProfile.id });
@@ -1455,7 +1499,9 @@ describe('listChannels status', () => {
     const listed = await h.service.listChannels();
     const atx = listed.find((c) => c.slug === 'at-x')!;
     const bs11 = listed.find((c) => c.slug === 'bs11')!;
-    expect(atx.playbackUrl).toBe('http://hls.zone1-n1/at-x/playlist.m3u8');
+    // no switcher: the fallback URL is keyed by the placement id, not the slug
+    const atxPlacementId = atx.placements[0]!.id;
+    expect(atx.playbackUrl).toBe(`http://hls.zone1-n1/${atxPlacementId}/playlist.m3u8`);
     expect(bs11.playbackUrl).toBeNull();
     await h.destroy();
   });
@@ -1506,8 +1552,8 @@ describe('listChannels status', () => {
       ],
       force: true, // zone2 has no AT-X 9.1 — blockedReason is under test
     });
-    seedNodeStatusEntry(h.cache, 'zone1', 'n1', [sessionStatus('at-x'), sessionStatus('other')]);
     const placementId = (await h.service.listChannels())[0]!.placements[0]!.id;
+    seedNodeStatusEntry(h.cache, 'zone1', 'n1', [sessionStatus(placementId), sessionStatus('other')]);
     const swStatus: SwitcherNodeStatus = {
       switcherId: 'sw1',
       url: 'http://sw1:5581',
@@ -1531,7 +1577,7 @@ describe('listChannels status', () => {
     const [listed] = await h.service.listChannels();
     const zone1Placement = listed!.placements.find((x) => x.instanceId === 'zone1')!;
     const zone2Placement = listed!.placements.find((x) => x.instanceId === 'zone2')!;
-    expect(zone1Placement.session?.name).toBe('at-x');
+    expect(zone1Placement.session?.name).toBe(placementId);
     expect(zone1Placement.blockedReason).toBeNull();
     expect(zone2Placement.session).toBeNull();
     // zone2 has no AT-X 9.1 — surfaced per placement, not per channel
@@ -1542,6 +1588,36 @@ describe('listChannels status', () => {
     expect(listed!.lastSwitch?.reason).toBe('push');
     expect(listed!.profileName).toBe('p');
     expect(chan.id).toBe(listed!.id);
+    await h.destroy();
+  });
+
+  it('resolves each placement its OWN live session, never the channel\'s first placement', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone1', nodeId: 'n2' },
+      ],
+    });
+    const placements = (await h.service.listChannels())[0]!.placements;
+    const n1Placement = placements.find((pl) => pl.nodeId === 'n1')!;
+    const n2Placement = placements.find((pl) => pl.nodeId === 'n2')!;
+
+    // seed live sessions on BOTH nodes keyed by each placement's OWN id — a
+    // bug matching by channel slug (or always taking the channel's first
+    // placement) would attribute one node's session to the other's placement
+    seedNodeStatusEntry(h.cache, 'zone1', 'n1', [sessionStatus(n1Placement.id)]);
+    seedNodeStatusEntry(h.cache, 'zone1', 'n2', [sessionStatus(n2Placement.id)]);
+
+    const [listed] = await h.service.listChannels();
+    const gotN1 = listed!.placements.find((pl) => pl.nodeId === 'n1')!;
+    const gotN2 = listed!.placements.find((pl) => pl.nodeId === 'n2')!;
+    expect(gotN1.session?.name).toBe(n1Placement.id);
+    expect(gotN2.session?.name).toBe(n2Placement.id);
     await h.destroy();
   });
 });
@@ -1619,7 +1695,8 @@ describe('failover state placements', () => {
       await h.db.deleteFrom('restream_failover_state').execute();
       await insertFailoverRow(h, { channelId: chan.id, fromPlacementId: hot.id, toPlacementId: cold.id, phase });
       const { doc } = await h.service.computeNodeDoc('zone1', 'n2');
-      expect(doc!.sessions.map((s) => s.name), `phase=${phase}`).toEqual(['at-x']);
+      // n2 hosts the cold placement — its session is named after cold.id
+      expect(doc!.sessions.map((s) => s.name), `phase=${phase}`).toEqual([cold.id]);
     }
     await h.destroy();
   });
@@ -1639,7 +1716,7 @@ describe('failover state placements', () => {
       const { doc: hotDoc } = await h.service.computeNodeDoc('zone1', 'n1');
       expect(hotDoc!.sessions, `phase=${phase}`).toHaveLength(0);
       const { doc: coldDoc } = await h.service.computeNodeDoc('zone1', 'n2');
-      expect(coldDoc!.sessions.map((s) => s.name), `phase=${phase}`).toEqual(['at-x']);
+      expect(coldDoc!.sessions.map((s) => s.name), `phase=${phase}`).toEqual([cold.id]);
     }
     await h.destroy();
   });
@@ -1655,7 +1732,7 @@ describe('failover state placements', () => {
       suppressFrom: true,
     });
     const { doc: hotDoc } = await h.service.computeNodeDoc('zone1', 'n1');
-    expect(hotDoc!.sessions.map((s) => s.name)).toEqual(['at-x']);
+    expect(hotDoc!.sessions.map((s) => s.name)).toEqual([hot.id]);
     await h.destroy();
   });
 
@@ -1709,6 +1786,965 @@ describe('failover state placements', () => {
     expect(flipped.mode).toBe('hot');
     await h.destroy();
   });
+
+  describe('mid-procedure mutation guard', () => {
+    const MID = { statusCode: 409, message: expect.stringContaining('failover in progress') };
+
+    it('deletePlacement 409s on a placement referenced by a mid-procedure row; force deletes', async () => {
+      const h = await setup();
+      const { chan, hot, cold } = await seedColdChannel(h);
+      await insertFailoverRow(h, {
+        channelId: chan.id,
+        fromPlacementId: hot.id,
+        toPlacementId: cold.id,
+        phase: 'awaiting-lag',
+      });
+      await expect(h.service.deletePlacement(cold.id)).rejects.toMatchObject(MID);
+      // the from side is protected too
+      await expect(h.service.deletePlacement(hot.id)).rejects.toMatchObject(MID);
+
+      await h.service.deletePlacement(cold.id, true);
+      const gone = await h.db
+        .selectFrom('restream_placements')
+        .select('id')
+        .where('id', '=', cold.id)
+        .executeTakeFirst();
+      expect(gone).toBeUndefined();
+      await h.destroy();
+    });
+
+    it('updatePlacement 409s on a placement referenced by a mid-procedure row; force updates', async () => {
+      const h = await setup();
+      const { chan, hot, cold } = await seedColdChannel(h);
+      await insertFailoverRow(h, {
+        channelId: chan.id,
+        fromPlacementId: hot.id,
+        toPlacementId: cold.id,
+        phase: 'switch-ordered',
+      });
+      await expect(h.service.updatePlacement(hot.id, { priority: 5 })).rejects.toMatchObject(MID);
+
+      const forced = await h.service.updatePlacement(hot.id, { priority: 5, force: true });
+      expect(forced.priority).toBe(5);
+      await h.destroy();
+    });
+
+    it('complete and draining rows do NOT block update or delete', async () => {
+      const h = await setup();
+      const { chan, hot, cold } = await seedColdChannel(h);
+      for (const phase of ['complete', 'draining']) {
+        await insertFailoverRow(h, {
+          channelId: chan.id,
+          fromPlacementId: hot.id,
+          toPlacementId: cold.id,
+          phase,
+        });
+        const updated = await h.service.updatePlacement(cold.id, { priority: 9 });
+        expect(updated.priority).toBe(9);
+      }
+      await h.service.deletePlacement(cold.id); // draining row: no 409
+      await h.destroy();
+    });
+
+    it('applyChannelChanges 409s when a kept placement is mid-procedure; force applies', async () => {
+      const h = await setup();
+      const { chan, hot, cold } = await seedColdChannel(h);
+      await insertFailoverRow(h, {
+        channelId: chan.id,
+        fromPlacementId: hot.id,
+        toPlacementId: cold.id,
+        phase: 'bringing-up',
+      });
+      const desired = [hot, cold].map((p) => ({
+        id: p.id,
+        instanceId: p.instanceId,
+        nodeId: p.nodeId,
+        mode: p.mode,
+        profileId: null,
+        programNumber: null,
+        enabled: true,
+      }));
+      await expect(
+        h.service.applyChannelChanges(chan.id, { placements: desired }),
+      ).rejects.toMatchObject(MID);
+
+      const applied = await h.service.applyChannelChanges(chan.id, {
+        placements: desired,
+        force: true,
+      });
+      expect(applied.placements).toHaveLength(2);
+      await h.destroy();
+    });
+
+    it('applyChannelChanges delete-sweep silently skips a mid-procedure placement, even with force', async () => {
+      const h = await setup();
+      const { chan, hot, cold } = await seedColdChannel(h);
+      // row references ONLY cold (first activation) — the kept hot is unguarded
+      await insertFailoverRow(h, {
+        channelId: chan.id,
+        fromPlacementId: null,
+        toPlacementId: cold.id,
+        phase: 'awaiting-switch-confirm',
+      });
+      const keepHot = [
+        {
+          id: hot.id,
+          instanceId: hot.instanceId,
+          nodeId: hot.nodeId,
+          mode: hot.mode,
+          profileId: null,
+          programNumber: null,
+          enabled: true,
+        },
+      ];
+      for (const force of [false, true]) {
+        const applied = await h.service.applyChannelChanges(chan.id, {
+          placements: keepHot,
+          ...(force ? { force: true } : {}),
+        });
+        // cold was omitted from the desired set but survives the sweep
+        expect(applied.placements.map((p) => p.id).sort()).toEqual([hot.id, cold.id].sort());
+      }
+      await h.destroy();
+    });
+  });
+});
+
+// ---------- cutover primitives (Stage B.2) ----------
+//
+// createCutoverClone/freezeOutgoingProfile/markCutoverCompleteInner/
+// deleteCutoverPlacementInner are internal-only — Stage B.2 ships no trigger
+// wiring (Stage B.3), so there is no public entry point yet. They're
+// exercised directly here via a narrow structural cast, mirroring how
+// FailoverSync's cutover branches already drive them through the
+// FailoverSyncHooks wired in the constructor (markCutoverComplete/
+// deleteCutoverPlacement — see failoverSync.test.ts's "cutover" describes for
+// full state-machine coverage with mocked hooks). The drain-expiry test below
+// additionally proves the REAL hook wiring end to end (no mocks).
+
+interface CutoverPrimitives {
+  createCutoverClone(
+    from: {
+      channel_id: string;
+      instance_id: string;
+      node_id: string;
+      priority: number;
+      program_number: number | null;
+    },
+    profileId: string | null,
+  ): Promise<{
+    id: string;
+    channelId: string;
+    instanceId: string;
+    nodeId: string;
+    profileId: string | null;
+    mode: string;
+    transient: boolean;
+  }>;
+  freezeOutgoingProfile(
+    from: { id: string },
+    freeze: { kind: 'pin'; profileId: string } | { kind: 'snapshot'; payload: AribHlsParams },
+  ): Promise<void>;
+  markCutoverCompleteInner(placementId: string): Promise<void>;
+  deleteCutoverPlacementInner(placementId: string): Promise<void>;
+}
+
+function cutoverPrimitives(service: RestreamerService): CutoverPrimitives {
+  return service as unknown as CutoverPrimitives;
+}
+
+describe('cutover primitives (Stage B.2)', () => {
+  async function insertCutoverDrainingRow(
+    h: Harness,
+    fields: { channelId: string; fromPlacementId: string | null; toPlacementId: string; drainUntil: string },
+  ): Promise<void> {
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: fields.channelId,
+        from_placement_id: fields.fromPlacementId,
+        to_placement_id: fields.toPlacementId,
+        phase: 'draining',
+        trigger_reason: 'cutover',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 1,
+        drain_until: fields.drainUntil,
+        started_at: TS,
+        updated_at: TS,
+      })
+      .execute();
+  }
+
+  it('createCutoverClone inserts a same-node transient clone that bypasses the one-placement-per-node uniqueness gate', async () => {
+    const h = await setup();
+    const p1 = await h.service.createProfile('p1', profilePayload());
+    const p2 = await h.service.createProfile('p2', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p1.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+    const fromRow = await h.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('id', '=', fromId)
+      .executeTakeFirstOrThrow();
+
+    const clone = await cutoverPrimitives(h.service).createCutoverClone(fromRow, p2.id);
+    expect(clone).toMatchObject({
+      channelId: chan.id,
+      instanceId: 'zone1',
+      nodeId: 'n1',
+      profileId: p2.id,
+      mode: 'hot',
+      transient: true,
+    });
+    expect(clone.id).not.toBe(fromId);
+
+    // both rows coexist on the same channel/instance/node -- no 409, no collision
+    const placements = (await h.service.listChannels())[0]!.placements;
+    expect(placements.map((pl) => pl.id).sort()).toEqual([fromId, clone.id].sort());
+    expect(placements.find((pl) => pl.id === clone.id)!.transient).toBe(true);
+    expect(placements.find((pl) => pl.id === fromId)!.transient).toBe(false);
+    await h.destroy();
+  });
+
+  it('freezeOutgoingProfile "pin" keeps `from` rendering the pinned profile after the channel is reassigned to a different one', async () => {
+    const h = await setup();
+    const p1 = await h.service.createProfile('p1', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
+    const p2 = await h.service.createProfile('p2', profilePayload({ mode: 'ivtc', bitrate: '9M' }));
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p1.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await cutoverPrimitives(h.service).freezeOutgoingProfile({ id: fromId }, { kind: 'pin', profileId: p1.id });
+    // reassign the channel to p2 -- without the pin this would instantly
+    // change what `from` renders (placement-override-wins in computeNodeDoc)
+    await h.db
+      .updateTable('restream_channels')
+      .set({ profile_id: p2.id, updated_at: TS })
+      .where('id', '=', chan.id)
+      .execute();
+
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    const argv = (doc!.sessions[0]!.pipeline as RawArgvParams).ffmpegArgv;
+    expect(argv[argv.indexOf('-b:v:0') + 1]).toBe('3M');
+    await h.destroy();
+  });
+
+  it('freezeOutgoingProfile "snapshot" keeps `from` rendering the pre-edit payload after the live profile row is edited in place', async () => {
+    const h = await setup();
+    const p1 = await h.service.createProfile('p1', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p1.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await cutoverPrimitives(h.service).freezeOutgoingProfile(
+      { id: fromId },
+      { kind: 'snapshot', payload: p1.payload },
+    );
+    // live-edit the SAME profile row in place, as updateProfile would
+    await h.db
+      .updateTable('restream_profiles')
+      .set({ payload: JSON.stringify(profilePayload({ mode: 'ivtc', bitrate: '9M' })), updated_at: TS })
+      .where('id', '=', p1.id)
+      .execute();
+
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n1');
+    const argv = (doc!.sessions[0]!.pipeline as RawArgvParams).ffmpegArgv;
+    expect(argv[argv.indexOf('-b:v:0') + 1]).toBe('3M');
+
+    const placementRow = await h.db
+      .selectFrom('restream_placements')
+      .select('profile_id')
+      .where('id', '=', fromId)
+      .executeTakeFirstOrThrow();
+    expect(placementRow.profile_id).not.toBe(p1.id);
+    const snapshotRow = await h.db
+      .selectFrom('restream_profiles')
+      .select('transient')
+      .where('id', '=', placementRow.profile_id!)
+      .executeTakeFirstOrThrow();
+    expect(snapshotRow.transient).toBe(1);
+    await h.destroy();
+  });
+
+  it('listProfiles excludes a freeze-snapshot transient profile', async () => {
+    const h = await setup();
+    const p1 = await h.service.createProfile('p1', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p1.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+    await cutoverPrimitives(h.service).freezeOutgoingProfile(
+      { id: fromId },
+      { kind: 'snapshot', payload: p1.payload },
+    );
+
+    const listed = await h.service.listProfiles();
+    expect(listed.map((p) => p.id)).toEqual([p1.id]);
+    await h.destroy();
+  });
+
+  it('markCutoverCompleteInner promotes a transient clone to permanent', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+    const fromRow = await h.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('id', '=', fromId)
+      .executeTakeFirstOrThrow();
+    const clone = await cutoverPrimitives(h.service).createCutoverClone(fromRow, p.id);
+    expect((await h.service.listChannels()).find((c) => c.id === chan.id)!.placements.find((pl) => pl.id === clone.id)!.transient).toBe(true);
+
+    // `from` and the clone share the exact (channel, instance, node) triple,
+    // and the unique index is scoped over `transient` -- promoting the clone
+    // while `from`'s transient=0 row still holds that triple would collide.
+    // `from` must be removed first, mirroring the real call order enforced
+    // by rowHygiene()'s draining-expiry branch (deleteCutoverPlacement then
+    // markCutoverComplete).
+    await cutoverPrimitives(h.service).deleteCutoverPlacementInner(fromId);
+    await cutoverPrimitives(h.service).markCutoverCompleteInner(clone.id);
+
+    const placements = (await h.service.listChannels())[0]!.placements;
+    expect(placements.find((pl) => pl.id === clone.id)!.transient).toBe(false);
+    await h.destroy();
+  });
+
+  it('deleteCutoverPlacementInner removes the placement and its orphaned transient snapshot profile', async () => {
+    const h = await setup();
+    const p1 = await h.service.createProfile('p1', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p1.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+    await cutoverPrimitives(h.service).freezeOutgoingProfile(
+      { id: fromId },
+      { kind: 'snapshot', payload: p1.payload },
+    );
+    const snapshotId = (
+      await h.db.selectFrom('restream_placements').select('profile_id').where('id', '=', fromId).executeTakeFirstOrThrow()
+    ).profile_id!;
+
+    await cutoverPrimitives(h.service).deleteCutoverPlacementInner(fromId);
+
+    expect(
+      await h.db.selectFrom('restream_placements').select('id').where('id', '=', fromId).executeTakeFirst(),
+    ).toBeUndefined();
+    expect(
+      await h.db.selectFrom('restream_profiles').select('id').where('id', '=', snapshotId).executeTakeFirst(),
+    ).toBeUndefined();
+    await h.destroy();
+  });
+
+  it('deleteCutoverPlacementInner leaves a non-transient (shared) profile untouched', async () => {
+    const h = await setup();
+    const p1 = await h.service.createProfile('p1', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p1.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+    // pin -- from.profile_id now overrides to a real, non-transient profile
+    await cutoverPrimitives(h.service).freezeOutgoingProfile({ id: fromId }, { kind: 'pin', profileId: p1.id });
+
+    await cutoverPrimitives(h.service).deleteCutoverPlacementInner(fromId);
+
+    expect(
+      await h.db.selectFrom('restream_placements').select('id').where('id', '=', fromId).executeTakeFirst(),
+    ).toBeUndefined();
+    // p1 is shared (still the channel's own profile) and non-transient -- must survive
+    expect(
+      await h.db.selectFrom('restream_profiles').select('id').where('id', '=', p1.id).executeTakeFirst(),
+    ).toMatchObject({ id: p1.id });
+    await h.destroy();
+  });
+
+  it('deleteCutoverPlacementInner is idempotent on an already-deleted placement', async () => {
+    const h = await setup();
+    await expect(cutoverPrimitives(h.service).deleteCutoverPlacementInner(randomUUID())).resolves.toBeUndefined();
+  });
+
+  it('a real drain-expiry sweep (via the public failoverTick) calls the actual wired hooks: deleteCutoverPlacement removes the retired `from` placement, and markCutoverComplete promotes the clone to permanent', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone1', nodeId: 'n2' },
+      ],
+    });
+    const placements = (await h.service.listChannels())[0]!.placements;
+    const fromPlacement = placements[0]!;
+    const toPlacement = placements[1]!;
+    // mirrors a real cutover clone: transient=1 until promoted at drain-expiry
+    await h.db.updateTable('restream_placements').set({ transient: 1 }).where('id', '=', toPlacement.id).execute();
+    await insertCutoverDrainingRow(h, {
+      channelId: chan.id,
+      fromPlacementId: fromPlacement.id,
+      toPlacementId: toPlacement.id,
+      drainUntil: '2020-01-01 00:00:00', // already expired
+    });
+
+    await h.service.failoverTick();
+
+    expect(
+      await h.db
+        .selectFrom('restream_failover_state')
+        .select('channel_id')
+        .where('channel_id', '=', chan.id)
+        .executeTakeFirst(),
+    ).toBeUndefined();
+    // the real hook wiring (not a mock) ran deleteCutoverPlacementInner on the retired `from`
+    expect(
+      await h.db.selectFrom('restream_placements').select('id').where('id', '=', fromPlacement.id).executeTakeFirst(),
+    ).toBeUndefined();
+    // ... and, only after that, ran markCutoverCompleteInner on `to`, promoting it to permanent
+    expect(
+      await h.db.selectFrom('restream_placements').select(['id', 'transient']).where('id', '=', toPlacement.id).executeTakeFirst(),
+    ).toMatchObject({ id: toPlacement.id, transient: 0 });
+    await h.destroy();
+  });
+});
+
+// ---------- startup orphan sweep (leaked cutover clones) ----------
+//
+// Regression coverage for the live E2E bug's collateral damage: a crash
+// between createCutoverClone and the requestFailover that would have created
+// a restream_failover_state row -- or the activePlacementOf tie-break bug
+// itself (see failoverSync.test.ts) mistaking a fresh clone for
+// already-active and short-circuiting the request -- leaves a transient=1
+// placement with NO referencing failover row. Nothing will ever drive or
+// clean it up, and being enabled+hot it keeps encoding forever.
+// reconcileFailoverOnStartup's sweep must reclaim exactly those orphans (plus
+// any transient profile snapshot referenced by nothing), and leave every
+// legitimately-referenced transient row alone.
+
+describe('reconcileFailoverOnStartup: orphaned cutover artifact sweep', () => {
+  async function insertFailoverRow(
+    h: Harness,
+    fields: { channelId: string; fromPlacementId: string | null; toPlacementId: string; phase?: string },
+  ): Promise<void> {
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: fields.channelId,
+        from_placement_id: fields.fromPlacementId,
+        to_placement_id: fields.toPlacementId,
+        phase: fields.phase ?? 'awaiting-lag',
+        trigger_reason: 'cutover',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: TS,
+        updated_at: TS,
+      })
+      .execute();
+  }
+
+  async function insertTransientProfileRow(h: Harness, name: string): Promise<string> {
+    const id = randomUUID();
+    await h.db
+      .insertInto('restream_profiles')
+      .values({
+        id,
+        name,
+        payload: JSON.stringify(profilePayload()),
+        transient: 1,
+        updated_at: TS,
+      })
+      .execute();
+    return id;
+  }
+
+  it('deletes an orphaned transient clone and an orphaned transient profile snapshot, leaves a referenced clone and a still-used snapshot untouched', async () => {
+    const h = await setup();
+    const pReal = await h.service.createProfile('real', profilePayload());
+
+    // -- channel A: leaked clone, no failover row referencing it ---------
+    const chanA = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pReal.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromA = (await h.service.listChannels()).find((c) => c.id === chanA.id)!.placements[0]!.id;
+    const fromARow = await h.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('id', '=', fromA)
+      .executeTakeFirstOrThrow();
+    const orphanClone = await cutoverPrimitives(h.service).createCutoverClone(fromARow, pReal.id);
+    // (deliberately no insertFailoverRow call -- this is the leak)
+
+    // -- an unrelated orphaned transient profile snapshot, pinned by nothing
+    const orphanProfileId = await insertTransientProfileRow(h, 'orphan-snapshot');
+
+    // -- channel B: legitimate in-progress cutover -- clone IS referenced -
+    const chanB = await h.service.createChannel({
+      channelName: 'BS11',
+      channelNumber: '11',
+      profileId: pReal.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n2' }],
+    });
+    const fromB = (await h.service.listChannels()).find((c) => c.id === chanB.id)!.placements[0]!.id;
+    const fromBRow = await h.db
+      .selectFrom('restream_placements')
+      .selectAll()
+      .where('id', '=', fromB)
+      .executeTakeFirstOrThrow();
+    const liveClone = await cutoverPrimitives(h.service).createCutoverClone(fromBRow, pReal.id);
+    await insertFailoverRow(h, { channelId: chanB.id, fromPlacementId: fromB, toPlacementId: liveClone.id });
+
+    // -- channel C: a transient snapshot still referenced by a placement --
+    const chanC = await h.service.createChannel({
+      channelName: 'NHK',
+      channelNumber: '1',
+      profileId: pReal.id,
+      placements: [{ instanceId: 'zone2', nodeId: 'n1' }],
+    });
+    const fromC = (await h.service.listChannels()).find((c) => c.id === chanC.id)!.placements[0]!.id;
+    await cutoverPrimitives(h.service).freezeOutgoingProfile({ id: fromC }, { kind: 'snapshot', payload: pReal.payload as AribHlsParams });
+    const stillUsedSnapshotId = (
+      await h.db.selectFrom('restream_placements').select('profile_id').where('id', '=', fromC).executeTakeFirstOrThrow()
+    ).profile_id!;
+
+    h.logs.length = 0; // drop any setup-time push/log noise before the assertion
+
+    await h.service.reconcileFailoverOnStartup();
+
+    // orphaned clone: gone
+    expect(
+      await h.db.selectFrom('restream_placements').select('id').where('id', '=', orphanClone.id).executeTakeFirst(),
+    ).toBeUndefined();
+    // orphaned profile snapshot: gone
+    expect(
+      await h.db.selectFrom('restream_profiles').select('id').where('id', '=', orphanProfileId).executeTakeFirst(),
+    ).toBeUndefined();
+
+    // legitimately-referenced clone: untouched
+    expect(
+      await h.db.selectFrom('restream_placements').select('id').where('id', '=', liveClone.id).executeTakeFirst(),
+    ).toMatchObject({ id: liveClone.id });
+    // still-used transient snapshot profile: untouched
+    expect(
+      await h.db.selectFrom('restream_profiles').select('id').where('id', '=', stillUsedSnapshotId).executeTakeFirst(),
+    ).toMatchObject({ id: stillUsedSnapshotId });
+
+    // one warning per reclaimed artifact, matching the documented message shape
+    const warnings = h.logs.filter((l) => l.type === 'warning' && l.service === 'restreamer' && l.source === 'controller');
+    expect(warnings).toHaveLength(2);
+    expect(warnings).toContainEqual(
+      expect.objectContaining({
+        message: `reclaimed orphaned cutover clone ${orphanClone.id} for channel "at-x" (leaked by an interrupted cutover)`,
+      }),
+    );
+    expect(warnings).toContainEqual(
+      expect.objectContaining({
+        message: `reclaimed orphaned cutover profile snapshot ${orphanProfileId} (leaked by an interrupted cutover)`,
+      }),
+    );
+
+    await h.destroy();
+  });
+
+  it('is a no-op when there are no transient rows at all', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    h.logs.length = 0;
+    await expect(h.service.reconcileFailoverOnStartup()).resolves.toBeUndefined();
+    expect(h.logs.filter((l) => l.type === 'warning')).toHaveLength(0);
+    await h.destroy();
+  });
+});
+
+// ---------- profile-change cutover routing (Stage B.3) ----------
+//
+// The four interception sites (updateChannel's profileId flip = case A,
+// updatePlacement's profile-override flip = case B, updateProfile's payload
+// edit = case C, and applyChannelChanges' existing-placement UPDATE loop)
+// all funnel through the private routeProfileChange -- exercised here only
+// through the public surface, no structural cast needed.
+
+describe('profile-change cutover routing (Stage B.3)', () => {
+  it('case A: a channel-level profile flip pins an inheriting placement to the OLD profile and clones onto the NEW one', async () => {
+    const h = await setup(); // default config has a switcher
+    const pOld = await h.service.createProfile('old', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
+    const pNew = await h.service.createProfile('new', profilePayload({ mode: 'ivtc', bitrate: '9M' }));
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pOld.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }], // inherits (no override)
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await h.service.updateChannel(chan.id, { profileId: pNew.id });
+
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(2);
+    const from = placements.find((p) => p.id === fromId)!;
+    const clone = placements.find((p) => p.id !== fromId)!;
+    expect(from.profileId).toBe(pOld.id); // pinned to OLD, not left inheriting
+    expect(from.transient).toBe(false);
+    expect(clone.profileId).toBe(pNew.id);
+    expect(clone.transient).toBe(true);
+    expect(clone.instanceId).toBe('zone1');
+    expect(clone.nodeId).toBe('n1');
+
+    // the channel row itself DID flip to the new profile
+    const chanRow = await h.db
+      .selectFrom('restream_channels')
+      .select('profile_id')
+      .where('id', '=', chan.id)
+      .executeTakeFirstOrThrow();
+    expect(chanRow.profile_id).toBe(pNew.id);
+
+    // sanity check: the clone is already encoding on its very first push,
+    // decoupled from FIFO activation -- no failoverTick() has run at all here
+    const node = h.nodes.get('zone1/n1')!;
+    expect(node.desired!.sessions).toHaveLength(2);
+    await h.destroy();
+  });
+
+  it('case A: a per-placement override is untouched by a channel-level profile flip (it never inherited the default)', async () => {
+    const h = await setup();
+    const pOld = await h.service.createProfile('old', profilePayload());
+    const pNew = await h.service.createProfile('new', profilePayload());
+    const pOverride = await h.service.createProfile('override', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pOld.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', profileId: pOverride.id }],
+    });
+    const placementId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await h.service.updateChannel(chan.id, { profileId: pNew.id });
+
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(1); // no clone -- nothing eligible
+    expect(placements[0]!.id).toBe(placementId);
+    expect(placements[0]!.profileId).toBe(pOverride.id); // unaffected
+    await h.destroy();
+  });
+
+  it('case B: a placement-level profile-override flip never writes `from` at all (freeze:none), and clones onto the new override', async () => {
+    const h = await setup();
+    const pChan = await h.service.createProfile('chan', profilePayload());
+    const pOverrideOld = await h.service.createProfile('override-old', profilePayload());
+    const pOverrideNew = await h.service.createProfile('override-new', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pChan.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', profileId: pOverrideOld.id }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await h.service.updatePlacement(fromId, { profileId: pOverrideNew.id });
+
+    const fromAfter = await h.db
+      .selectFrom('restream_placements')
+      .select('profile_id')
+      .where('id', '=', fromId)
+      .executeTakeFirstOrThrow();
+    expect(fromAfter.profile_id).toBe(pOverrideOld.id); // untouched
+
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(2);
+    const clone = placements.find((p) => p.id !== fromId)!;
+    expect(clone.profileId).toBe(pOverrideNew.id);
+    expect(clone.transient).toBe(true);
+    expect(clone.instanceId).toBe('zone1');
+    expect(clone.nodeId).toBe('n1');
+    await h.destroy();
+  });
+
+  it('case B: clearing a placement override (explicit null) is itself a routable profile change', async () => {
+    const h = await setup();
+    const pChan = await h.service.createProfile('chan', profilePayload());
+    const pOverrideOld = await h.service.createProfile('override-old', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pChan.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', profileId: pOverrideOld.id }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await h.service.updatePlacement(fromId, { profileId: null });
+
+    const fromAfter = await h.db
+      .selectFrom('restream_placements')
+      .select('profile_id')
+      .where('id', '=', fromId)
+      .executeTakeFirstOrThrow();
+    expect(fromAfter.profile_id).toBe(pOverrideOld.id); // untouched, freeze:none
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(2);
+    const clone = placements.find((p) => p.id !== fromId)!;
+    expect(clone.profileId).toBeNull(); // clone inherits the channel default
+    expect(clone.transient).toBe(true);
+    await h.destroy();
+  });
+
+  it('case C: a profile payload edit snapshots the OLD payload onto `from` before the live row updates, and the clone renders the NEW payload', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }], // inherits
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+    const beforeDoc = (await h.service.computeNodeDoc('zone1', 'n1')).doc!;
+    const beforeSession = beforeDoc.sessions.find((s) => s.name === fromId)!;
+
+    await h.service.updateProfile(p.id, { payload: profilePayload({ mode: 'ivtc', bitrate: '9M' }) });
+
+    const placements = (await h.service.listChannels())[0]!.placements;
+    expect(placements).toHaveLength(2);
+    const from = placements.find((pl) => pl.id === fromId)!;
+    const clone = placements.find((pl) => pl.id !== fromId)!;
+    expect(from.transient).toBe(false);
+    expect(clone.transient).toBe(true);
+
+    const afterDoc = (await h.service.computeNodeDoc('zone1', 'n1')).doc!;
+    const fromSessionAfter = afterDoc.sessions.find((s) => s.name === fromId)!;
+    const cloneSession = afterDoc.sessions.find((s) => s.name === clone.id)!;
+    // `from`'s rendered pipeline is byte-unchanged
+    expect(fromSessionAfter.pipeline).toEqual(beforeSession.pipeline);
+    // the clone renders the NEW payload
+    const cloneArgv = (cloneSession.pipeline as RawArgvParams).ffmpegArgv;
+    expect(cloneArgv[cloneArgv.indexOf('-b:v:0') + 1]).toBe('9M');
+    await h.destroy();
+  });
+
+  it('applyChannelChanges: an existing-placement UPDATE where profileId AND mode change together is a combined edit -- always goes direct, never cutover', async () => {
+    const h = await setup();
+    const pOld = await h.service.createProfile('old', profilePayload());
+    const pNew = await h.service.createProfile('new', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pOld.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', profileId: pOld.id }],
+    });
+    const placementId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await h.service.applyChannelChanges(chan.id, {
+      placements: [
+        {
+          id: placementId,
+          instanceId: 'zone1',
+          nodeId: 'n1',
+          mode: 'cold',
+          profileId: pNew.id,
+          programNumber: null,
+          enabled: true,
+        },
+      ],
+    });
+
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(1); // no clone
+    expect(placements[0]!.id).toBe(placementId);
+    expect(placements[0]!.profileId).toBe(pNew.id); // direct write
+    expect(placements[0]!.mode).toBe('cold');
+    await h.destroy();
+  });
+
+  it('applyChannelChanges: a pure profile flip on one placement cutovers while a combined edit on another placement in the SAME call goes direct -- no cross-contamination', async () => {
+    const h = await setup();
+    const pOld = await h.service.createProfile('old', profilePayload());
+    const pNew = await h.service.createProfile('new', profilePayload());
+    const pOther = await h.service.createProfile('other', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pOld.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1', profileId: pOld.id }, // cutover candidate
+        { instanceId: 'zone1', nodeId: 'n2', profileId: pOld.id }, // combined-edit candidate
+      ],
+    });
+    const rows = (await h.service.listChannels())[0]!.placements;
+    const cutoverFromId = rows.find((p) => p.nodeId === 'n1')!.id;
+    const directId = rows.find((p) => p.nodeId === 'n2')!.id;
+
+    await h.service.applyChannelChanges(chan.id, {
+      placements: [
+        {
+          id: cutoverFromId,
+          instanceId: 'zone1',
+          nodeId: 'n1',
+          mode: 'hot',
+          profileId: pNew.id,
+          programNumber: null,
+          enabled: true,
+        },
+        {
+          id: directId,
+          instanceId: 'zone1',
+          nodeId: 'n2',
+          mode: 'cold', // + profileId change = combined edit, direct
+          profileId: pOther.id,
+          programNumber: null,
+          enabled: true,
+        },
+      ],
+    });
+
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(3); // cutoverFrom (frozen) + clone + direct
+    const cutoverFrom = placements.find((p) => p.id === cutoverFromId)!;
+    const clone = placements.find((p) => p.nodeId === 'n1' && p.id !== cutoverFromId)!;
+    const direct = placements.find((p) => p.id === directId)!;
+
+    expect(cutoverFrom.profileId).toBe(pOld.id); // untouched (freeze:'none') -- never wrote the new value
+    expect(clone.profileId).toBe(pNew.id);
+    expect(clone.transient).toBe(true);
+    expect(direct.profileId).toBe(pOther.id); // direct write applied
+    expect(direct.mode).toBe('cold');
+    await h.destroy();
+  });
+
+  it('no switcher configured: profile-change routing degrades entirely to direct writes (no cutover clone ever created)', async () => {
+    const h = await setup({ restreamer: { switchers: [] } });
+    const pOld = await h.service.createProfile('old', profilePayload());
+    const pNew = await h.service.createProfile('new', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pOld.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await h.service.updateChannel(chan.id, { profileId: pNew.id });
+
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(1); // no clone
+    expect(placements[0]!.id).toBe(fromId);
+    expect(placements[0]!.profileId).toBeNull(); // still inheriting -- channel row flipped directly
+    const chanRow = await h.db
+      .selectFrom('restream_channels')
+      .select('profile_id')
+      .where('id', '=', chan.id)
+      .executeTakeFirstOrThrow();
+    expect(chanRow.profile_id).toBe(pNew.id);
+    await h.destroy();
+  });
+
+  it('an ineligible `from` (cold mode) never cutovers even with a switcher configured -- profile-only changes apply directly', async () => {
+    const h = await setup();
+    const pOld = await h.service.createProfile('old', profilePayload());
+    const pNew = await h.service.createProfile('new', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pOld.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', mode: 'cold' }],
+    });
+    const fromId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await h.service.updateChannel(chan.id, { profileId: pNew.id });
+
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(1);
+    expect(placements[0]!.id).toBe(fromId);
+    await h.destroy();
+  });
+
+  it('a channel already mid-procedure falls back to direct + logs a warning event, instead of layering a second cutover on top', async () => {
+    const h = await setup();
+    const pOld = await h.service.createProfile('old', profilePayload());
+    const pNew = await h.service.createProfile('new', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: pOld.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1' },
+        { instanceId: 'zone1', nodeId: 'n2' },
+      ],
+    });
+    const rows = (await h.service.listChannels())[0]!.placements;
+    const fromId = rows[0]!.id;
+    const toId = rows[1]!.id;
+    // a real in-flight (non-cutover) failover row, e.g. lag-triggered
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: chan.id,
+        from_placement_id: fromId,
+        to_placement_id: toId,
+        phase: 'bringing-up',
+        trigger_reason: 'lag',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: TS,
+        updated_at: TS,
+      })
+      .execute();
+
+    await h.service.updateChannel(chan.id, { profileId: pNew.id });
+
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    expect(placements).toHaveLength(2); // no clone added
+    expect(placements.find((p) => p.id === fromId)!.profileId).toBeNull(); // direct: still inherits (now the new channel default)
+    const chanRow = await h.db
+      .selectFrom('restream_channels')
+      .select('profile_id')
+      .where('id', '=', chan.id)
+      .executeTakeFirstOrThrow();
+    expect(chanRow.profile_id).toBe(pNew.id);
+
+    expect(h.logs).toContainEqual(
+      expect.objectContaining({ type: 'warning', service: 'restreamer', source: `channel.${chan.slug}` }),
+    );
+    await h.destroy();
+  });
 });
 
 // ---------- poller hooks ----------
@@ -1740,6 +2776,7 @@ describe('poller hooks', () => {
     });
     const node = h.nodes.get('zone1/n1')!;
     expect(node.puts()).toHaveLength(1);
+    const placementId = node.desired!.sessions[0]!.name;
     node.desired = null; // simulate state-file loss
 
     const hooks = h.service.pollerHooks();
@@ -1747,7 +2784,7 @@ describe('poller hooks', () => {
     // the forced push runs through the serialized op chain — join it
     await h.service.pushAll();
     expect(node.puts().length).toBeGreaterThanOrEqual(2);
-    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['at-x']);
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual([placementId]);
     await h.destroy();
   });
 
@@ -1755,6 +2792,48 @@ describe('poller hooks', () => {
     const h = await setup();
     h.cache.get('zone1').topology = null;
     expect(await h.service.getPendingPush('zone1', 'n1')).toBe(false);
+    await h.destroy();
+  });
+});
+
+// ---------- probe engine wiring (delivery-path URL construction) ----------
+
+describe('probe engine wiring', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('liveness/underspeed/lag probes fetch URLs built from the placement id, not the channel slug', async () => {
+    // ProbeEngine's fetchImpl defaults to the global `fetch` captured AT
+    // CONSTRUCTION TIME (a plain default-parameter value, not a live lookup),
+    // so the stub must be installed before setup() constructs the service —
+    // stubbing afterward would silently leave the engine on the real fetch.
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) => {
+        calls.push(String(url));
+        return new Response('', { status: 500 }); // every probe fails gracefully, we only care about the URL
+      }),
+    );
+
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }], // n1 has a serveUrl
+    });
+    const placementId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    await h.service.probeEngine.tick();
+
+    expect(calls.length).toBeGreaterThan(0);
+    for (const url of calls) {
+      expect(url).toContain(`/${placementId}/playlist.m3u8`);
+      expect(url).not.toContain('/at-x/');
+    }
     await h.destroy();
   });
 });
@@ -1767,7 +2846,7 @@ describe('onTopologyChanged', () => {
     const p = await h.service.createProfile('p', profilePayload());
     const node = h.nodes.get('zone1/n1')!;
     node.unreachable = true;
-    await h.service.createChannel({
+    const chan = await h.service.createChannel({
       channelName: 'AT-X',
       channelNumber: '9.1',
       profileId: p.id,
@@ -1775,6 +2854,8 @@ describe('onTopologyChanged', () => {
     });
     node.unreachable = false;
     const putsBefore = node.puts().length;
+    const placementId = (await h.service.listChannels()).find((c) => c.id === chan.id)!
+      .placements[0]!.id;
 
     vi.useFakeTimers();
     h.service.onTopologyChanged('zone1');
@@ -1784,7 +2865,7 @@ describe('onTopologyChanged', () => {
     await vi.advanceTimersByTimeAsync(200);
     vi.useRealTimers();
     await h.service.pushAll(); // join the op chain
-    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['at-x']);
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual([placementId]);
     h.service.stopSweep();
     await h.destroy();
   });
@@ -2009,7 +3090,8 @@ describe('catalog resolution (tvh-miss fallback)', () => {
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
     const node = h.nodes.get('zone1/n1')!;
-    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['cam-1']);
+    const placementId = node.desired!.sessions[0]!.name;
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual([placementId]);
     const putsBefore = node.puts().length;
 
     // the entry disappears (rename in sources.m3u) — catalog-flap analog of
@@ -2021,7 +3103,7 @@ describe('catalog resolution (tvh-miss fallback)', () => {
       'channel "Cam 1" (#1) not found on instance zone1 nor in node zone1/n1\'s sources catalog',
     );
     expect(node.puts().length).toBe(putsBefore);
-    expect(node.desired!.sessions.map((s) => s.name)).toEqual(['cam-1']);
+    expect(node.desired!.sessions.map((s) => s.name)).toEqual([placementId]);
     await h.destroy();
   });
 
@@ -2029,12 +3111,14 @@ describe('catalog resolution (tvh-miss fallback)', () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     // catalog unknown at write time → allowed, blocked at compute time
-    await h.service.createChannel({
+    const chan = await h.service.createChannel({
       channelName: 'Cam 1',
       channelNumber: '1',
       profileId: p.id,
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
+    const placementId = (await h.service.listChannels()).find((c) => c.id === chan.id)!
+      .placements[0]!.id;
     const node = h.nodes.get('zone1/n1')!;
     expect(node.puts()).toHaveLength(0); // never-pushed node, blocked session stays out
 
@@ -2053,7 +3137,7 @@ describe('catalog resolution (tvh-miss fallback)', () => {
     expect(result.action).toBe('skipped');
     expect(node.puts()).toHaveLength(1);
     expect(node.desired!.sessions[0]).toMatchObject({
-      name: 'cam-1',
+      name: placementId,
       source: { url: 'http://cam.example/1.m3u8' },
       tsreadex: {},
     });

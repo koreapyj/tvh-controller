@@ -30,8 +30,8 @@ export interface ParsedSegmentRef {
 /**
  * First variant URI of a MASTER playlist (the line after `#EXT-X-STREAM-INF`);
  * null when the text is not a master playlist. arib-hls nodes serve a master
- * at `<slug>/playlist.m3u8` with media playlists per variant underneath, so
- * probes follow one hop before looking for segments.
+ * at `<session directory>/playlist.m3u8` with media playlists per variant
+ * underneath, so probes follow one hop before looking for segments.
  */
 export function parseMasterVariant(text: string): string | null {
   let afterStreamInf = false;

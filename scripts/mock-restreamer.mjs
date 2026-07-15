@@ -42,7 +42,23 @@
 //                                        advancing with the wall clock
 // Test hooks for the switcher failover demo:
 //   POST /__freeze     stop playlist advancement (simulates a stalled encoder)
-//   POST /__unfreeze   resume
+//                      optional JSON body {"session":"<name>"} freezes only
+//                      that session's playlists; no body/no .session freezes
+//                      every session (global freeze, unchanged behavior).
+//                      Either form may also carry "atMs": <epoch-ms> to pin
+//                      the frozen instant in the past/future instead of
+//                      Date.now() (e.g. to make a playlist born-stale).
+//   POST /__unfreeze   resume; same optional {"session":"<name>"} body
+//                      scoping. When a global freeze is active, unfreezing
+//                      one session does NOT delete its entry — it records an
+//                      explicit exemption (frozenSessions.set(name, null))
+//                      so that session keeps advancing while every other
+//                      session stays frozen at the global instant. A later
+//                      global unfreeze (no body) clears the global freeze
+//                      AND drops these exemption sentinels; per-session
+//                      freezes set independently of a global freeze (real
+//                      timestamps, not null) are untouched by a global
+//                      unfreeze, same as before.
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 
@@ -64,6 +80,13 @@ const SESSION_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
 let desired = null;
 /** while set, playlists stop advancing (frozen wall clock for HLS output) */
 let frozenAtMs = null;
+/**
+ * per-session freeze override: session name -> frozen epoch ms, OR `null` as
+ * an explicit "exempt from the current global freeze, keep advancing"
+ * sentinel. Presence in the map (has()) always wins over frozenAtMs; a
+ * `null` value then falls back to Date.now() (i.e. not frozen).
+ */
+const frozenSessions = new Map();
 /** sources.m3u catalog entries; null = no sourcesM3u configured */
 let sources = null;
 /** ISO 8601 of the last catalog mutation; null while no catalog */
@@ -72,7 +95,6 @@ let sourcesUpdatedAt = null;
 const sourcesHash = () =>
   sources === null ? null : createHash('sha256').update(JSON.stringify(sources)).digest('hex').slice(0, 16);
 
-const nowMs = () => frozenAtMs ?? Date.now();
 const configHash = (session) => createHash('sha256').update(JSON.stringify(session)).digest('hex').slice(0, 16);
 
 function validateDesired(doc) {
@@ -105,6 +127,7 @@ function sessionStatuses() {
   const now = new Date().toISOString();
   return (desired?.sessions ?? []).map((s) => {
     const enabled = s.enabled !== false;
+    const f = frozenSessions.has(s.name) ? frozenSessions.get(s.name) : frozenAtMs;
     return {
       name: s.name,
       state: enabled ? 'running' : 'disabled',
@@ -124,8 +147,8 @@ function sessionStatuses() {
               updatedAt: now,
             },
             memoryRssMb: 512,
-            lastSegmentAt: new Date(nowMs()).toISOString(),
-            playlistLagSec: frozenAtMs === null ? 0.5 : (Date.now() - frozenAtMs) / 1000,
+            lastSegmentAt: new Date(f ?? Date.now()).toISOString(),
+            playlistLagSec: f === null || f === undefined ? 0.5 : (Date.now() - f) / 1000,
           }
         : { restarts: 0, consecutiveFailures: 0 }),
     };
@@ -163,8 +186,8 @@ function segName(ms) {
   return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}.ts`;
 }
 
-function mediaPlaylist() {
-  const seq = Math.floor(nowMs() / 1000 / SEG_SEC) - WINDOW;
+function mediaPlaylist(nowMsValue) {
+  const seq = Math.floor(nowMsValue / 1000 / SEG_SEC) - WINDOW;
   const lines = ['#EXTM3U', '#EXT-X-VERSION:6', `#EXT-X-TARGETDURATION:${SEG_SEC}`, `#EXT-X-MEDIA-SEQUENCE:${seq}`];
   for (let i = 0; i < WINDOW; i++) {
     const segStartMs = (seq + i) * SEG_SEC * 1000;
@@ -245,11 +268,49 @@ createServer((req, res) => {
 
     // ---- test hooks (switcher failover demo) ----
     if (path === '/__freeze' && req.method === 'POST') {
-      frozenAtMs = frozenAtMs ?? Date.now();
+      let body;
+      try {
+        body = chunks ? JSON.parse(chunks) : null;
+      } catch {
+        body = null;
+      }
+      const session = typeof body?.session === 'string' ? body.session : null;
+      const atMs = typeof body?.atMs === 'number' ? body.atMs : null;
+      if (session) {
+        if (!frozenSessions.has(session)) frozenSessions.set(session, atMs ?? Date.now());
+        return log(200, `session "${session}" frozen`), send(res, 200, { frozen: true, session });
+      }
+      frozenAtMs = frozenAtMs ?? atMs ?? Date.now();
       return log(200, 'playlists frozen'), send(res, 200, { frozen: true });
     }
     if (path === '/__unfreeze' && req.method === 'POST') {
+      let body;
+      try {
+        body = chunks ? JSON.parse(chunks) : null;
+      } catch {
+        body = null;
+      }
+      const session = typeof body?.session === 'string' ? body.session : null;
+      if (session) {
+        // Under an active global freeze, unfreezing one session must not
+        // erase its entry — a plain delete would fall through to frozenAtMs
+        // in sessionStatuses()/effNow and re-freeze it. Record an explicit
+        // null-sentinel exemption instead so this session keeps advancing
+        // while the rest of the node stays frozen.
+        if (frozenAtMs !== null) {
+          frozenSessions.set(session, null);
+        } else {
+          frozenSessions.delete(session);
+        }
+        return log(200, `session "${session}" advancing`), send(res, 200, { frozen: false, session });
+      }
       frozenAtMs = null;
+      // Global unfreeze clears exemption sentinels (no longer meaningful
+      // once there's no global freeze to be exempt from). Real per-session
+      // freezes set independently (non-null values) are left untouched.
+      for (const [k, v] of frozenSessions) {
+        if (v === null) frozenSessions.delete(k);
+      }
       return log(200, 'playlists advancing'), send(res, 200, { frozen: false });
     }
     if (path === '/__sources' && req.method === 'POST') {
@@ -280,7 +341,8 @@ createServer((req, res) => {
     }
     m = /^\/([a-z0-9][a-z0-9-]{0,63})\/([a-zA-Z0-9_]+)\/stream\.m3u8$/.exec(path);
     if (m && req.method === 'GET') {
-      return log(200), send(res, 200, mediaPlaylist(), 'application/vnd.apple.mpegurl');
+      const effNow = frozenSessions.has(m[1]) ? (frozenSessions.get(m[1]) ?? Date.now()) : (frozenAtMs ?? Date.now());
+      return log(200), send(res, 200, mediaPlaylist(effNow), 'application/vnd.apple.mpegurl');
     }
 
     log(404);

@@ -95,6 +95,8 @@ export interface RestreamProfilesTable {
   /** AribHlsParams JSON (controller-owned profile schema) — rendered to raw-argv before push */
   payload: string;
   updated_at: ColumnType<Date, string, string>;
+  /** 1 = a cutover-owned snapshot of a base profile's pre-edit payload; excluded from listProfiles() */
+  transient: Generated<number>;
 }
 
 /** logical restream channel: one slug, one channel identity, one profile */
@@ -128,6 +130,8 @@ export interface RestreamPlacementsTable {
   /** 'hot' = always encodes; 'cold' = standby, encodes only while an activation row exists */
   mode: Generated<string>;
   updated_at: ColumnType<Date, string, string>;
+  /** 1 = a cutover-owned transient clone of another placement; never user-created */
+  transient: Generated<number>;
 }
 
 /**

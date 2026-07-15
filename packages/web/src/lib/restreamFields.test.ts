@@ -215,8 +215,8 @@ describe('audio row add/remove bounds (1..4)', () => {
 
 describe('CHANNEL_BATCH_FIELDS', () => {
   const profiles: RestreamProfile[] = [
-    { id: 'p1', name: 'hevc-3M', payload: defaultProfilePayload(), updatedAt: '' },
-    { id: 'p2', name: 'hevc-5M', payload: defaultProfilePayload(), updatedAt: '' },
+    { id: 'p1', name: 'hevc-3M', payload: defaultProfilePayload(), updatedAt: '', transient: false },
+    { id: 'p2', name: 'hevc-5M', payload: defaultProfilePayload(), updatedAt: '', transient: false },
   ];
   const playlists: RestreamPlaylist[] = [
     { id: 'pl1', slug: 'main', title: 'Main channels', updatedAt: '' },

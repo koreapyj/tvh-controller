@@ -7,9 +7,9 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import BetterSqlite3 from 'better-sqlite3';
-import { Kysely, SqliteDialect } from 'kysely';
+import { Kysely, SqliteDialect, sql } from 'kysely';
 import type { Database } from '../src/db/schema.js';
-import { migrateTo, migrateToLatest } from '../src/db/migrations.js';
+import { migrateTo, migrateToLatest, runMigrationUp } from '../src/db/migrations.js';
 import { SqliteCompatPlugin } from './support/sqliteCompatPlugin.js';
 import { createTestDb, type TestDb } from './support/testDb.js';
 
@@ -796,6 +796,422 @@ describe('migration 008_restreamer', () => {
           .where('node_id', '=', 'node1')
           .executeTakeFirstOrThrow();
         expect(afterDown).toMatchObject({ pushed_hash: 'abc', advertised_raw_argv: 0 });
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
+  describe('020_placement_transient', () => {
+    it('a transient=1 clone coexists with the transient=0 original on the same (channel,instance,node); a second transient=0 row on that triple still collides', async () => {
+      await seed();
+      await t.db
+        .insertInto('restream_placements')
+        .values({
+          id: 'plc-clone',
+          channel_id: 'chan-1',
+          instance_id: 'tyo1',
+          node_id: 'node1',
+          priority: 1,
+          enabled: 1,
+          profile_id: null,
+          program_number: null,
+          transient: 1,
+          updated_at: NOW,
+        })
+        .execute();
+      const rows = await t.db
+        .selectFrom('restream_placements')
+        .select('transient')
+        .where('channel_id', '=', 'chan-1')
+        .execute();
+      expect(rows.map((r) => r.transient).sort()).toEqual([0, 1]);
+
+      await expect(
+        t.db
+          .insertInto('restream_placements')
+          .values({
+            id: 'plc-dup',
+            channel_id: 'chan-1',
+            instance_id: 'tyo1',
+            node_id: 'node1',
+            priority: 2,
+            enabled: 1,
+            profile_id: null,
+            program_number: null,
+            updated_at: NOW,
+          })
+          .execute(),
+      ).rejects.toThrow(/UNIQUE/i);
+    });
+
+    it('restream_profiles rows default transient to 0', async () => {
+      await seed();
+      const row = await t.db
+        .selectFrom('restream_profiles')
+        .selectAll()
+        .where('id', '=', 'prof-1')
+        .executeTakeFirstOrThrow();
+      expect(row.transient).toBe(0);
+    });
+
+    it('up defaults pre-existing rows to transient=0 and widens the unique index; down narrows it back and drops the column', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '019_drop_advertised_raw_argv');
+
+        interface OldProfileRow019 {
+          id: string;
+          name: string;
+          payload: string;
+          updated_at: string;
+        }
+        interface OldChannelRow019 {
+          id: string;
+          slug: string;
+          channel_name: string;
+          channel_number: string | null;
+          profile_id: string;
+          enabled: number;
+          comment: string | null;
+          updated_at: string;
+        }
+        interface OldPlacementRow019 {
+          id: string;
+          channel_id: string;
+          instance_id: string;
+          node_id: string;
+          priority: number;
+          enabled: number;
+          profile_id: string | null;
+          program_number: number | null;
+          mode: string;
+          updated_at: string;
+        }
+        const oldDb = db as unknown as Kysely<{
+          restream_profiles: OldProfileRow019;
+          restream_channels: OldChannelRow019;
+          restream_placements: OldPlacementRow019;
+        }>;
+        await oldDb
+          .insertInto('restream_profiles')
+          .values({ id: 'prof-1', name: 'p', payload: '{}', updated_at: NOW })
+          .execute();
+        await oldDb
+          .insertInto('restream_channels')
+          .values({
+            id: 'chan-1',
+            slug: 'at-x',
+            channel_name: 'AT-X',
+            channel_number: '9.1',
+            profile_id: 'prof-1',
+            enabled: 1,
+            comment: null,
+            updated_at: NOW,
+          })
+          .execute();
+        await oldDb
+          .insertInto('restream_placements')
+          .values({
+            id: 'plc-1',
+            channel_id: 'chan-1',
+            instance_id: 'tyo1',
+            node_id: 'node1',
+            priority: 1,
+            enabled: 1,
+            profile_id: null,
+            program_number: null,
+            mode: 'hot',
+            updated_at: NOW,
+          })
+          .execute();
+
+        await migrateTo(db, '020_placement_transient');
+
+        const placementAfterUp = await db
+          .selectFrom('restream_placements')
+          .selectAll()
+          .where('id', '=', 'plc-1')
+          .executeTakeFirstOrThrow();
+        expect(placementAfterUp).toMatchObject({ transient: 0 });
+        const profileAfterUp = await db
+          .selectFrom('restream_profiles')
+          .selectAll()
+          .where('id', '=', 'prof-1')
+          .executeTakeFirstOrThrow();
+        expect(profileAfterUp).toMatchObject({ transient: 0 });
+
+        // widened index: a transient=1 clone on the same triple no longer collides
+        await db
+          .insertInto('restream_placements')
+          .values({
+            id: 'plc-clone',
+            channel_id: 'chan-1',
+            instance_id: 'tyo1',
+            node_id: 'node1',
+            priority: 2,
+            enabled: 1,
+            profile_id: null,
+            program_number: null,
+            mode: 'hot',
+            transient: 1,
+            updated_at: NOW,
+          })
+          .execute();
+        // remove it before narrowing back down -- the narrower 3-col index
+        // cannot hold both a transient=0 and transient=1 row on one triple
+        await db.deleteFrom('restream_placements').where('id', '=', 'plc-clone').execute();
+
+        await migrateTo(db, '019_drop_advertised_raw_argv');
+
+        const placementAfterDown = await oldDb
+          .selectFrom('restream_placements')
+          .selectAll()
+          .where('id', '=', 'plc-1')
+          .executeTakeFirstOrThrow();
+        expect(placementAfterDown).not.toHaveProperty('transient');
+        const profileAfterDown = await oldDb
+          .selectFrom('restream_profiles')
+          .selectAll()
+          .where('id', '=', 'prof-1')
+          .executeTakeFirstOrThrow();
+        expect(profileAfterDown).not.toHaveProperty('transient');
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
+  describe('020_placement_transient resumability (interrupted-boot recovery)', () => {
+    /*
+     * MySQL/MariaDB DDL auto-commits per statement, so a process that dies
+     * partway through 020's up() can leave a subset of its steps already
+     * applied with no migration-history row recorded (the migrator only
+     * writes that row after up() returns). The next boot re-runs up() from
+     * the top. These tests simulate each partial-application point directly
+     * with raw SQL against a db parked at 019 (the same state a half-applied
+     * MySQL run would leave behind) and assert migrateToLatest() still
+     * completes and lands on the correct final schema.
+     */
+
+    async function freshDbAt019WithSeedRow(): Promise<Kysely<Database>> {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      await migrateTo(db, '019_drop_advertised_raw_argv');
+
+      interface OldProfileRow019 {
+        id: string;
+        name: string;
+        payload: string;
+        updated_at: string;
+      }
+      interface OldChannelRow019 {
+        id: string;
+        slug: string;
+        channel_name: string;
+        channel_number: string | null;
+        profile_id: string;
+        enabled: number;
+        comment: string | null;
+        updated_at: string;
+      }
+      interface OldPlacementRow019 {
+        id: string;
+        channel_id: string;
+        instance_id: string;
+        node_id: string;
+        priority: number;
+        enabled: number;
+        profile_id: string | null;
+        program_number: number | null;
+        mode: string;
+        updated_at: string;
+      }
+      const oldDb = db as unknown as Kysely<{
+        restream_profiles: OldProfileRow019;
+        restream_channels: OldChannelRow019;
+        restream_placements: OldPlacementRow019;
+      }>;
+      await oldDb
+        .insertInto('restream_profiles')
+        .values({ id: 'prof-1', name: 'p', payload: '{}', updated_at: NOW })
+        .execute();
+      await oldDb
+        .insertInto('restream_channels')
+        .values({
+          id: 'chan-1',
+          slug: 'at-x',
+          channel_name: 'AT-X',
+          channel_number: '9.1',
+          profile_id: 'prof-1',
+          enabled: 1,
+          comment: null,
+          updated_at: NOW,
+        })
+        .execute();
+      // seeded BEFORE the simulated partial state, to prove the resumed
+      // rebuild in step 3 preserves pre-existing rows
+      await oldDb
+        .insertInto('restream_placements')
+        .values({
+          id: 'plc-1',
+          channel_id: 'chan-1',
+          instance_id: 'tyo1',
+          node_id: 'node1',
+          priority: 1,
+          enabled: 1,
+          profile_id: null,
+          program_number: null,
+          mode: 'hot',
+          updated_at: NOW,
+        })
+        .execute();
+      return db;
+    }
+
+    /** asserts migrateToLatest() reached the correct, fully-widened end state */
+    async function assertResumedToCorrectSchema(db: Kysely<Database>): Promise<void> {
+      // the pre-seeded row survived the resumed rebuild with its data intact
+      const placement = await db
+        .selectFrom('restream_placements')
+        .selectAll()
+        .where('id', '=', 'plc-1')
+        .executeTakeFirstOrThrow();
+      expect(placement).toMatchObject({
+        channel_id: 'chan-1',
+        instance_id: 'tyo1',
+        node_id: 'node1',
+        priority: 1,
+        mode: 'hot',
+        transient: 0,
+      });
+
+      const profile = await db
+        .selectFrom('restream_profiles')
+        .selectAll()
+        .where('id', '=', 'prof-1')
+        .executeTakeFirstOrThrow();
+      expect(profile).toMatchObject({ transient: 0 });
+
+      // unique index is the widened 4-col shape: a transient=1 clone on the
+      // same (channel, instance, node) triple now coexists with plc-1
+      await db
+        .insertInto('restream_placements')
+        .values({
+          id: 'plc-clone',
+          channel_id: 'chan-1',
+          instance_id: 'tyo1',
+          node_id: 'node1',
+          priority: 2,
+          enabled: 1,
+          profile_id: null,
+          program_number: null,
+          mode: 'hot',
+          transient: 1,
+          updated_at: NOW,
+        })
+        .execute();
+      const rows = await db
+        .selectFrom('restream_placements')
+        .select('transient')
+        .where('channel_id', '=', 'chan-1')
+        .execute();
+      expect(rows.map((r) => r.transient).sort()).toEqual([0, 1]);
+      await db.deleteFrom('restream_placements').where('id', '=', 'plc-clone').execute();
+
+      // no rebuild scratch table left behind
+      const leftover = await sql<{ name: string }>`
+        select name from sqlite_master where type = 'table' and name = 'restream_placements_new'
+      `.execute(db);
+      expect(leftover.rows).toHaveLength(0);
+    }
+
+    it('(a) resumes and completes when only step 1 (restream_placements.transient) landed before the interrupt', async () => {
+      const db = await freshDbAt019WithSeedRow();
+      try {
+        // simulates the crash point in the bug report: step 1 committed, then
+        // the process died before step 2 or step 3
+        await sql`alter table restream_placements add column transient boolean not null default 0`.execute(
+          db,
+        );
+
+        await expect(migrateToLatest(db)).resolves.toBeUndefined();
+        await assertResumedToCorrectSchema(db);
+      } finally {
+        await db.destroy();
+      }
+    });
+
+    it('(b) resumes and completes when steps 1+2 (both transient columns) landed before the interrupt', async () => {
+      const db = await freshDbAt019WithSeedRow();
+      try {
+        await sql`alter table restream_placements add column transient boolean not null default 0`.execute(
+          db,
+        );
+        await sql`alter table restream_profiles add column transient boolean not null default 0`.execute(
+          db,
+        );
+
+        await expect(migrateToLatest(db)).resolves.toBeUndefined();
+        await assertResumedToCorrectSchema(db);
+      } finally {
+        await db.destroy();
+      }
+    });
+
+    it('(c) resumes and completes when steps 1+2 landed and a leftover restream_placements_new table survives a death mid-rebuild', async () => {
+      const db = await freshDbAt019WithSeedRow();
+      try {
+        await sql`alter table restream_placements add column transient boolean not null default 0`.execute(
+          db,
+        );
+        await sql`alter table restream_profiles add column transient boolean not null default 0`.execute(
+          db,
+        );
+        // simulates dying between rebuildPlacementsUniqueConstraint()
+        // creating its scratch table and the final drop+rename
+        await sql`create table restream_placements_new (id varchar(36) primary key, leftover_marker varchar(8))`.execute(
+          db,
+        );
+
+        await expect(migrateToLatest(db)).resolves.toBeUndefined();
+        await assertResumedToCorrectSchema(db);
+      } finally {
+        await db.destroy();
+      }
+    });
+
+    it('(d) re-running 020 up() directly on an already-fully-migrated db is a no-op', async () => {
+      const db = await freshDbAt019WithSeedRow();
+      try {
+        await migrateToLatest(db);
+        const before = await db
+          .selectFrom('restream_placements')
+          .selectAll()
+          .where('id', '=', 'plc-1')
+          .executeTakeFirstOrThrow();
+
+        // bypasses the migrator's history bookkeeping entirely — exercises
+        // up()'s own idempotence, not just "the migrator won't re-run it"
+        await expect(runMigrationUp(db, '020_placement_transient')).resolves.toBeUndefined();
+
+        const after = await db
+          .selectFrom('restream_placements')
+          .selectAll()
+          .where('id', '=', 'plc-1')
+          .executeTakeFirstOrThrow();
+        expect(after).toEqual(before);
+        expect(await db.selectFrom('restream_placements').selectAll().execute()).toHaveLength(1);
+        await assertResumedToCorrectSchema(db);
       } finally {
         await db.destroy();
       }

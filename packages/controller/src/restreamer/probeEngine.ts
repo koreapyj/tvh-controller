@@ -60,14 +60,14 @@ export const PROBE_BASE_TICK_MS = 5_000;
 /** fetch budget for the playlist hops of the lag round (the lag threshold itself is config) */
 const LAG_FETCH_TIMEOUT_MS = 10_000;
 
-/** one node's probeable surface: its serveUrl + the slugs desired on it */
+/** one node's probeable surface: its serveUrl + the session names desired on it */
 export interface NodeProbeTarget {
   instanceId: string;
   nodeId: string;
   /** null = node not directly serveable — instance probes are skipped ("n/a") */
   serveUrl: string | null;
-  /** slugs of sessions currently desired on this node (docs' inclusion rules) */
-  slugs: string[];
+  /** names (placement ids) of sessions currently desired on this node (docs' inclusion rules) */
+  sessionNames: string[];
 }
 
 /** one placement's channel-level probe surface */
@@ -76,6 +76,7 @@ export interface PlacementProbeTarget {
   placementId: string;
   instanceId: string;
   nodeId: string;
+  /** channel slug — diagnostics/log labeling only; playlistUrl is keyed by placementId */
   slug: string;
   /** master playlist URL through the node's serveUrl; null = not probeable */
   playlistUrl: string | null;
@@ -112,7 +113,7 @@ export class ProbeEngine {
   private readonly lag = new Map<string, LagCounter>();
   /** nextDueAt (ms) per probe kind+target key */
   private readonly due = new Map<string, number>();
-  /** round-robin slug cursor per node */
+  /** round-robin session cursor per node */
   private readonly rr = new Map<string, number>();
   private timer: NodeJS.Timeout | null = null;
   private running = false;
@@ -231,11 +232,11 @@ export class ProbeEngine {
 
   /** next hosted playlist URL for a node's instance-level probes (round-robin) */
   private nextPlaylistUrl(node: NodeProbeTarget): string | null {
-    if (!node.serveUrl || node.slugs.length === 0) return null;
+    if (!node.serveUrl || node.sessionNames.length === 0) return null;
     const key = nk(node.instanceId, node.nodeId);
-    const idx = (this.rr.get(key) ?? 0) % node.slugs.length;
+    const idx = (this.rr.get(key) ?? 0) % node.sessionNames.length;
     this.rr.set(key, idx + 1);
-    return `${node.serveUrl}/${node.slugs[idx]}/playlist.m3u8`;
+    return `${node.serveUrl}/${node.sessionNames[idx]}/playlist.m3u8`;
   }
 
   // ---------- liveness ----------
