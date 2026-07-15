@@ -65,6 +65,11 @@ export interface NodeProbeSettings {
   lag: ProbeThresholds;
 }
 
+export interface NodeSettings {
+  /** null = uncapped; 0 = admit no new sessions */
+  maxSessions: number | null;
+}
+
 /**
  * Live probe counters. `failed` trips after failureThreshold consecutive
  * failures and clears only after successThreshold consecutive successes;
@@ -274,6 +279,8 @@ export interface RestreamerNodeStatus {
   capabilities: string[] | null;
   /** pipeline templates the daemon can build (from `/v1/status.templates`); null = unreachable / unknown */
   templates: { id: string; version: number }[] | null;
+  /** per-node session cap from DB settings; null = uncapped */
+  maxSessions: number | null;
 }
 
 /** one switcher's polled status (SSE `restreamer-switcher` events) */

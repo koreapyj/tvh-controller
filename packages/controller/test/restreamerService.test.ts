@@ -12,6 +12,7 @@ import type {
   AribHlsParams,
   DesiredState,
   EnrichedSessionStatus,
+  NodeSettings,
   RawArgvParams,
   RestreamProfile,
   SourceCatalogEntry,
@@ -202,6 +203,7 @@ function seedNodeStatusEntry(cache: InstanceCache, instanceId: string, nodeId: s
     sources: null,
     capabilities: null,
     templates: null,
+    maxSessions: null,
   });
 }
 
@@ -2812,6 +2814,64 @@ describe('poller hooks', () => {
     ]);
     expect(enriched.find((s) => s.name === placementId)?.channelSlug).toBe('at-x');
     expect(enriched.find((s) => s.name === 'orphan-uuid')?.channelSlug).toBeNull();
+    await h.destroy();
+  });
+});
+
+// ---------- node settings (per-node session capacity) ----------
+
+describe('node settings (per-node session capacity)', () => {
+  it('getNodeSettings defaults to {maxSessions: null} when no row exists', async () => {
+    const h = await setup();
+    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({ maxSessions: null });
+    await h.destroy();
+  });
+
+  it('setNodeSettings round-trips a value, and back to null (row persists, not deleted)', async () => {
+    const h = await setup();
+    expect(await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 3 })).toEqual<NodeSettings>({
+      maxSessions: 3,
+    });
+    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({ maxSessions: 3 });
+
+    expect(await h.service.setNodeSettings('zone1', 'n1', { maxSessions: null })).toEqual<NodeSettings>({
+      maxSessions: null,
+    });
+    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({ maxSessions: null });
+    await h.destroy();
+  });
+
+  it('setNodeSettings only touches the targeted node — a sibling node keeps its own row (or default)', async () => {
+    const h = await setup();
+    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 2 });
+    expect(await h.service.getNodeSettings('zone1', 'n2')).toEqual<NodeSettings>({ maxSessions: null });
+    expect(await h.service.getNodeSettings('zone2', 'n1')).toEqual<NodeSettings>({ maxSessions: null });
+    await h.destroy();
+  });
+
+  it('setNodeSettings invalidates the capacity cache immediately — pollerHooks().getMaxSessions reflects the new value without waiting out the 4s TTL', async () => {
+    const h = await setup();
+    const hooks = h.service.pollerHooks();
+    expect(await hooks.getMaxSessions!('zone1', 'n1')).toBeNull();
+
+    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 5 });
+    expect(await hooks.getMaxSessions!('zone1', 'n1')).toBe(5);
+
+    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: null });
+    expect(await hooks.getMaxSessions!('zone1', 'n1')).toBeNull();
+    await h.destroy();
+  });
+
+  it('getNodeSettings/setNodeSettings reject an unknown instance or node with 400 (not 404)', async () => {
+    const h = await setup();
+    await expect(h.service.getNodeSettings('zone9', 'n1')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(h.service.getNodeSettings('zone1', 'n99')).rejects.toMatchObject({ statusCode: 400 });
+    await expect(h.service.setNodeSettings('zone9', 'n1', { maxSessions: 1 })).rejects.toMatchObject({
+      statusCode: 400,
+    });
+    await expect(h.service.setNodeSettings('zone1', 'n99', { maxSessions: 1 })).rejects.toMatchObject({
+      statusCode: 400,
+    });
     await h.destroy();
   });
 });

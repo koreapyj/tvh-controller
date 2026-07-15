@@ -28,6 +28,7 @@ import type {
   InstanceSummary,
   MasterRulePayload,
   NodeProbeSettings,
+  NodeSettings,
   ReconcileAction,
   RecordingBatchResult,
   RecordingEditOp,
@@ -289,6 +290,10 @@ export const api = {
     http<NodeProbeSettings>('GET', `/api/restreamer/nodes/${instanceId}/${nodeId}/probes`),
   updateRestreamerNodeProbes: (instanceId: string, nodeId: string, payload: NodeProbeSettings) =>
     http<NodeProbeSettings>('PUT', `/api/restreamer/nodes/${instanceId}/${nodeId}/probes`, payload),
+  getNodeSettings: (instanceId: string, nodeId: string) =>
+    http<NodeSettings>('GET', `/api/restreamer/nodes/${instanceId}/${nodeId}/settings`),
+  putNodeSettings: (instanceId: string, nodeId: string, settings: NodeSettings) =>
+    http<NodeSettings>('PUT', `/api/restreamer/nodes/${instanceId}/${nodeId}/settings`, settings),
   restartRestreamSession: (instanceId: string, nodeId: string, name: string) =>
     http<{ ok: boolean }>(
       'POST',

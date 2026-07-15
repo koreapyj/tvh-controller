@@ -183,6 +183,14 @@ export interface RestreamNodeProbesTable {
   updated_at: ColumnType<Date, string, string>;
 }
 
+/** per-node settings (UI-editable); absent row or NULL = uncapped */
+export interface RestreamNodeSettingsTable {
+  instance_id: string;
+  node_id: string;
+  max_sessions: number | null;
+  updated_at: ColumnType<Date, string, string>;
+}
+
 /** last successfully pushed desired-doc hash per node (doc is atomic — one hash) */
 export interface RestreamNodeStateTable {
   instance_id: string;
@@ -237,6 +245,7 @@ export interface Database {
   restream_placements: RestreamPlacementsTable;
   restream_failover_state: RestreamFailoverStateTable;
   restream_node_probes: RestreamNodeProbesTable;
+  restream_node_settings: RestreamNodeSettingsTable;
   restream_node_state: RestreamNodeStateTable;
   restream_playlists: RestreamPlaylistsTable;
   restream_playlist_members: RestreamPlaylistMembersTable;

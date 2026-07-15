@@ -26,6 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { api, unavailableDetail, type RestreamChannelPatch } from '../lib/api.js';
   import { lowestNumberFor, parseChannelInput } from '../lib/channelPick.js';
   import { errText } from '../lib/fetchGuard.js';
+  import { configuredHotCount, isAtCapacity } from '../lib/nodeCapacity.js';
   import { placementAvailability } from '../lib/placementAvailability.js';
   import {
     buildPlacementsPayload,
@@ -51,12 +52,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   let {
     channel = null,
+    channels,
     profiles,
     playlists,
     onclose,
   }: {
     /** null = create */
     channel?: RestreamChannelWithStatus | null;
+    /** full channel list (with placements) — used only to flag at-capacity nodes in the picker */
+    channels: RestreamChannelWithStatus[];
     profiles: RestreamProfile[];
     playlists: RestreamPlaylist[];
     /** called after the modal is done (page refetches the channel list) */
@@ -170,6 +174,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return m;
   });
   const nodeInstanceIds = $derived([...nodesByInstance.keys()]);
+
+  /** node picker option label — annotates nodes at/over their configured hot-session cap (warn-only; selection stays allowed) */
+  function nodeOptionLabel(instanceId: string, nodeId: string): string {
+    const node = $restreamerNodes[restreamerNodeKey({ instanceId, nodeId })];
+    if (!node || node.maxSessions == null) return nodeId;
+    const configured = configuredHotCount(channels, instanceId, nodeId);
+    return isAtCapacity(node.maxSessions, configured) ? `${nodeId} (at capacity)` : nodeId;
+  }
 
   let addInstance = $state('');
   let addNode = $state('');
@@ -483,7 +495,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         </select>
         <select style="width:auto" bind:value={addNode} aria-label="node">
           {#each nodesByInstance.get(addInstance) ?? [] as n (n)}
-            <option value={n}>{n}</option>
+            <option value={n}>{nodeOptionLabel(addInstance, n)}</option>
           {/each}
         </select>
         <select style="width:auto" bind:value={addMode} aria-label="mode">

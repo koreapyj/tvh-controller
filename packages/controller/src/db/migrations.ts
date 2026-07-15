@@ -914,6 +914,25 @@ migrations['020_placement_transient'] = {
   },
 };
 
+migrations['021_node_settings'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // per-node session cap (UI-editable); absent row or NULL max_sessions ⇒
+    // uncapped. Nodes live in config.yaml (no FK target exists) — a row
+    // whose (instance_id, node_id) no longer matches config is ignored.
+    await db.schema
+      .createTable('restream_node_settings')
+      .addColumn('instance_id', 'varchar(64)', (c) => c.notNull())
+      .addColumn('node_id', 'varchar(64)', (c) => c.notNull())
+      .addColumn('max_sessions', 'integer')
+      .addColumn('updated_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .addPrimaryKeyConstraint('pk_restream_node_settings', ['instance_id', 'node_id'])
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.dropTable('restream_node_settings').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

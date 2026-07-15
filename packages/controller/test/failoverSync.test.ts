@@ -108,6 +108,7 @@ function nodeStatusFixture(
     sources: null,
     capabilities: null,
     templates: null,
+    maxSessions: null,
     ...opts,
   };
 }
@@ -341,6 +342,21 @@ function failoverRow(db: Kysely<Database>, channelId: string) {
     .selectAll()
     .where('channel_id', '=', channelId)
     .executeTakeFirst();
+}
+
+async function insertNodeSettings(
+  db: Kysely<Database>,
+  fields: { instanceId: string; nodeId: string; maxSessions: number | null },
+): Promise<void> {
+  await db
+    .insertInto('restream_node_settings')
+    .values({
+      instance_id: fields.instanceId,
+      node_id: fields.nodeId,
+      max_sessions: fields.maxSessions,
+      updated_at: TS,
+    })
+    .execute();
 }
 
 // ---------- harness ----------
@@ -1550,6 +1566,107 @@ describe('FailoverSync: activePlacementOf never infers a transient clone as "act
 
     expect(h.sync.activeChannelId()).toBeNull();
     expect(await failoverRow(h.db, chanId)).toBeUndefined();
+  });
+});
+
+// ---------- 11. per-node session capacity (restream_node_settings) ----------
+//
+// candidateOf charges a candidate one session slot unless it is already
+// counted in the node's desired-session total (alreadyDesired — hot
+// placements and the current failover row's own from/to). Exercised end to
+// end: seeded restream_node_settings rows, requestFailover/requestReset,
+// tick().
+
+describe('FailoverSync: per-node session capacity (restream_node_settings)', () => {
+  /**
+   * chanA has a single hot placement on zoneA/n1 — steady-state running, and
+   * therefore always counted in that node's desired-session total. chanB is
+   * the channel under test: hot on zoneA/n2 (currently active per the
+   * switcher), cold on zoneA/n1 (the failover candidate — sharing chanA's
+   * node, so capacity on n1 is contended between the two channels).
+   */
+  async function seedSharedNodeChannels(h: Harness) {
+    const chanA = await insertChannel(h.db, { slug: 'chanA' });
+    const aHot = await insertPlacement(h.db, { channelId: chanA, instanceId: 'zoneA', nodeId: 'n1', priority: 1 });
+    addSession(h.cache, 'zoneA', 'n1', aHot);
+
+    const chanB = await insertChannel(h.db, { slug: 'chanB' });
+    const bHot = await insertPlacement(h.db, { channelId: chanB, instanceId: 'zoneA', nodeId: 'n2', priority: 1 });
+    const bCold = await insertPlacement(h.db, {
+      channelId: chanB,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 2,
+      mode: 'cold',
+    });
+    addSession(h.cache, 'zoneA', 'n2', bHot);
+    seedSwitcherStatus(h.cache, 'sw1', [
+      swChan('chanB', bHot, [
+        { id: bHot, healthy: true },
+        { id: bCold, healthy: true },
+      ]),
+    ]);
+
+    return { chanA, aHot, chanB, bHot, bCold };
+  }
+
+  it('rejects a cold candidate that would push a capped node over max_sessions, with an at-capacity blocked reason', async () => {
+    const h = await setup();
+    const { chanB, bCold } = await seedSharedNodeChannels(h);
+    // zoneA/n1 already carries chanA's hot session (desired=1); capped at 1
+    await insertNodeSettings(h.db, { instanceId: 'zoneA', nodeId: 'n1', maxSessions: 1 });
+
+    const outcome = await h.sync.requestFailover(chanB, { toPlacementId: bCold, reason: 'manual' });
+    expect(outcome).toEqual({ ok: true, queued: true });
+
+    await h.sync.tick();
+    expect(await failoverRow(h.db, chanB)).toBeUndefined();
+    expect(h.sync.blockedReason(chanB)).toContain('at-capacity');
+    expect(h.sync.activeChannelId()).toBeNull();
+  });
+
+  it('admits the same candidate once max_sessions is explicitly NULL (uncapped)', async () => {
+    const h = await setup();
+    const { chanB, bCold } = await seedSharedNodeChannels(h);
+    await insertNodeSettings(h.db, { instanceId: 'zoneA', nodeId: 'n1', maxSessions: null });
+
+    const outcome = await h.sync.requestFailover(chanB, { toPlacementId: bCold, reason: 'manual' });
+    expect(outcome).toEqual({ ok: true, queued: true });
+
+    await h.sync.tick();
+    expect(h.sync.blockedReason(chanB)).toBeNull();
+    expect(await failoverRow(h.db, chanB)).toMatchObject({ to_placement_id: bCold, phase: 'awaiting-lag' });
+    expect(h.sync.activeChannelId()).toBe(chanB);
+  });
+
+  it('a node with no restream_node_settings row at all is uncapped', async () => {
+    const h = await setup();
+    const { chanB, bCold } = await seedSharedNodeChannels(h);
+
+    const outcome = await h.sync.requestFailover(chanB, { toPlacementId: bCold, reason: 'manual' });
+    expect(outcome).toEqual({ ok: true, queued: true });
+
+    await h.sync.tick();
+    expect(h.sync.blockedReason(chanB)).toBeNull();
+    expect(await failoverRow(h.db, chanB)).toMatchObject({ to_placement_id: bCold, phase: 'awaiting-lag' });
+  });
+
+  it('an already-desired hot placement is free at exactly capacity — retargeting onto it costs no extra slot', async () => {
+    const h = await setup();
+    // hot-hot redundant channel: A active on zoneA/n1, B standby-but-running
+    // (hot) on zoneA/n2 — B already contributes to zoneA/n2's desired count
+    // regardless of which one the switcher currently reports active.
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    // B's node capped at exactly 1: without the alreadyDesired exemption,
+    // failing over onto B (desired=1, +1 candidate charge = 2) would be
+    // rejected; with it, B costs no extra slot (1 + 0 = 1, at the cap).
+    await insertNodeSettings(h.db, { instanceId: 'zoneA', nodeId: 'n2', maxSessions: 1 });
+    h.snapshot.lag.set(aId, lagFail(40)); // trigger: A (active) is failing
+
+    await h.sync.tick();
+    const row = await failoverRow(h.db, chanId);
+    expect(row).toMatchObject({ from_placement_id: aId, to_placement_id: bId, phase: 'awaiting-lag' });
+    expect(h.sync.blockedReason(chanId)).toBeNull();
   });
 });
 

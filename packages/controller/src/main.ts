@@ -154,6 +154,7 @@ async function main(): Promise<void> {
           sources: null,
           capabilities: null,
           templates: null,
+          maxSessions: null,
         },
       ];
       restreamerPollers.push(

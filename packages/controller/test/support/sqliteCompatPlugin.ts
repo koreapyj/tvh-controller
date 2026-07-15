@@ -60,6 +60,7 @@ const CONFLICT_TARGETS: Record<string, string[]> = {
   restream_node_state: ['instance_id', 'node_id'],
   restream_switcher_state: ['switcher_id'],
   restream_node_probes: ['instance_id', 'node_id'],
+  restream_node_settings: ['instance_id', 'node_id'],
   restream_failover_state: ['channel_id'],
 };
 

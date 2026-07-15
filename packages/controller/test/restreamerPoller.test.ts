@@ -198,6 +198,48 @@ describe('RestreamerPoller', () => {
     });
   });
 
+  describe('maxSessions hook', () => {
+    // unlike capabilities/templates (which come from the daemon's own status
+    // response and are only known on a successful poll), maxSessions is
+    // resolved once from the hook up front — it must carry through
+    // identically whether the node answered or not.
+    it('a successful poll carries maxSessions from the hook', async () => {
+      const { cache, status, poller } = setup({ getMaxSessions: () => 5 });
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.maxSessions).toBe(5);
+    });
+
+    it('an unreachable poll still carries maxSessions from the hook', async () => {
+      const { cache, status, poller } = setup({ getMaxSessions: () => 5 });
+      status.mockRejectedValue(new Error('down'));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.maxSessions).toBe(5);
+    });
+
+    it('hook absent -> maxSessions null, in both the reachable and unreachable branches', async () => {
+      const { cache, status, poller } = setup();
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.maxSessions).toBeNull();
+
+      status.mockRejectedValue(new Error('down'));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.maxSessions).toBeNull();
+    });
+
+    it('a throwing hook is swallowed -> maxSessions null rather than crashing the poll', async () => {
+      const { cache, status, poller } = setup({
+        getMaxSessions: () => {
+          throw new Error('db unavailable');
+        },
+      });
+      status.mockResolvedValue(nodeStatus());
+      await expect(poller.pollOnce()).resolves.toBeUndefined();
+      expect(cache.get('i1').restreamers[0]?.maxSessions).toBeNull();
+    });
+  });
+
   describe('revision-mismatch trigger', () => {
     it('fires when expected differs from the reported revision', async () => {
       const onRevisionMismatch = vi.fn();
@@ -574,6 +616,7 @@ describe('RestreamerPoller', () => {
           sources: null,
           capabilities: null,
           templates: null,
+          maxSessions: null,
         },
       ];
 

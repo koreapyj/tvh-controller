@@ -22,7 +22,7 @@
  * defaults in migration 013) and validation for the PUT endpoint.
  */
 
-import type { NodeProbeSettings, ProbeThresholds } from '@tvhc/shared';
+import type { NodeProbeSettings, NodeSettings, ProbeThresholds } from '@tvhc/shared';
 import type { RestreamNodeProbesTable } from '../db/schema.js';
 import { httpError } from '../util/httpError.js';
 
@@ -139,4 +139,14 @@ export function parseProbeSettings(raw: unknown): NodeProbeSettings {
     underspeed: thresholds('underspeed'),
     lag: thresholds('lag'),
   };
+}
+
+/** validate an untrusted PUT body into a full NodeSettings; missing key is invalid (null must be explicit) */
+export function parseNodeSettings(raw: unknown): NodeSettings {
+  if (typeof raw !== 'object' || raw === null) throw httpError(400, 'body must be an object');
+  const { maxSessions } = raw as Record<string, unknown>;
+  if (maxSessions !== null && (typeof maxSessions !== 'number' || !Number.isInteger(maxSessions) || maxSessions < 0)) {
+    throw httpError(400, 'maxSessions must be null or a non-negative integer');
+  }
+  return { maxSessions };
 }

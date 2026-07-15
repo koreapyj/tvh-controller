@@ -32,7 +32,7 @@ import {
   type PlacementInput,
   type PlacementPatch,
 } from '../restreamer/service.js';
-import { parseProbeSettings } from '../restreamer/probeSettings.js';
+import { parseNodeSettings, parseProbeSettings } from '../restreamer/probeSettings.js';
 import { RestreamerError } from '../restreamer/client.js';
 import { httpError, requireDb, type AppContext } from './context.js';
 import { mergeEpg, type EpgMergeInput } from './epg.js';
@@ -713,6 +713,19 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
         req.params.nodeId,
         parseProbeSettings(req.body),
       ),
+  );
+
+  // ---------- per-node settings ----------
+
+  app.get<{ Params: { instanceId: string; nodeId: string } }>(
+    '/api/restreamer/nodes/:instanceId/:nodeId/settings',
+    async (req) => svc().getNodeSettings(req.params.instanceId, req.params.nodeId),
+  );
+
+  app.put<{ Params: { instanceId: string; nodeId: string } }>(
+    '/api/restreamer/nodes/:instanceId/:nodeId/settings',
+    async (req) =>
+      svc().setNodeSettings(req.params.instanceId, req.params.nodeId, parseNodeSettings(req.body)),
   );
 
   // ---------- profiles ----------

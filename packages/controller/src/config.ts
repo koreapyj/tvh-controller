@@ -36,14 +36,6 @@ export interface RestreamerNodeConfig {
   serveUrl?: string;
   /** expected serving bandwidth budget (Mbps), used by the rebalancer */
   egressMbps?: number;
-  /**
-   * hard cap on concurrent encoding sessions this node's GPU can carry;
-   * absent = uncapped. Consulted by the cold-backup admission gate — measure
-   * by ramping production-profile sessions until speed/lag degrade, then set
-   * the largest stable count MINUS 1-2 (the margin doubles as failover
-   * headroom).
-   */
-  maxSessions?: number;
 }
 
 export interface InstanceConfig {
@@ -161,17 +153,11 @@ function parseRestreamerNodes(
       throw new Error(`instance "${instanceId}": duplicate restreamer node id "${n.id}"`);
     }
     ids.add(n.id);
-    if (n.maxSessions !== undefined && (!Number.isInteger(n.maxSessions) || n.maxSessions < 0)) {
-      throw new Error(
-        `instance "${instanceId}": restreamer node "${n.id}" maxSessions must be a non-negative integer`,
-      );
-    }
     return {
       id: n.id,
       url: n.url.replace(/\/+$/, ''),
       serveUrl: n.serveUrl?.replace(/\/+$/, ''),
       egressMbps: n.egressMbps,
-      maxSessions: n.maxSessions,
     };
   });
   return { nodes };

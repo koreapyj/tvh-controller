@@ -20,6 +20,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     chanLabel,
     type AribHlsParams,
     type NodeProbeSettings,
+    type NodeSettings,
     type RestreamChannelWithStatus,
     type RestreamPlaylist,
     type RestreamProfile,
@@ -35,6 +36,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     resetUnavailableReason,
     showActiveCheck,
   } from '../lib/failoverIndicator.js';
+  import { configuredHotCount, isOverCapacity } from '../lib/nodeCapacity.js';
   import { notify } from '../lib/notifications.js';
   import {
     CHANNEL_BATCH_FIELDS,
@@ -127,41 +129,62 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     return m;
   });
 
-  /** node card muted line: version / uptime / last measurement, in order, only the pieces we have */
-  function nodeMutedLine(n: RestreamerNodeStatus): string {
+  /** REST channel list with the SSE live overlay applied — the freshest view for capacity counting */
+  const mergedChannels = $derived(channels.map((c) => $restreamChannelLive[c.id] ?? c));
+
+  /** node keys (restreamerNodeKey) whose configured hot load exceeds their maxSessions cap */
+  const overCapacityNodeKeys = $derived.by(() => {
+    const set = new Set<string>();
+    for (const n of Object.values($restreamerNodes)) {
+      const configured = configuredHotCount(mergedChannels, n.instanceId, n.nodeId);
+      if (isOverCapacity(n.maxSessions, configured)) set.add(restreamerNodeKey(n));
+    }
+    return set;
+  });
+
+  /** node card muted line: version / uptime / last measurement / capacity, in order, only the pieces we have */
+  function nodeMutedLine(n: RestreamerNodeStatus, configured: number): string {
     const parts: string[] = [];
     if (n.version) parts.push(`v${n.version}`);
     if (n.uptimeSec !== null) parts.push(`up ${uptimeLabel(n.uptimeSec)}`);
     const measured = probeMeasurementLabel(n);
     if (measured) parts.push(measured);
+    if (n.maxSessions !== null) parts.push(`${configured}/${n.maxSessions} hot configured`);
     return parts.join(' · ');
   }
 
-  // ---------- per-node probe settings ----------
+  // ---------- per-node settings (probes + capacity) ----------
 
-  let probeModal: {
+  let settingsModal: {
     instanceId: string;
     nodeId: string;
     nodeLabel: string;
     initial: NodeProbeSettings;
+    initialSettings: NodeSettings;
   } | null = $state(null);
 
-  async function openProbeModal(n: RestreamerNodeStatus): Promise<void> {
+  async function openSettingsModal(n: RestreamerNodeStatus): Promise<void> {
     try {
-      const initial = await api.restreamerNodeProbes(n.instanceId, n.nodeId);
-      probeModal = { instanceId: n.instanceId, nodeId: n.nodeId, nodeLabel: n.nodeId, initial };
+      const [initial, initialSettings] = await Promise.all([
+        api.restreamerNodeProbes(n.instanceId, n.nodeId),
+        api.getNodeSettings(n.instanceId, n.nodeId),
+      ]);
+      settingsModal = { instanceId: n.instanceId, nodeId: n.nodeId, nodeLabel: n.nodeId, initial, initialSettings };
     } catch (err) {
       notify.error(errText(err));
     }
   }
 
-  async function saveProbes(payload: NodeProbeSettings): Promise<void> {
-    const m = probeModal;
+  async function saveSettings(payload: { probes: NodeProbeSettings; settings: NodeSettings }): Promise<void> {
+    const m = settingsModal;
     if (!m) return;
-    probeModal = null;
+    settingsModal = null;
     try {
-      await api.updateRestreamerNodeProbes(m.instanceId, m.nodeId, payload);
-      notify.success(`Probe settings saved for ${m.nodeLabel}`);
+      await Promise.all([
+        api.updateRestreamerNodeProbes(m.instanceId, m.nodeId, payload.probes),
+        api.putNodeSettings(m.instanceId, m.nodeId, payload.settings),
+      ]);
+      notify.success(`Settings saved for ${m.nodeLabel}`);
     } catch (err) {
       notify.error(errText(err));
     }
@@ -501,12 +524,19 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {/each}
 
     {#each nodeList as n (restreamerNodeKey(n))}
+      {@const configured = configuredHotCount(mergedChannels, n.instanceId, n.nodeId)}
       <div class="card">
         <h3>
           {n.nodeId}
           {#if n.reachable}<span class="badge ok">reachable</span>{:else}<span class="badge bad">unreachable</span>{/if}
           {#if n.pendingPush}<span class="badge warn" title="the controller's desired doc is not confirmed pushed to this node">pending push</span>{/if}
           {#if !n.apiVersionSupported}<span class="badge bad" title="node reports an apiVersion the controller doesn't speak">api?</span>{/if}
+          {#if overCapacityNodeKeys.has(restreamerNodeKey(n))}
+            <span
+              class="badge warn"
+              title="configured hot placements ({configured}) exceed this node's max sessions ({n.maxSessions}) — encodes are still pushed; reduce placements or raise the cap"
+            >over capacity</span>
+          {/if}
         </h3>
         {#if failingProbeBadges(n).length}
           <div style="margin:4px 0">
@@ -515,13 +545,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             {/each}
           </div>
         {/if}
-        <div class="muted small">{nodeMutedLine(n)}</div>
+        <div class="muted small">{nodeMutedLine(n, configured)}</div>
         {#if n.error}<div class="small" style="color:var(--bad)">{n.error}</div>{/if}
         <div style="margin:8px 0;display:flex;gap:8px">
           <button disabled={busy} onclick={() => run(() => api.pushRestreamerNode(n.instanceId, n.nodeId))}>
             Push now
           </button>
-          <button disabled={busy} onclick={() => openProbeModal(n)}>Probes…</button>
+          <button disabled={busy} onclick={() => openSettingsModal(n)}>Settings…</button>
         </div>
         {#if n.sessions.length}
           <table>
@@ -677,6 +707,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             {@const cls = placementBadgeClass(p.indicator, { enabled: p.enabled, sessionState: p.session?.state ?? null })}
             {@const redundant = live.placements.filter((x) => x.enabled).length > 1}
             {@const showCheck = showActiveCheck(p.indicator, live.activePlacementId === p.id, redundant)}
+            {@const nodeOverCap = overCapacityNodeKeys.has(restreamerNodeKey(p))}
             <button
               class="badge badge-button {cls}"
               title={placementTitle(live, p)}
@@ -684,6 +715,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
             >
               {#if showCheck}✓&nbsp;{/if}{p.nodeId}{#if p.blockedReason}&nbsp;⚠{/if}
             </button>
+            {#if nodeOverCap}
+              <span
+                class="rec-dot warn"
+                title="{p.nodeId} is over capacity: configured hot placements exceed its max sessions — encodes are still pushed; reduce placements or raise the cap"
+              ></span>
+            {/if}
           {:else}
             <span class="muted small m-hide">no placements</span>
           {/each}
@@ -788,6 +825,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 {#if channelModal}
   <RestreamChannelModal
     channel={channelModal.channel}
+    {channels}
     {profiles}
     {playlists}
     onclose={() => {
@@ -864,12 +902,13 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   />
 {/if}
 
-{#if probeModal}
+{#if settingsModal}
   <ProbeConfigModal
-    nodeLabel={probeModal.nodeLabel}
-    initial={probeModal.initial}
-    onsave={saveProbes}
-    oncancel={() => (probeModal = null)}
+    nodeLabel={settingsModal.nodeLabel}
+    initial={settingsModal.initial}
+    initialSettings={settingsModal.initialSettings}
+    onsave={saveSettings}
+    oncancel={() => (settingsModal = null)}
   />
 {/if}
 

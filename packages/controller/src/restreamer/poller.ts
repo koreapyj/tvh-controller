@@ -75,6 +75,8 @@ export interface RestreamerPollerHooks {
    * fact would be wiped by the next poll). Default: null (no probes).
    */
   getProbes?: (instanceId: string, nodeId: string) => NodeProbeStatus | null;
+  /** per-node session cap from DB settings; null/undefined hook = uncapped */
+  getMaxSessions?: (instanceId: string, nodeId: string) => Promise<number | null> | number | null;
   /** fold channel-level probe state (lag) into the polled sessions */
   enrichSessions?: (
     instanceId: string,
@@ -162,6 +164,7 @@ export class RestreamerPoller {
     // probe state persists across unreachable polls — a dead node's liveness
     // probe failing is exactly the signal that must stay visible
     const probes = this.getProbesSafe();
+    const maxSessions = await this.getMaxSessionsSafe();
     let status: RestreamerNodeStatus;
     try {
       const res = await this.client.status();
@@ -187,6 +190,7 @@ export class RestreamerPoller {
         sources: this.lastSources,
         capabilities: res.capabilities,
         templates: res.templates,
+        maxSessions,
       };
       await this.checkRevision(res.desiredRevision);
     } catch (err) {
@@ -211,6 +215,7 @@ export class RestreamerPoller {
         sources: this.lastSources,
         capabilities: null,
         templates: null,
+        maxSessions,
       };
     }
 
@@ -302,6 +307,14 @@ export class RestreamerPoller {
   private getProbesSafe(): NodeProbeStatus | null {
     try {
       return this.hooks.getProbes?.(this.instanceId, this.node.id) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async getMaxSessionsSafe(): Promise<number | null> {
+    try {
+      return (await this.hooks.getMaxSessions?.(this.instanceId, this.node.id)) ?? null;
     } catch {
       return null;
     }

@@ -28,6 +28,7 @@ import {
   type FailoverPhase,
   type FailoverTriggerReason,
   type NodeProbeSettings,
+  type NodeSettings,
   type RestreamChannel,
   type RestreamChannelWithStatus,
   type RestreamPlacement,
@@ -400,6 +401,8 @@ export class RestreamerService {
   private readonly pushProblems = new Map<string, string | null>();
   /** brief cache for the per-node probe settings map (probe base tick is 5s) */
   private probeSettingsCache: { at: number; map: Map<string, NodeProbeSettings> } | null = null;
+  /** brief cache for the per-node session-cap map, keyed by nodeKey() */
+  private nodeCapacityCache: { at: number; map: Map<string, number | null> } | null = null;
   /**
    * brief cache for placementId -> channel slug (session display enrichment,
    * event messages + web). Populated on demand from a single query shared
@@ -2923,6 +2926,8 @@ export class RestreamerService {
       // probe state is pulled at status-build time — the engine is the single
       // source of truth; patching it in afterwards would be wiped every poll
       getProbes: (instanceId, nodeId) => this.probeEngine.nodeProbeStatus(instanceId, nodeId),
+      getMaxSessions: async (instanceId, nodeId) =>
+        (await this.allNodeCapacity()).get(nodeKey(instanceId, nodeId)) ?? null,
       enrichSessions: async (_instanceId, _nodeId, sessions) => {
         // post-rename the session name IS the placement id — feeds both the
         // probe-engine lookup (no lookup needed there) and the slug map below
@@ -3105,6 +3110,42 @@ export class RestreamerService {
         .onDuplicateKeyUpdate({ ...row, updated_at: now() })
         .execute();
       this.probeSettingsCache = null;
+      return settings;
+    });
+  }
+
+  /** all nodes' session caps (stored rows only — missing key = uncapped), briefly cached */
+  private async allNodeCapacity(): Promise<Map<string, number | null>> {
+    const nowMs = Date.now();
+    if (this.nodeCapacityCache && nowMs - this.nodeCapacityCache.at < 4_000) {
+      return this.nodeCapacityCache.map;
+    }
+    const rows = await this.db.selectFrom('restream_node_settings').selectAll().execute();
+    const map = new Map(rows.map((r) => [nodeKey(r.instance_id, r.node_id), r.max_sessions]));
+    this.nodeCapacityCache = { at: nowMs, map };
+    return map;
+  }
+
+  async getNodeSettings(instanceId: string, nodeId: string): Promise<NodeSettings> {
+    this.assertNodeConfigured(instanceId, nodeId);
+    const row = await this.db
+      .selectFrom('restream_node_settings')
+      .selectAll()
+      .where('instance_id', '=', instanceId)
+      .where('node_id', '=', nodeId)
+      .executeTakeFirst();
+    return { maxSessions: row?.max_sessions ?? null };
+  }
+
+  setNodeSettings(instanceId: string, nodeId: string, settings: NodeSettings): Promise<NodeSettings> {
+    return this.serialize(async () => {
+      this.assertNodeConfigured(instanceId, nodeId);
+      await this.db
+        .insertInto('restream_node_settings')
+        .values({ instance_id: instanceId, node_id: nodeId, max_sessions: settings.maxSessions, updated_at: now() })
+        .onDuplicateKeyUpdate({ max_sessions: settings.maxSessions, updated_at: now() })
+        .execute();
+      this.nodeCapacityCache = null;
       return settings;
     });
   }

@@ -31,14 +31,6 @@ instances:
     #       serveUrl: https://tv1.example.com
     #       # expected serving bandwidth budget in Mbps (used by the rebalancer):
     #       egressMbps: 500
-    #       # hard cap on concurrent encoding sessions (cold-backup admission gate;
-    #       # omit = uncapped). Measure it: ramp production-profile sessions one at
-    #       # a time, watching every session hold speed >= 1.0 and playlist lag ~0
-    #       # for 10+ minutes (and intel_gpu_top VDBOX headroom); set the largest
-    #       # stable count MINUS 1-2 — the margin absorbs content spikes and
-    #       # doubles as failover headroom. Re-measure when the encode profile
-    #       # changes (resolution/bitrate/deinterlace).
-    #       maxSessions: 6
   - id: zone2
     name: Zone 2
     url: http://192.168.2.10:9981

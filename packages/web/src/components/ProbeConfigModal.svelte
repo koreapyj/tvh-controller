@@ -16,48 +16,74 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
-  import type { NodeProbeSettings } from '@tvhc/shared';
+  import type { NodeProbeSettings, NodeSettings } from '@tvhc/shared';
+  import { maxSessionsToInput, parseMaxSessionsInput } from '../lib/nodeCapacity.js';
   import { buildProbesPayload, PROBE_FIELDS, PROBE_GROUPS, probesToVals } from '../lib/probeFields.js';
 
-  // Per-node probe threshold editor: one bordered group per probe (liveness /
-  // underspeed / lag), mirroring RestreamProfileModal's section
-  // styling. Pure form — no fetching in here; the page loads `initial` and
-  // performs the PUT after onsave.
+  // Pure form — no fetching in here; the page loads `initial`/`initialSettings`
+  // and fans the single onsave out to both PUTs.
 
   let {
     nodeLabel,
     initial,
+    initialSettings,
     onsave,
     oncancel,
   }: {
     nodeLabel: string;
     initial: NodeProbeSettings;
-    onsave: (payload: NodeProbeSettings) => void;
+    initialSettings: NodeSettings;
+    onsave: (payload: { probes: NodeProbeSettings; settings: NodeSettings }) => void;
     oncancel: () => void;
   } = $props();
 
   let vals: Record<string, string> = $state(probesToVals(initial));
+  let maxSessionsVal = $state(maxSessionsToInput(initialSettings.maxSessions));
   let formError = $state('');
 
   function save(): void {
     formError = '';
+    const maxSessions = parseMaxSessionsInput(maxSessionsVal);
+    if (maxSessions === undefined) {
+      formError = 'Max sessions must be a non-negative integer, or blank for uncapped';
+      return;
+    }
     const built = buildProbesPayload($state.snapshot(vals));
     if (!built.ok) {
       formError = built.error;
       return;
     }
-    onsave(built.payload);
+    onsave({ probes: built.payload, settings: { maxSessions } });
   }
 </script>
 
 <svelte:window onkeydown={(e) => e.key === 'Escape' && oncancel()} />
 
 <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && oncancel()}>
-  <div class="modal" role="dialog" aria-modal="true" aria-label={`Probe settings: ${nodeLabel}`}>
-    <h2 style="margin-top:0">Probe settings: {nodeLabel}</h2>
+  <div class="modal" role="dialog" aria-modal="true" aria-label={`Node settings: ${nodeLabel}`}>
+    <h2 style="margin-top:0">Node settings: {nodeLabel}</h2>
     {#if formError}<div class="error-banner">{formError}</div>{/if}
 
     <div style="display:flex;flex-direction:column;gap:10px">
+      <div style="border:1px solid var(--border);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px">
+        <div>
+          <b class="small">Capacity</b>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <label for="pc-max-sessions" style="margin:0;width:160px;flex:none">Max sessions</label>
+          <input
+            id="pc-max-sessions"
+            style="flex:1"
+            inputmode="numeric"
+            placeholder="uncapped"
+            bind:value={maxSessionsVal}
+          />
+        </div>
+        <div class="muted small">
+          Benchmark: ramp sessions until speed/lag degrade, then set 1–2 below the stable max — that
+          margin is what failover and profile-cutover admissions consume. Empty = uncapped.
+        </div>
+      </div>
       {#each PROBE_GROUPS as group (group.key)}
         <div style="border:1px solid var(--border);border-radius:8px;padding:10px;display:flex;flex-direction:column;gap:8px">
           <div>

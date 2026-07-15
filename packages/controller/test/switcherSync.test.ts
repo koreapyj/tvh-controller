@@ -668,6 +668,7 @@ describe('rebalanceTick', () => {
       sources: null,
       capabilities: null,
       templates: null,
+      maxSessions: null,
     });
   }
 

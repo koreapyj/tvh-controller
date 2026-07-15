@@ -173,6 +173,9 @@ function seedNodeStatus(
       sessions,
       sourcesHash: sources === null ? null : 'h1',
       sources,
+      capabilities: null,
+      templates: null,
+      maxSessions: null,
     },
   ];
 }
@@ -2150,6 +2153,90 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/probes', () => {
       method: 'PUT',
       url: '/api/restreamer/nodes/zone1/ghost/probes',
       payload: NODE_PROBE_DEFAULTS,
+    });
+    expect(put.statusCode).toBe(400);
+  });
+});
+
+// ---------- per-node session capacity ----------
+
+describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/settings', () => {
+  it('GET returns {maxSessions: null} when no row is stored', async () => {
+    const { app } = await harness();
+    const res = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n1/settings' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ maxSessions: null });
+  });
+
+  it('PUT persists a non-negative integer; a later GET reflects it, and a different node is unaffected', async () => {
+    const { app } = await harness();
+    const put = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/settings',
+      payload: { maxSessions: 3 },
+    });
+    expect(put.statusCode).toBe(200);
+    expect(put.json()).toEqual({ maxSessions: 3 });
+
+    const get = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n1/settings' });
+    expect(get.json()).toEqual({ maxSessions: 3 });
+    const other = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n2/settings' });
+    expect(other.json()).toEqual({ maxSessions: null });
+  });
+
+  it('PUT accepts 0 (fully capped) and explicit null (clears back to uncapped)', async () => {
+    const { app } = await harness();
+    const zero = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/settings',
+      payload: { maxSessions: 0 },
+    });
+    expect(zero.statusCode).toBe(200);
+    expect(zero.json()).toEqual({ maxSessions: 0 });
+
+    const cleared = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/settings',
+      payload: { maxSessions: null },
+    });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toEqual({ maxSessions: null });
+  });
+
+  it('PUT with an invalid body -> 400: negative, non-integer, wrong type, missing key, non-object', async () => {
+    const { app } = await harness();
+    const bad = [-1, 1.5, '6', undefined].map((maxSessions) =>
+      maxSessions === undefined ? {} : { maxSessions },
+    );
+    for (const payload of bad) {
+      const res = await app.inject({ method: 'PUT', url: '/api/restreamer/nodes/zone1/n1/settings', payload });
+      expect(res.statusCode).toBe(400);
+    }
+    // explicit null IS valid -- re-assert separately so the loop above only covers genuinely invalid bodies
+    const nullOk = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/settings',
+      payload: { maxSessions: null },
+    });
+    expect(nullOk.statusCode).toBe(200);
+
+    const nonObject = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/settings',
+      payload: JSON.stringify('nope'),
+      headers: { 'content-type': 'application/json' },
+    });
+    expect(nonObject.statusCode).toBe(400);
+  });
+
+  it('an unknown node -> 400 on both GET and PUT', async () => {
+    const { app } = await harness();
+    const get = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/ghost/settings' });
+    expect(get.statusCode).toBe(400);
+    const put = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/ghost/settings',
+      payload: { maxSessions: 1 },
     });
     expect(put.statusCode).toBe(400);
   });

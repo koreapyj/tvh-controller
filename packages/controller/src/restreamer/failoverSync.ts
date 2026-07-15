@@ -45,7 +45,7 @@ import type {
   FailoverTriggerReason,
   NodeProbeSettings,
 } from '@tvhc/shared';
-import type { AppConfig, RestreamerNodeConfig } from '../config.js';
+import type { AppConfig } from '../config.js';
 import type { Db } from '../db/db.js';
 import type { RestreamFailoverStateTable } from '../db/schema.js';
 import type { EventLog } from '../state/eventLog.js';
@@ -146,6 +146,8 @@ interface TickData {
   rows: Map<string, FailoverRow>;
   /** desired-session count per nodeKey (doc inclusion incl. suppression) */
   desiredCounts: Map<string, number>;
+  /** per-node session cap from restream_node_settings; absent key = uncapped */
+  capacity: Map<string, number | null>;
 }
 
 function nk(instanceId: string, nodeId: string): string {
@@ -223,13 +225,8 @@ export class FailoverSync {
   // data loading
   // -------------------------------------------------------------------------
 
-  private nodeConfig(instanceId: string, nodeId: string): RestreamerNodeConfig | null {
-    const inst = this.config.instances.find((i) => i.id === instanceId);
-    return inst?.restreamer?.nodes.find((n) => n.id === nodeId) ?? null;
-  }
-
   private async loadData(): Promise<TickData> {
-    const [channels, placements, rows] = await Promise.all([
+    const [channels, placements, rows, settings] = await Promise.all([
       this.db
         .selectFrom('restream_channels as c')
         .innerJoin('restream_profiles as pr', 'pr.id', 'c.profile_id')
@@ -243,6 +240,7 @@ export class FailoverSync {
         .orderBy('id')
         .execute(),
       this.db.selectFrom('restream_failover_state').selectAll().execute(),
+      this.db.selectFrom('restream_node_settings').select(['instance_id', 'node_id', 'max_sessions']).execute(),
     ]);
     const channelMap = new Map(channels.map((c) => [c.id, c]));
     const placementsByChannel = new Map<string, PlacementRow[]>();
@@ -273,7 +271,16 @@ export class FailoverSync {
       }
     }
 
-    return { channels: channelMap, placementsByChannel, placementById, rows: rowMap, desiredCounts };
+    const capacity = new Map(settings.map((s) => [nk(s.instance_id, s.node_id), s.max_sessions]));
+
+    return {
+      channels: channelMap,
+      placementsByChannel,
+      placementById,
+      rows: rowMap,
+      desiredCounts,
+      capacity,
+    };
   }
 
   /**
@@ -374,7 +381,6 @@ export class FailoverSync {
 
   private candidateOf(data: TickData, p: PlacementRow): FailoverCandidate {
     const key = nk(p.instance_id, p.node_id);
-    const nodeCfg = this.nodeConfig(p.instance_id, p.node_id);
     const status = this.cache.has(p.instance_id)
       ? (this.cache.get(p.instance_id).restreamers.find((r) => r.nodeId === p.node_id) ?? null)
       : null;
@@ -393,7 +399,7 @@ export class FailoverSync {
           status,
           history: this.admissionHistories.get(key)?.history ?? emptyHistory(),
           desiredSessionCount: desired + (alreadyDesired ? 0 : 1),
-          maxSessions: nodeCfg?.maxSessions,
+          maxSessions: data.capacity.get(key) ?? undefined,
         })
       : ({ ok: false, reason: 'node-unreachable', detail: 'node never polled' } as const);
     return {

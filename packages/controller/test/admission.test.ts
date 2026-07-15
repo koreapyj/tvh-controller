@@ -74,6 +74,7 @@ function status(
     sources: null,
     capabilities: null,
     templates: null,
+    maxSessions: null,
     sessions: sessions.map((s) => ({ ...s, channelSlug: null })),
     ...opts,
   };

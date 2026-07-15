@@ -56,6 +56,7 @@ function node(
     sources,
     capabilities: null,
     templates: null,
+    maxSessions: null,
   };
 }
 
