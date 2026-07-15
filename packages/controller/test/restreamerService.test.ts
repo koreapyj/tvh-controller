@@ -360,7 +360,7 @@ describe('profiles', () => {
 
   it('updateProfile with a payload change re-pushes every node hosting the profile', async () => {
     // no switcher -- this tests the DIRECT-write path; the switcher-fronted
-    // cutover path (Stage B.3) is covered separately in its own describe block
+    // cutover path is covered separately in its own describe block
     const h = await setup({ restreamer: { switchers: [] } });
     const profile = await h.service.createProfile('p', profilePayload());
     await h.service.createChannel({
@@ -752,8 +752,8 @@ describe('desired doc determinism and push', () => {
   });
 
   it('a per-placement profile override changes only that placement\'s pipeline; clearing it reverts the doc revision', async () => {
-    // no switcher -- this tests the DIRECT-write path; Stage B.3's cutover
-    // routing (switcher-fronted) has its own describe block with equivalent coverage
+    // no switcher -- this tests the DIRECT-write path; switcher-fronted
+    // cutover routing has its own describe block with equivalent coverage
     const h = await setup({ restreamer: { switchers: [] } });
     const profileA = await h.service.createProfile('profile-a', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
     const profileB = await h.service.createProfile('profile-b', profilePayload({ mode: 'ivtc', bitrate: '6M' }));
@@ -1910,17 +1910,16 @@ describe('failover state placements', () => {
   });
 });
 
-// ---------- cutover primitives (Stage B.2) ----------
+// ---------- cutover primitives ----------
 //
 // createCutoverClone/freezeOutgoingProfile/markCutoverCompleteInner/
-// deleteCutoverPlacementInner are internal-only — Stage B.2 ships no trigger
-// wiring (Stage B.3), so there is no public entry point yet. They're
+// deleteCutoverPlacementInner have no public API of their own, so they're
 // exercised directly here via a narrow structural cast, mirroring how
-// FailoverSync's cutover branches already drive them through the
-// FailoverSyncHooks wired in the constructor (markCutoverComplete/
-// deleteCutoverPlacement — see failoverSync.test.ts's "cutover" describes for
-// full state-machine coverage with mocked hooks). The drain-expiry test below
-// additionally proves the REAL hook wiring end to end (no mocks).
+// FailoverSync's cutover branches drive them through the FailoverSyncHooks
+// wired in the constructor (markCutoverComplete/deleteCutoverPlacement — see
+// failoverSync.test.ts's "cutover" describes for full state-machine coverage
+// with mocked hooks). The drain-expiry test below additionally proves the
+// REAL hook wiring end to end (no mocks).
 
 interface CutoverPrimitives {
   createCutoverClone(
@@ -1953,7 +1952,7 @@ function cutoverPrimitives(service: RestreamerService): CutoverPrimitives {
   return service as unknown as CutoverPrimitives;
 }
 
-describe('cutover primitives (Stage B.2)', () => {
+describe('cutover primitives', () => {
   async function insertCutoverDrainingRow(
     h: Harness,
     fields: { channelId: string; fromPlacementId: string | null; toPlacementId: string; drainUntil: string },
@@ -2394,15 +2393,15 @@ describe('reconcileFailoverOnStartup: orphaned cutover artifact sweep', () => {
   });
 });
 
-// ---------- profile-change cutover routing (Stage B.3) ----------
+// ---------- profile-change cutover routing ----------
 //
-// The four interception sites (updateChannel's profileId flip = case A,
+// The four interception points (updateChannel's profileId flip = case A,
 // updatePlacement's profile-override flip = case B, updateProfile's payload
 // edit = case C, and applyChannelChanges' existing-placement UPDATE loop)
 // all funnel through the private routeProfileChange -- exercised here only
 // through the public surface, no structural cast needed.
 
-describe('profile-change cutover routing (Stage B.3)', () => {
+describe('profile-change cutover routing', () => {
   it('case A: a channel-level profile flip pins an inheriting placement to the OLD profile and clones onto the NEW one', async () => {
     const h = await setup(); // default config has a switcher
     const pOld = await h.service.createProfile('old', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
@@ -3490,16 +3489,16 @@ describe('tvh-less instance (url: null)', () => {
   });
 });
 
-// ---------- event-log emission: node push failed/healed (site #7) ----------
+// ---------- event-log emission: node push failed/healed ----------
 
-describe('RestreamerService: node push failed/healed event-log emission (site #7)', () => {
+describe('RestreamerService: node push failed/healed event-log emission', () => {
   it('logs a warning on the first push failure, nothing on a repeated failure, and a normal once it recovers', async () => {
     const h = await setup();
-    // this harness's config carries a switcher ('sw1') with no client wired up
-    // (site #11 territory) — filter this test's assertions down to node.zone1.n1
-    // logs so the two sites' coverage stay independent
+    // this harness's config also carries a switcher ('sw1') with no client
+    // wired up — filter this test's assertions down to node.zone1.n1 logs so
+    // node and switcher push coverage stay independent
     const nodeLogs = () => h.logs.filter((l) => l.source === 'node.zone1.n1');
-    // updateNodeStatus() (and therefore the cached-error read the site #7
+    // updateNodeStatus() (and therefore the cached-error read the push
     // transition guard relies on) is a no-op until the node has a cached
     // status entry — normally seeded by main.ts before any poller runs
     seedNodeStatusEntry(h.cache, 'zone1', 'n1');

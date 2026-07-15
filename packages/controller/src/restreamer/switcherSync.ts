@@ -92,11 +92,11 @@ function now(): string {
 
 export class SwitcherSync {
   /**
-   * Site #11 (switcher push failed/healed) transition state, keyed by
-   * switcherId. NOT read from cache.switchers.get(id)?.error — the
-   * SwitcherPoller overwrites that field every tick with its own reachability
-   * error, independent of push outcomes, so reading it here would spam or
-   * suppress the transition log depending on unrelated poll timing.
+   * Push fail/heal transition state, keyed by switcherId. NOT read from
+   * cache.switchers.get(id)?.error — the SwitcherPoller overwrites that field
+   * every tick with its own reachability error, independent of push outcomes,
+   * so reading it here would spam or suppress the transition log depending on
+   * unrelated poll timing.
    */
   private readonly pushProblems = new Map<string, string | null>();
 
@@ -269,9 +269,8 @@ export class SwitcherSync {
     force = false,
     precomputed?: ComputedSwitcherDoc,
   ): Promise<SwitcherPushResult> {
-    // site #11: switcher push failed/healed — read the dedicated
-    // pushProblems entry BEFORE this attempt overwrites it, mirroring
-    // pushNodeInner (site #7)
+    // read before overwrite: log push fail/heal as a transition, mirroring
+    // RestreamerService.pushNodeInner
     const prevError = this.pushProblems.get(switcherId) ?? null;
     try {
       const { doc, blocked } = precomputed ?? (await this.computeDoc());
@@ -314,9 +313,9 @@ export class SwitcherSync {
   }
 
   /**
-   * Site #11 (switcher push failed/healed): logs only on the null<->non-null
-   * transition, mirroring site #7 — a still-failing switcher retried by the
-   * 60s sweep must not spam a new warning every cycle.
+   * Switcher push failed/healed: logs only on the null<->non-null transition
+   * — a still-failing switcher retried by the 60s sweep must not spam a new
+   * warning every cycle.
    */
   private logSwitcherPushTransition(
     switcherId: string,
@@ -453,8 +452,7 @@ export class SwitcherSync {
     for (const move of moves) {
       const channelId = channelIdBySlug.get(move.slug);
       if (!channelId) continue;
-      // site #11: rebalance move queued/failed — controller-automatic, so
-      // always logged (never a user-initiated action)
+      // controller-automatic, so always logged (never a user-initiated action)
       const source = `switcher.${switcherBySlug.get(move.slug) ?? 'unknown'}`;
       try {
         await requestMove(channelId, move.toPlacementId, move.slug);

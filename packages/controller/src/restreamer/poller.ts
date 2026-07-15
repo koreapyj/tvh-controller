@@ -32,7 +32,7 @@ import type { InstanceCache } from '../state/instanceCache.js';
 import type { RestreamerClient, SwitcherClient } from './client.js';
 
 /**
- * Push-state hooks the pollers consume; RestreamerService (B3) provides real
+ * Push-state hooks the pollers consume; RestreamerService provides real
  * implementations backed by `restream_node_state`. All hooks are optional and
  * error-safe: a throwing hook never fails a poll tick.
  */
@@ -55,8 +55,8 @@ export interface RestreamerPollerHooks {
   /**
    * Fired (not awaited, errors swallowed) when a reachable node reports a
    * `desiredRevision` different from the expected one — e.g. a node that lost
-   * its state file. B3 wires this to an immediate push instead of waiting for
-   * the heal sweep.
+   * its state file. Wired to an immediate push instead of waiting for the
+   * heal sweep.
    */
   onRevisionMismatch?: (
     instanceId: string,
@@ -66,7 +66,7 @@ export interface RestreamerPollerHooks {
   /**
    * Fired (not awaited, errors swallowed) when the node's sources-catalog
    * hash actually changed — after a successful `/v1/sources` re-fetch or when
-   * a catalog disappeared. B2 wires this to a debounced push.
+   * a catalog disappeared. Wired to a debounced push.
    */
   onSourcesChanged?: (instanceId: string, nodeId: string) => void | Promise<void>;
   /**
@@ -120,9 +120,9 @@ export class RestreamerPoller {
   private lastSources: SourceCatalogEntry[] | null = null;
   /** fingerprint matching lastSources; null = no catalog / unknown */
   private lastSourcesHash: string | null = null;
-  /** site #8: per-session ffmpeg restart counts across polls */
+  /** per-session ffmpeg restart counts across polls */
   private readonly sessionRestarts = new Map<string, number>();
-  /** first-poll baseline guard (site 8): seeds sessionRestarts without logging on the first pass */
+  /** first-poll baseline guard: seeds sessionRestarts without logging on the first pass */
   private sessionBaselineSeeded = false;
 
   constructor(
@@ -216,8 +216,8 @@ export class RestreamerPoller {
 
     const snap = this.cache.get(this.instanceId);
     const idx = snap.restreamers.findIndex((r) => r.nodeId === this.node.id);
-    // site #6: restreamer node up/down — read prev reachable before overwriting.
-    // main.ts pre-seeds a reachable:false placeholder (lastPollAt: null) before
+    // read prev reachable before overwriting: main.ts pre-seeds a
+    // reachable:false placeholder (lastPollAt: null) before
     // this poller's first real tick — a prior entry with lastPollAt === null is
     // that placeholder, not a real prior observation, so it must not count as
     // a transition either (same "undefined" treatment as idx === -1).
@@ -235,7 +235,7 @@ export class RestreamerPoller {
     }
   }
 
-  /** site #6: restreamer node up/down — transition-based only */
+  /** restreamer node up/down — transition-based only */
   private logReachabilityTransition(
     prevReachable: boolean | undefined,
     status: RestreamerNodeStatus,
@@ -260,12 +260,12 @@ export class RestreamerPoller {
   }
 
   /**
-   * Site #8 (ffmpeg session restarts): per-session diff of SessionStatus.restarts
-   * across polls. First-poll baseline guard (sessionBaselineSeeded): the
-   * initial pass only seeds sessionRestarts, never logs — otherwise every
-   * controller restart would flood the log with pre-existing restart counts.
-   * Sessions that disappear are evicted so a later same-named session starts
-   * fresh instead of comparing against a stale count.
+   * Per-session diff of SessionStatus.restarts across polls. First-poll
+   * baseline guard (sessionBaselineSeeded): the initial pass only seeds
+   * sessionRestarts, never logs — otherwise every controller restart would
+   * flood the log with pre-existing restart counts. Sessions that disappear
+   * are evicted so a later same-named session starts fresh instead of
+   * comparing against a stale count.
    */
   private trackSessionRestarts(sessions: EnrichedSessionStatus[]): void {
     const seen = new Set<string>();
@@ -448,7 +448,7 @@ export class SwitcherPoller {
       };
     }
 
-    // site #6: switcher up/down — read prev reachable before overwriting
+    // read prev reachable before overwriting
     const prevReachable = this.cache.switchers.get(this.cfg.id)?.reachable;
     this.cache.switchers.set(this.cfg.id, status);
     this.logReachabilityTransition(prevReachable, status);
@@ -460,7 +460,7 @@ export class SwitcherPoller {
     }
   }
 
-  /** site #6: switcher up/down — transition-based only */
+  /** switcher up/down — transition-based only */
   private logReachabilityTransition(prevReachable: boolean | undefined, status: SwitcherNodeStatus): void {
     if (prevReachable === undefined || prevReachable === status.reachable) return;
     const source = `switcher.${this.cfg.id}`;

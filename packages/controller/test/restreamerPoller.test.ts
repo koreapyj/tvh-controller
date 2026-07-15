@@ -526,7 +526,7 @@ describe('RestreamerPoller', () => {
     expect(status).toHaveBeenCalledTimes(2);
   });
 
-  describe('event-log emission: node up/down (site #6)', () => {
+  describe('event-log emission: node up/down', () => {
     it('logs nothing on the very first poll (no prior state), then a normal/warning on each transition only', async () => {
       const { logs, status, poller } = setup();
       status.mockRejectedValue(new Error('down'));
@@ -593,7 +593,7 @@ describe('RestreamerPoller', () => {
     });
   });
 
-  describe('event-log emission: ffmpeg session restarts (site #8)', () => {
+  describe('event-log emission: ffmpeg session restarts', () => {
     function sess(name: string, over: Partial<SessionStatus> = {}): SessionStatus {
       return { name, state: 'running', enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0, ...over };
     }
@@ -746,7 +746,7 @@ describe('SwitcherPoller', () => {
     expect(status).toHaveBeenCalledTimes(1);
   });
 
-  describe('event-log emission: switcher up/down (site #6)', () => {
+  describe('event-log emission: switcher up/down', () => {
     it('logs nothing on the first poll, then a normal/warning only on transitions', async () => {
       const { logs, status, poller } = setupSwitcher();
       status.mockRejectedValue(new Error('down'));

@@ -801,20 +801,12 @@ migrations['020_placement_transient'] = {
   // (never user-created, never surfaced in the profile picker) so the apply
   // sweep and listProfiles() can exclude them.
   /*
-   * Resumable by design. MySQL/MariaDB DDL auto-commits per statement — the
-   * migrator cannot roll back a half-applied multi-statement migration on
-   * that dialect. If the process dies partway through up() (crash, deploy
-   * timeout, connection loss), the migrator records the run as failed but
-   * whatever DDL already landed stays landed. The next boot retries up()
-   * from the top: a naive re-run of `ADD COLUMN transient` then dies on
-   * "Duplicate column name", masking whatever actually killed the first
-   * attempt and wedging the deployment on every subsequent boot.
-   *
-   * Each step below therefore checks the live schema first and no-ops if
-   * that step's effect is already present, so a fresh run and a resumed run
-   * take the identical path — there's no separate "first attempt" code path
-   * to keep in sync. This costs one extra introspection query per step, only
-   * ever paid once (at migration time), against no ongoing cost.
+   * Resumable by design. MySQL/MariaDB DDL auto-commits per statement, so a
+   * crash partway through up() can leave some DDL already landed with no
+   * record of it beyond the live schema — a naive re-run would then die on
+   * "Duplicate column name" forever. Each step below checks the live schema
+   * first and no-ops if its effect is already present, so a fresh run and a
+   * resumed run take the identical path.
    */
   async up(db: Kysely<unknown>): Promise<void> {
     if (!(await columnExists(db, 'restream_placements', 'transient'))) {
@@ -852,26 +844,16 @@ migrations['020_placement_transient'] = {
       // builder's dropConstraint()/addUniqueConstraint() (which compile to
       // `DROP CONSTRAINT` / `ADD CONSTRAINT ... UNIQUE`).
       //
-      // MySQL vs MariaDB divergence that this index exists to paper over:
-      // channel_id's column-level `.references('restream_channels.id')`
-      // (008_restreamer) compiles to an inline `REFERENCES` clause on the
-      // column definition. MySQL parses that syntax and silently ignores it
-      // — no FK is actually created (verified on MySQL 8: SHOW CREATE TABLE
-      // has no FOREIGN KEY line, and deleting a channel leaves its
-      // placements orphaned). MariaDB 10.2.1+ instead HONORS the exact same
-      // inline REFERENCES clause and creates a real FK (channel_id ->
-      // restream_channels.id, ON DELETE CASCADE). Prod runs MariaDB, so
-      // that FK is real there, and InnoDB refuses to drop whichever index
-      // is currently satisfying it unless some other index already leads
-      // with the FK's column. uq_placements_channel_node (channel_id,
-      // instance_id, node_id[, transient]) is the only index that does, so
-      // `DROP INDEX uq_placements_channel_node` below fails with "needed in
-      // a foreign key constraint" the moment it's the sole anchor — which
-      // is exactly what happened in prod. Ensuring this plain, permanent
-      // stand-in index exists FIRST gives the FK somewhere else to anchor
-      // to, so the drop always succeeds; on FK-less MySQL it's simply an
-      // extra harmless index. It is never dropped again — not even in
-      // down() below — so every future migration that touches
+      // MySQL vs MariaDB divergence this index papers over: channel_id's
+      // column-level `.references('restream_channels.id')` (008_restreamer)
+      // compiles to an inline `REFERENCES` clause. MySQL silently ignores it
+      // (no FK is created); MariaDB 10.2.1+ honors it and creates a real FK.
+      // Prod runs MariaDB, so InnoDB refuses to drop uq_placements_channel_node
+      // once it's the FK's sole anchor. Ensuring this plain, permanent
+      // stand-in index exists FIRST gives the FK somewhere else to anchor to,
+      // so the drop always succeeds; on FK-less MySQL it's just an extra
+      // harmless index. It is never dropped again — not even in down() below
+      // — so every future migration that touches
       // uq_placements_channel_node inherits the same protection for free.
       if (!(await indexExists(db, 'restream_placements', 'idx_placements_channel_id'))) {
         await sql`create index idx_placements_channel_id on restream_placements (channel_id)`.execute(
@@ -903,10 +885,10 @@ migrations['020_placement_transient'] = {
         await rebuildPlacementsUniqueConstraint(db, narrowCols);
       }
     } else {
-      // Same MySQL-vs-MariaDB inline-REFERENCES trap as up() above (see the
-      // long comment there): ensure idx_placements_channel_id exists before
-      // dropping uq_placements_channel_node, so MariaDB's real FK always has
-      // somewhere else to anchor to. Left in place afterward, same as up().
+      // Same MySQL-vs-MariaDB inline-REFERENCES trap as up() above: ensure
+      // idx_placements_channel_id exists before dropping
+      // uq_placements_channel_node, so MariaDB's real FK always has
+      // somewhere else to anchor to.
       if (!(await indexExists(db, 'restream_placements', 'idx_placements_channel_id'))) {
         await sql`create index idx_placements_channel_id on restream_placements (channel_id)`.execute(
           db,

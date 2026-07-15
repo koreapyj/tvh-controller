@@ -18,7 +18,7 @@
 
 /**
  * Pure parsing/classification for tvheadend's comet `logmessage`
- * notifications (event log site #2). tvheadend only ever sends
+ * notifications. tvheadend only ever sends
  * `{ notificationClass: 'logmessage', logtxt }` — no severity metadata reaches
  * the client (tvheadend pre-filters to INFO+ before pushing). `logtxt` is
  * `"YYYY-MM-DD HH:MM:SS[.mmm] <subsystem>: <message>"`, occasionally prefixed

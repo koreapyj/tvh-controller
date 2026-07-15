@@ -2300,8 +2300,8 @@ describe('POST /api/restreamer/channels/:id/apply', () => {
   });
 
   it('persists placement profileId on new and existing placements; invalid type -> 400', async () => {
-    // no switcher -- this tests the DIRECT-write path; Stage B.3's
-    // switcher-fronted cutover routing is covered in restreamerService.test.ts
+    // no switcher -- this tests the DIRECT-write path; switcher-fronted
+    // cutover routing is covered in restreamerService.test.ts
     const h = await harness({ restreamer: { switchers: [] } });
     const channelProfile = await createProfile(h.app, 'channel-profile');
     const overrideProfile = await createProfile(h.app, 'override-profile');
@@ -2346,9 +2346,9 @@ describe('POST /api/restreamer/channels/:id/apply', () => {
   });
 });
 
-// ---------- batch edit playlistIds regression ----------
+// ---------- batch edit playlistIds ----------
 
-describe('POST /api/restreamer/channels/batch — playlistIds regression', () => {
+describe('POST /api/restreamer/channels/batch — playlistIds', () => {
   it('an edit patch carrying playlistIds replaces channel memberships', async () => {
     const h = await harness();
     const profile = await createProfile(h.app);

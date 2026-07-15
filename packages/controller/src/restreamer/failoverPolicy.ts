@@ -167,8 +167,8 @@ export function midProcedure(phase: FailoverPhase): boolean {
 }
 
 /**
- * Per-placement UI indicator for one failover row (the plan's mapping table).
- * Placements not named here are 'idle' — session-state fallback in the UI.
+ * Per-placement UI indicator for one failover row. Placements not named here
+ * are 'idle' — session-state fallback in the UI.
  */
 export function placementIndicators(row: {
   phase: FailoverPhase;

@@ -25,9 +25,9 @@ import { buildModel } from './buildModel.js';
 
 /** Recomputes conflict windows for an instance when its inputs change. */
 export class ConflictService {
-  /** site #13: per-instance conflict-window synthetic keys from the previous recompute() */
+  /** per-instance conflict-window synthetic keys from the previous recompute() */
   private readonly lastConflictKeys = new Map<string, Set<string>>();
-  /** first-poll baseline guard (site 13): instances already seeded once */
+  /** first-poll baseline guard: instances already seeded once */
   private readonly conflictBaselineSeeded = new Set<string>();
 
   constructor(
@@ -65,11 +65,9 @@ export class ConflictService {
   }
 
   /**
-   * Site #13 (capacity conflict window appeared/cleared): synthetic-key set
-   * diff per instance. First-poll baseline guard: the first recompute() for
-   * an instance only seeds lastConflictKeys, never logs — otherwise every
-   * controller restart would flood the log with conflicts that already
-   * existed before it started.
+   * Conflict appeared/cleared events: synthetic-key set diff per instance.
+   * The first recompute() for an instance only seeds lastConflictKeys, never
+   * logs — otherwise every controller restart would re-log standing conflicts.
    */
   private logConflictTransitions(instanceId: string, windows: ConflictWindow[]): void {
     const byKey = new Map(windows.map((w) => [this.conflictKey(instanceId, w), w]));

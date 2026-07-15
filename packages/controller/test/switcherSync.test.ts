@@ -747,7 +747,7 @@ describe('rebalanceTick', () => {
     await h.destroy();
   });
 
-  it('logs a normal event-log entry when a rebalance move is queued (site #11)', async () => {
+  it('logs a normal event-log entry when a rebalance move is queued', async () => {
     const h = await setup();
     seedNodeReachable(h, 'zone1', 'n1');
     seedNodeReachable(h, 'zone2', 'n1');
@@ -768,9 +768,9 @@ describe('rebalanceTick', () => {
   });
 });
 
-// ---------- event-log emission: switcher push failed/healed (site #11) ----------
+// ---------- event-log emission: switcher push failed/healed ----------
 
-describe('SwitcherSync: switcher push failed/healed event-log emission (site #11)', () => {
+describe('SwitcherSync: switcher push failed/healed event-log emission', () => {
   it('logs a warning on the first push failure, nothing on a repeat, and a normal once it recovers', async () => {
     const h = await setup();
     seedSwitcherStatus(h.cache, 'sw1', []); // updateStatus() is a no-op until a status entry exists

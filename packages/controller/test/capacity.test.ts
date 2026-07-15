@@ -163,7 +163,7 @@ describe('analyze', () => {
   });
 });
 
-// ---------- ConflictService: event-log emission (site #13) ----------
+// ---------- ConflictService: event-log emission ----------
 
 interface LoggedEvent {
   type: 'normal' | 'warning';
@@ -211,7 +211,7 @@ function setupConflicts() {
   return { cache, bus, logs, conflicts };
 }
 
-describe('ConflictService: capacity conflict appeared/cleared event-log emission (site #13)', () => {
+describe('ConflictService: capacity conflict appeared/cleared event-log emission', () => {
   it('baseline: nothing logged on the first recompute() even with a pre-existing conflict', () => {
     const { cache, logs, conflicts } = setupConflicts();
     cache.get('i1').upcoming = [dvrEntry('a', 'c1', 0, 100), dvrEntry('b', 'c2', 50, 150)];

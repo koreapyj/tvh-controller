@@ -340,7 +340,7 @@ describe('UploadDispatcher auto-retry sweep (Part 2b)', () => {
   });
 });
 
-describe('UploadDispatcher event-log emission (site #12)', () => {
+describe('UploadDispatcher event-log emission', () => {
   /** drives the private publish() choke point directly against a synthetic ledger row */
   async function publishJob(dispatcher: UploadDispatcher, ledger: FakeLedger, j: Partial<UploadJob>): Promise<void> {
     const merged = { ...(ledger.jobs.get(j.id as string) ?? {}), ...j } as UploadJob;
@@ -433,8 +433,8 @@ describe('UploadDispatcher event-log emission (site #12)', () => {
 
     // exercise the production sweep path directly (private-access pattern
     // already used elsewhere in this file) instead of hand-publishing the
-    // 'verifying' transition — this is the exact path that used to bypass
-    // publish() and so never emitted the site #12 event
+    // 'verifying' transition, to confirm the sweep path itself routes
+    // through publish() and emits the event
     await (dispatcher as unknown as { sweepRetries: () => Promise<void> }).sweepRetries();
     await (dispatcher as unknown as { instanceQueues: Map<string, Promise<void>> }).instanceQueues.get(
       'tyo1',

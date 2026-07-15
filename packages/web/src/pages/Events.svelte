@@ -84,10 +84,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   // ---------- fetching ----------
 
-  // latest-wins guard: URL restoration, filter changes, sort clicks, and SSE ticks can all
-  // start overlapping requests; this sequence number lets a stale response detect that a
-  // newer one has already landed and bail out instead of clobbering it. Plain let (not
-  // $state) since it's an internal bookkeeping counter, not something the template reads.
+  // latest-wins guard: bumped per fetch so a stale response can detect it's been superseded and bail out.
   let fetchSeq = 0;
 
   function listParams(off: number) {

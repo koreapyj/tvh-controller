@@ -491,9 +491,9 @@ describe('ProbeEngine: per-target period gating and pruning', () => {
   });
 });
 
-// ---------- event-log emission (site #5) ----------
+// ---------- event-log emission ----------
 
-describe('ProbeEngine: event-log emission (site #5)', () => {
+describe('ProbeEngine: event-log emission', () => {
   it('liveness: warns on trip, stays silent on repeated still-failing ticks, normal on clear', async () => {
     const s = setup();
     s.setTargets({ nodes: [nodeTarget('z1', 'n1', 'http://node1', ['ch1'])], placements: [] });

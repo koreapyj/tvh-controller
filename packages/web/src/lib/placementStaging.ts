@@ -52,9 +52,9 @@ export interface StagedPlacementInput {
 
 /**
  * seed the staging array from a channel's current placements, in priority
- * order — cutover-owned transient clones (Stage B.3) are never user-created
- * and are excluded from manual editing entirely; they come and go on their
- * own lifecycle (createCutoverClone / markCutoverComplete / drain-expiry)
+ * order — cutover-owned transient clones are never user-created and are
+ * excluded from manual editing entirely; they come and go on their own
+ * lifecycle (createCutoverClone / markCutoverComplete / drain-expiry)
  */
 export function seedStagedPlacements(placements: RestreamPlacement[]): StagedPlacement[] {
   return placements

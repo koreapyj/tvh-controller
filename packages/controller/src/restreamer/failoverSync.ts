@@ -282,15 +282,10 @@ export class FailoverSync {
    * reported active upstream, else the preferred (lowest-(priority,id))
    * enabled hot placement.
    *
-   * The third fallback NEVER returns a transient (cutover-owned) placement,
-   * even if it's the only hot one: a transient clone is machinery-owned and
-   * only ever "active" by way of an explicit failover-row target or the
-   * switcher's own report (the two prior fallbacks) — never inferred from
-   * bare priority order. A cutover clone starts out tied with `from` on
-   * (priority, mode='hot'), so without this guard the tie-break (lexically
-   * smallest id) is a coin flip: if it ever picked the clone, requestFailover
-   * would see the cutover's own target as already-active and silently drop
-   * the request, leaking the clone and pinning `from` forever.
+   * The third fallback never returns a transient (cutover-owned) placement —
+   * it starts tied with `from` on (priority, mode='hot'), so an unguarded
+   * tie-break could pick the clone and make requestFailover treat the
+   * cutover's own target as already-active, silently dropping the request.
    */
   private activePlacementOf(data: TickData, channelId: string): PlacementRow | null {
     const row = data.rows.get(channelId);
@@ -529,17 +524,10 @@ export class FailoverSync {
         // FK cascades cover hard deletes; this covers disable/mode churn.
         // Mid-procedure this is an abort — conservative and loss-minimal.
         if (row.trigger_reason === 'cutover' && to) {
-          // `to` is a transient clone that fell out of a valid cutover
-          // target here (its channel or the clone itself got disabled,
-          // rather than hard-deleted — a hard delete already leaves `to`
-          // undefined, and its row dies via the same FK cascade
-          // independently). Same leak class as requestReset's mid-cutover
-          // abort branch: reclaim it now instead of leaving it to encode
-          // forever until the next controller-restart orphan sweep. `from`'s
-          // frozen/snapshot profile pin is left alone — it's still
-          // referenced by `from`'s own live, non-transient placement row, so
-          // the startup orphan sweep for transient profiles won't reclaim it
-          // either.
+          // `to` is a transient clone whose channel/target got disabled
+          // rather than hard-deleted (a hard delete already leaves `to`
+          // undefined via FK cascade) — reclaim it now, or it encodes
+          // forever until the next controller-restart orphan sweep.
           await this.hooks.deleteCutoverPlacement?.(row.to_placement_id);
         }
         await this.deleteRow(channelId);
@@ -553,15 +541,10 @@ export class FailoverSync {
         const until = asMs(row.drain_until);
         if (until === null || nowMs >= until) {
           if (row.trigger_reason === 'cutover') {
-            // the retired encode's drain window elapsed — remove it (and its
-            // frozen/snapshot profile, if orphaned) now that the switcher has
-            // long since stopped sending it viewers. The clone can only be
-            // promoted to transient=0 AFTER `from` is gone: createCutoverClone
-            // always places it on `from`'s exact (channel_id, instance_id,
-            // node_id) triple, and the unique index is scoped over
-            // `transient` — promoting the clone while `from`'s transient=0
-            // row still holds that triple would collide with it. deleteRow
-            // below only clears the failover_state row, not the placement.
+            // promote only after `from` is gone: the clone shares `from`'s
+            // exact (channel_id, instance_id, node_id) triple, and the
+            // unique index is scoped over `transient` — promoting while
+            // `from`'s transient=0 row still holds that triple would collide.
             if (row.from_placement_id) {
               await this.hooks.deleteCutoverPlacement?.(row.from_placement_id);
             }
@@ -574,19 +557,12 @@ export class FailoverSync {
       }
     }
 
-    // stale blocked reasons for channels gone entirely (disabled or
-    // hard-deleted): beginNext sets `blocked` when a failover attempt fails
-    // to even START, which most of the time never creates a failover_state
-    // row — so a channel can go straight from "enabled, no eligible
-    // candidate" to disabled without ever getting one for the loop above to
-    // catch. scanTriggers can't reach these either, since it only walks
-    // data.channels (enabled channels). This sweep is the only place that
-    // does — it also keeps listChannels() (which does not filter by enabled)
-    // from surfacing a permanently stale "blocked" badge for a channel the
-    // operator turned off.
-    // Publish directly (not via `changed`, which also drives pushNodes/
-    // pushSwitchers) — nothing about node/switcher state changed here, only
-    // an in-memory bookkeeping entry for a channel that is no longer enabled.
+    // sweep stale `blocked` entries for channels gone entirely (disabled or
+    // hard-deleted): a failed admission rarely creates a failover_state row,
+    // so the loop above can't catch these, and scanTriggers only walks
+    // enabled channels — this is the only path that reclaims them, keeping
+    // listChannels() from showing a permanently stale badge. Published
+    // directly (not via `changed`): no node/switcher state actually moved.
     for (const channelId of [...this.blocked.keys()]) {
       if (data.channels.has(channelId)) continue;
       this.blocked.delete(channelId);
@@ -608,13 +584,8 @@ export class FailoverSync {
 
       const active = this.activePlacementOf(data, channelId);
       if (!active) {
-        // no active placement to evaluate a trigger against (every placement
-        // disabled since blocked was last set, or an all-cold channel with no
-        // placement to be "active" at all) — there's no trigger being
-        // evaluated, so any recorded blocked reason can't describe anything
-        // failing right now. (Channels gone entirely — disabled/hard-deleted
-        // — never reach this loop, since data.channels only holds enabled
-        // channels; rowHygiene's stale-blocked sweep covers those instead.)
+        // no active placement to evaluate a trigger against — nothing is
+        // failing right now, so any recorded blocked reason is stale.
         this.clearStaleBlocked(channelId);
         continue;
       }
@@ -639,10 +610,8 @@ export class FailoverSync {
         detail = lag.detail;
       }
       if (!reason) {
-        // trigger cleared (or never existed) — forget the backoff so a
-        // future incident is fresh, and drop any blocked reason recorded by
-        // the last attempt: it documented why THAT trigger couldn't act, and
-        // nothing is failing now for it to describe.
+        // trigger cleared (or never existed) — nothing failing now, so any
+        // recorded blocked reason is stale.
         this.clearStaleBlocked(channelId);
         continue;
       }
@@ -710,12 +679,10 @@ export class FailoverSync {
         const cand = this.candidateOf(data, target);
         if (!cand.admission.ok) {
           this.blocked.set(item.channelId, `${target.id}: ${cand.admission.detail}`);
-          // same backoff as the other two blocked-setting sites: an explicit
-          // target (manual switch / reset) is rejected on ITS OWN admission,
-          // which says nothing about whether the ACTIVE placement's trigger
-          // is failing — scanTriggers would otherwise see "no reason" against
-          // the (probably healthy) active placement and clear this message
-          // within a tick, even though the rejection reason hasn't changed.
+          // bump backoff: this rejection is about the explicit target's own
+          // admission, not the active placement's trigger — without it,
+          // scanTriggers would clear this message next tick even though
+          // nothing about the rejection actually changed.
           this.bumpBackoff(item.channelId);
           this.hooks.publishChannel(item.channelId);
           return;
@@ -773,7 +740,7 @@ export class FailoverSync {
     console.error(
       `restreamer: failover BEGIN for "${channel.slug}" (${item.reason}) — ${from?.id ?? '(none)'} → ${targetId}`,
     );
-    // site #4: automatic failover lifecycle — skip manual/reset (user-initiated)
+    // automatic failover lifecycle — skip manual/reset (user-initiated)
     if (item.reason !== 'manual' && item.reason !== 'reset') {
       this.events.log({
         type: 'warning',
@@ -938,9 +905,8 @@ export class FailoverSync {
       return;
     }
     if (row.trigger_reason === 'cutover') {
-      // the clone is the ONLY acceptable target for a cutover — never fall
-      // through to the normal candidate search and retarget onto some other
-      // standby placement (even a healthy, eligible one on another node)
+      // the clone is the only acceptable target for a cutover — never
+      // retarget onto some other standby placement
       await this.abortCutover(data, channelId, row, changed);
       return;
     }
@@ -949,7 +915,7 @@ export class FailoverSync {
       .filter((p) => p.id !== row.from_placement_id)
       .map((p) => this.candidateOf(data, p));
     const slug = data.channels.get(channelId)?.slug ?? channelId;
-    // site #4: automatic failover lifecycle — skip manual/reset (user-initiated)
+    // automatic failover lifecycle — skip manual/reset (user-initiated)
     const automatic = row.trigger_reason !== 'manual' && row.trigger_reason !== 'reset';
     const chosen = selectTarget(candidates, this.tried);
     if (chosen) {
@@ -1000,7 +966,7 @@ export class FailoverSync {
       await this.finishCutover(data, channelId, row, changed);
       return;
     }
-    // site #4: automatic failover lifecycle (complete) — skip manual/reset
+    // automatic failover lifecycle (complete) — skip manual/reset
     if (row.trigger_reason !== 'manual' && row.trigger_reason !== 'reset') {
       const slug = data.channels.get(channelId)?.slug ?? channelId;
       this.events.log({
@@ -1052,12 +1018,10 @@ export class FailoverSync {
   }
 
   /**
-   * A cutover in awaiting-lag never reaches here without a healthy clone —
-   * the clone is the ONLY acceptable target, so if it never becomes healthy
-   * the procedure aborts loss-free instead (see retargetOrAbort). `from` was
-   * never suppressed (the switch was never issued), so nothing was ever lost.
-   * No bumpBackoff/this.blocked — a cutover is a one-shot, explicitly
-   * requested procedure, not part of the automatic-retry loop those throttle.
+   * The clone is the only acceptable target for a cutover, so if it never
+   * becomes healthy the procedure aborts loss-free — `from` was never
+   * suppressed, so nothing was lost. No bumpBackoff/blocked: a cutover is a
+   * one-shot explicit request, not part of the automatic-retry loop.
    */
   private async abortCutover(
     data: TickData,
@@ -1083,19 +1047,12 @@ export class FailoverSync {
   }
 
   /**
-   * Cutover reached complete: move straight to 'draining', reusing the same
-   * drainGraceMs retained-window mechanism as a cold-outgoing automatic
-   * failover — the retiring `from` keeps encoding, still resolvable from this
-   * row, until the switcher's retained HLS window has fully drained;
-   * rowHygiene's draining-expiry branch then retires `from` AND promotes the
-   * clone (transient -> permanent) together via deleteCutoverPlacement /
-   * markCutoverComplete. The promotion is deliberately NOT done here: `from`
-   * and the clone share the same (channel_id, instance_id, node_id) triple
-   * (createCutoverClone always places it there), and the unique index is
-   * scoped over `transient` — promoting the clone to transient=0 while
-   * `from`'s transient=0 row is still present would collide with it. Unlike
-   * the generic site #4 path this ALWAYS logs — cutover is never
-   * 'manual'/'reset', so it's never eligible for that skip.
+   * Cutover reached complete: move to 'draining', reusing the same
+   * drainGraceMs window as a cold-outgoing automatic failover — `from` keeps
+   * encoding until the switcher's retained HLS window drains, then
+   * rowHygiene retires `from` and promotes the clone together (promoting
+   * here would collide with `from`'s still-present unique-index row).
+   * Always logs: a cutover is never 'manual'/'reset'.
    */
   private async finishCutover(
     data: TickData,
@@ -1168,19 +1125,10 @@ export class FailoverSync {
 
     if (!pastCommitPoint(row.phase) && midProcedure(row.phase)) {
       // before the commit point — revert loss-free: viewers were never moved.
-      // For a cutover row this is the same abort as abortCutover (the
-      // trigger never got as far as automatic exhaustion — an operator
-      // pressed reset instead) so it needs the same clone reclaim: to_placement_id
-      // is a transient clone, never a normal candidate, and nothing else will
-      // ever drive or clean it up once the row is gone — without this it
-      // leaks an ever-encoding clone until the next controller-restart orphan
-      // sweep. `from` is deliberately left pinned to its frozen/snapshot
-      // profile, same as abortCutover: retry-safe, a later profile edit
-      // re-triggers the pin. No event log for the reclaim: unlike the
-      // automatic-abort path (which logs a warning because nothing else
-      // reports the outcome), this abort is a direct result of the operator's
-      // own reset action, and per the event-log rule user-initiated actions
-      // are never logged.
+      // A cutover row needs the same clone reclaim as abortCutover here, or
+      // the transient clone leaks (encoding forever with nothing left to
+      // clean it up). No event log: this is a user-initiated reset, not an
+      // autonomous action.
       if (row.trigger_reason === 'cutover') {
         await this.hooks.deleteCutoverPlacement?.(row.to_placement_id);
       }

@@ -68,7 +68,7 @@ describe('seedStagedPlacements', () => {
     expect(seeded[1]).toMatchObject({ programNumber: '3' });
   });
 
-  it('excludes cutover-owned transient clones (Stage B.3) — never surfaced for manual editing', () => {
+  it('excludes cutover-owned transient clones — never surfaced for manual editing', () => {
     const seeded = seedStagedPlacements([
       placement({ id: 'a', priority: 1, transient: false }),
       placement({ id: 'clone', priority: 1, transient: true }),
@@ -198,7 +198,7 @@ describe('removedPlacementIds', () => {
     expect(removedPlacementIds(original, [])).toEqual(['a', 'b', 'c']);
   });
 
-  it('never reports a transient clone as removed, even though it was never staged (Stage B.3)', () => {
+  it('never reports a transient clone as removed, even though it was never staged', () => {
     const withClone = [...original, placement({ id: 'clone', transient: true })];
     const staged: StagedPlacement[] = original.map((p): StagedPlacement => ({
       id: p.id,

@@ -293,8 +293,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void close());
 
   await app.listen({ port: config.port, host: '0.0.0.0' });
-  // single explicit restart marker, replacing the per-component boot noise
-  // that site #1/#6 baseline guards now suppress (log() no-ops without a db)
+  // single explicit restart marker (log() no-ops without a db)
   eventLog.log({ type: 'normal', service: 'controller', source: 'controller', message: 'controller started' });
 }
 

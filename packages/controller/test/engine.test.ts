@@ -1532,9 +1532,9 @@ describe('tvh-less instances', () => {
   });
 });
 
-// ---------- event-log emission: drift (site #9) ----------
+// ---------- event-log emission: drift ----------
 
-describe('SyncEngine: drift event-log emission (site #9)', () => {
+describe('SyncEngine: drift event-log emission', () => {
   it('baseline: nothing logged on the first publishDrift even with pre-existing drift', async () => {
     const { destroy, engine, clients, pollers, logs } = await setup(['tyo1']);
     const rule = await engine.createRule({
@@ -1614,9 +1614,9 @@ describe('SyncEngine: drift event-log emission (site #9)', () => {
   });
 });
 
-// ---------- event-log emission: rule push error/blocked (site #10) ----------
+// ---------- event-log emission: rule push error/blocked ----------
 
-describe('SyncEngine: rule push error/blocked event-log emission (site #10)', () => {
+describe('SyncEngine: rule push error/blocked event-log emission', () => {
   it('logs one warning when a push is blocked, and none on a repeated still-blocked push', async () => {
     const { destroy, engine, cache, logs } = await setup(['tyo1']);
     cache.init('ext1', 'ext1', null); // tvh-less instance — pushRuleToInstance blocks unconditionally

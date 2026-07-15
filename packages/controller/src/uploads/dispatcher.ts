@@ -77,11 +77,10 @@ export class UploadDispatcher {
   private stopped = false;
   private retrySweepTimer: NodeJS.Timeout | null = null;
   /**
-   * Site #12 (upload failed/auto-retry/done) status-transition tracking, keyed
-   * by upload id. Terminal jobs (done/cancelled/superseded) are evicted once
-   * logged so this stays bounded; 'failed' stays tracked so a later auto-retry
-   * (failed -> verifying via sweepRetries) can still be detected as a
-   * transition.
+   * Event-log status-transition tracking, keyed by upload id. Terminal jobs
+   * (done/cancelled/superseded) are evicted once logged so this stays bounded;
+   * 'failed' stays tracked so a later auto-retry (failed -> verifying via
+   * sweepRetries) can still be detected as a transition.
    */
   private readonly uploadTrackedState = new Map<string, { status: UploadStatus; autoRetries: number }>();
 
@@ -164,10 +163,8 @@ export class UploadDispatcher {
         auto_retries: job.autoRetries + 1,
       });
       // route the transition through the same choke point retry()/driveInner
-      // use, so this real auto-retry publishes both the SSE 'upload-progress'
-      // event and the site #12 event-log entry (previously this sweep bumped
-      // the ledger directly, so the failed -> verifying transition was never
-      // observed by logUploadTransition)
+      // use, so this auto-retry publishes both the SSE 'upload-progress'
+      // event and the event-log transition (logUploadTransition)
       await this.publish(job.id);
       void this.drive(job.id, job.instanceId);
     }
@@ -262,10 +259,9 @@ export class UploadDispatcher {
   }
 
   /**
-   * Site #12 (upload failed/auto-retry/done): publish() is the single choke
-   * point every status change flows through, so it is the natural place to
-   * log TRANSITIONS only — progress-only publishes (same status, e.g. byte
-   * counters during 'uploading') must not log.
+   * publish() is the single choke point every status change flows through, so
+   * it is where upload events are logged as TRANSITIONS only — progress-only
+   * publishes (same status, e.g. byte counters during 'uploading') never log.
    * - into 'failed' = warning (failure_kind + error)
    * - into 'done' = normal
    * - 'failed' -> 'verifying' via the auto-retry sweep = normal; a MANUAL

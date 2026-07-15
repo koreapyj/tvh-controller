@@ -391,21 +391,21 @@ export class RestreamerService {
   /** dedup keys for `restreamer-channel` SSE publishes, by channel id */
   private readonly lastChannelPublishKey = new Map<string, string>();
   /**
-   * Site #7 (node push failed/healed) transition state, keyed by nodeKey().
-   * NOT read from cache.restreamers[].error — the RestreamerPoller overwrites
-   * that field every tick with its own reachability error, independent of
-   * push outcomes, so reading it here would spam or suppress the transition
-   * log depending on unrelated poll timing.
+   * Push fail/heal transition state, keyed by nodeKey(). NOT read from
+   * cache.restreamers[].error — the RestreamerPoller overwrites that field
+   * every tick with its own reachability error, independent of push outcomes,
+   * so reading it here would spam or suppress the transition log depending on
+   * unrelated poll timing.
    */
   private readonly pushProblems = new Map<string, string | null>();
   /** brief cache for the per-node probe settings map (probe base tick is 5s) */
   private probeSettingsCache: { at: number; map: Map<string, NodeProbeSettings> } | null = null;
   /**
    * brief cache for placementId -> channel slug (session display enrichment,
-   * site #8 + web). Populated on demand from a single query shared across
-   * every node's poll tick rather than a per-tick/per-session lookup; a few
-   * seconds of staleness after a channel/placement CRUD is fine — the next
-   * poll tick heals it.
+   * event messages + web). Populated on demand from a single query shared
+   * across every node's poll tick rather than a per-tick/per-session lookup;
+   * a few seconds of staleness after a channel/placement CRUD is fine — the
+   * next poll tick heals it.
    */
   private placementSlugCache: { at: number; map: Map<string, string> } | null = null;
   /** a switch was just ordered — main.ts wires this to SwitcherPoller.pollOnce */
@@ -568,14 +568,13 @@ export class RestreamerService {
     const payload =
       patch.payload !== undefined ? completeProfileParams(patch.payload) : existing.payload;
 
-    // Stage B.3: a payload edit rewrites this profile row IN PLACE (same id),
-    // so every placement currently rendering it -- via an explicit override
-    // OR by inheriting the channel's default -- is about to see new bytes.
-    // Route each such `from` through a same-node cutover clone when eligible,
-    // snapshotting the OLD payload onto `from` first so it keeps rendering
-    // exactly what it was before this call for the rest of the cutover; this
-    // MUST run before the UPDATE below, or a push racing this operation could
-    // observe `from` already reflecting the new payload while still unfrozen.
+    // A payload edit rewrites this profile row IN PLACE (same id), so every
+    // placement currently rendering it (explicit override or inherited
+    // default) is about to see new bytes. Route each such `from` through a
+    // same-node cutover clone when eligible, snapshotting the OLD payload
+    // onto `from` first. This MUST run before the UPDATE below, or a push
+    // racing this call could observe `from` already reflecting the new
+    // payload while still unfrozen.
     if (patch.payload !== undefined) {
       const affected = await this.placementsUsingProfile(id);
       for (const p of affected) {
@@ -604,10 +603,9 @@ export class RestreamerService {
       .execute();
     // re-push every node hosting a placement of a channel using this profile;
     // the switcher doc depends on the payload too (hls.segmentSeconds). This
-    // naturally covers cutover clones too: a clone's cloneProfileId mirrors
-    // `from`'s pre-freeze effective override, so it still matches the query
-    // below even though `from` itself no longer does (it's pinned to the
-    // snapshot now).
+    // also covers cutover clones: a clone's cloneProfileId mirrors `from`'s
+    // pre-freeze effective override, so it still matches the query below even
+    // though `from` itself is now pinned to the snapshot.
     if (patch.payload !== undefined) {
       await this.pushAffectedByProfileInner(id).catch((err) =>
         console.error('restreamer: profile re-push failed:', err),
@@ -1058,14 +1056,13 @@ export class RestreamerService {
       if (!profile) throw httpError(400, `profile ${patch.profileId} not found`);
       profileId = patch.profileId;
 
-      // Stage B.3: every placement that INHERITS the channel's default (no
-      // per-placement override) is about to flip to the new profile the
-      // instant the UPDATE below commits. Pin each one to the OLD profile id
-      // (and try a same-node cutover clone rendering the new one) BEFORE that
-      // UPDATE runs -- reversed order would leave a window where `from` is
-      // still unfrozen but the channel row already resolves to the new
-      // profile. Placement-level overrides are untouched: they don't inherit
-      // the channel default, so this flip doesn't change what they render.
+      // Every placement that inherits the channel's default (no per-placement
+      // override) is about to flip to the new profile once the UPDATE below
+      // commits. Pin each one to the OLD profile id (and try a same-node
+      // cutover clone) BEFORE that UPDATE runs, or there's a window where
+      // `from` is still unfrozen but the channel row already resolves to the
+      // new profile. Placement-level overrides are untouched — they don't
+      // inherit the channel default.
       const inheriting = await this.db
         .selectFrom('restream_placements')
         .selectAll()
@@ -1215,8 +1212,7 @@ export class RestreamerService {
     if (desired) {
       const keptIds = new Set(desired.filter((p) => p.id !== undefined).map((p) => p.id!));
       const sweepIds = existingPlacements.filter((p) => !keptIds.has(p.id)).map((p) => p.id);
-      // never sweep a placement an in-flight failover depends on (even with
-      // force) — B.2 extends this guard with the transient-clone flag
+      // never sweep a placement an in-flight failover depends on (even with force)
       const protectedIds = new Set(
         (await this.midProcedurePlacements(sweepIds)).map((b) => b.placementId),
       );
@@ -1229,13 +1225,10 @@ export class RestreamerService {
         if (protectedIds.has(pid) || transientIds.has(pid)) continue;
         await this.db.deleteFrom('restream_placements').where('id', '=', pid).execute();
       }
-      // Stage B.3: an existing-placement UPDATE where ONLY profileId differs
-      // from what's already on the row is a cutover candidate -- anything
-      // else in the same entry (a move, a priority/enabled/mode/program
-      // change alongside it) is a combined edit and always goes direct, to
-      // keep the scoping conservative. `byId` mirrors the one built above for
-      // validation, rebuilt here since this loop is a separate `if (desired)`
-      // block.
+      // An existing-placement UPDATE where ONLY profileId differs from what's
+      // already on the row is a cutover candidate; anything else changing
+      // alongside it (a move, priority/enabled/mode/program) is a combined
+      // edit and always goes direct, to keep the scoping conservative.
       const byId = new Map(existingPlacements.map((p) => [p.id, p]));
       for (const [index, p] of desired.entries()) {
         if (p.id !== undefined) {
@@ -1650,12 +1643,11 @@ export class RestreamerService {
 
     if (patch.profileId != null) await this.assertProfileExists(patch.profileId);
 
-    // Stage B.3: a pure profile-override flip (nothing else in the patch
-    // actually changes the row) is a cutover candidate -- try a same-node
-    // clone rendering the NEW override; on success, skip writing the new
-    // profile_id onto `from` at all (freeze:'none' -- there is no live
-    // profile ROW being edited here, so nothing needs pinning, `from` simply
-    // keeps its current profile_id untouched for the rest of the cutover).
+    // A pure profile-override flip (nothing else in the patch changes the
+    // row) is a cutover candidate — try a same-node clone rendering the NEW
+    // override; on success, skip writing profile_id onto `from` at all
+    // (freeze:'none' — no live profile row is being edited here, so `from`
+    // simply keeps its current profile_id for the rest of the cutover).
     let routed = false;
     if (
       !moved &&
@@ -1776,17 +1768,17 @@ export class RestreamerService {
     await this.pushAffectedByChannelSafe(channelId);
   }
 
-  // ---------- cutover (Stage B.2) ----------
+  // ---------- cutover ----------
   //
-  // These are internal primitives only — no public API, no trigger wiring yet
-  // (that's Stage B.3). They're composed by FailoverSync's cutover branches
-  // (via the markCutoverComplete/deleteCutoverPlacement hooks) and are meant
-  // to be driven directly by a future orchestrator that: (1) freezes `from`'s
-  // outgoing profile, (2) creates the clone via createCutoverClone, (3) calls
-  // requestFailover({ reason: 'cutover', toPlacementId: clone.id }). None of
-  // these primitives call assertNotMidProcedure — they're raw, targeted DB
-  // writes, not general placement CRUD, so the mid-procedure CRUD guard does
-  // not apply to them.
+  // Internal primitives with no public API of their own. Driven by
+  // routeProfileChange (below), which (1) freezes `from`'s outgoing profile,
+  // (2) creates the clone via createCutoverClone, (3) calls
+  // requestFailover({ reason: 'cutover', toPlacementId: clone.id }); also
+  // composed by FailoverSync's cutover branches via the
+  // markCutoverComplete/deleteCutoverPlacement hooks. None of these
+  // primitives call assertNotMidProcedure — they're raw, targeted DB writes,
+  // not general placement CRUD, so the mid-procedure CRUD guard does not
+  // apply to them.
 
   /**
    * With a switcher configured, every channel is uniformly fronted by it (see
@@ -1979,19 +1971,17 @@ export class RestreamerService {
   }
 
   /**
-   * Stage B.3: route a profile-only change away from overwriting `from` in
-   * place and toward a same-node dual-encode cutover, when eligible --
-   * eligible = switcher-fronted (needed to keep the viewer-facing URL
-   * resolving while both encodes run), `from` is enabled+hot (only a
-   * currently-serving placement is worth double-encoding for), and the
-   * channel has no OTHER in-flight failover procedure already. Ineligible,
-   * or a requestFailover that unexpectedly throws, both resolve to
-   * `{cutover:false}` -- every call site then applies the change directly to
-   * `from`, exactly as it did before B.3. Callers are responsible for the
-   * write-ordering half of the contract: run this BEFORE writing whatever
-   * would otherwise change `from`'s effective profile (the channel-flip
-   * UPDATE, the live profile-payload UPDATE, etc.) so no unguarded concurrent
-   * read can ever observe `from` mid-flight to the new value.
+   * Route a profile-only change away from overwriting `from` in place and
+   * toward a same-node dual-encode cutover, when eligible: switcher-fronted
+   * (needed to keep the viewer-facing URL resolving while both encodes run),
+   * `from` is enabled+hot (only a currently-serving placement is worth
+   * double-encoding for), and the channel has no other in-flight failover
+   * procedure. Ineligible, or a requestFailover that unexpectedly throws,
+   * both resolve to `{cutover:false}` — the caller then applies the change
+   * directly to `from`. Callers must run this BEFORE writing whatever would
+   * otherwise change `from`'s effective profile (the channel-flip UPDATE, the
+   * live profile-payload UPDATE, etc.) so no concurrent read can ever observe
+   * `from` mid-flight to the new value.
    */
   private async routeProfileChange(input: {
     from: {
@@ -2625,9 +2615,8 @@ export class RestreamerService {
     force = false,
   ): Promise<NodePushResult> {
     const base = { instanceId, nodeId };
-    // site #7: node push failed/healed — read the dedicated pushProblems
-    // entry BEFORE this attempt overwrites it, so the outcome can be logged
-    // as a transition (never on every 60s sweep retry of a still-down node)
+    // read before overwrite: log push fail/heal as a transition, not on
+    // every 60s sweep retry of a still-down node
     const key = nodeKey(instanceId, nodeId);
     const prevError = this.pushProblems.get(key) ?? null;
     try {
@@ -2660,8 +2649,7 @@ export class RestreamerService {
       }
       const client = this.clients.get(nodeKey(instanceId, nodeId));
       if (!client) {
-        // treated the same as a thrown push error (site #7) — updateNodeStatus
-        // here (previously skipped) keeps the cached status consistent
+        // treated the same as a thrown push error, to keep the cached status consistent
         this.updateNodeStatus(instanceId, nodeId, { pendingPush: true, error: 'no client configured for node' });
         this.pushProblems.set(key, 'no client configured for node');
         this.logPushTransition(instanceId, nodeId, prevError, 'no client configured for node');
@@ -2699,9 +2687,9 @@ export class RestreamerService {
   }
 
   /**
-   * Site #7 (node push failed/healed): logs only on the null<->non-null
-   * transition of the push outcome — a still-failing node re-attempted by the
-   * 60s sweep must not spam a new warning every cycle.
+   * Push fail/heal events: logs only on the null<->non-null transition of the
+   * push outcome — a still-failing node re-attempted by the 60s sweep must
+   * not spam a new warning every cycle.
    */
   private logPushTransition(
     instanceId: string,
@@ -3057,8 +3045,8 @@ export class RestreamerService {
 
   /**
    * placementId -> channel slug, briefly cached. Backs the session
-   * `channelSlug` display enrichment (site #8's event message + the web
-   * node-card session table) without a per-tick DB query.
+   * `channelSlug` display enrichment (session-restart event messages + the
+   * web node-card session table) without a per-tick DB query.
    */
   private async placementSlugMap(): Promise<Map<string, string>> {
     const nowMs = Date.now();
@@ -3167,21 +3155,15 @@ export class RestreamerService {
   /**
    * Startup-only orphan sweep (no periodic equivalent — orphaning only
    * happens mid-procedure-creation, which a running controller never leaves
-   * partial). A transient=1 placement is cutover-owned machinery: normally a
-   * restream_failover_state row (referencing it as to_placement_id while
-   * in-flight, or from_placement_id while draining) drives it to completion
-   * or cleanup. A crash between createCutoverClone and the requestFailover
-   * that would have created that row — or requestFailover itself mistaking
-   * the fresh clone for already-active via the bare-priority-order fallback
-   * (see FailoverSync.activePlacementOf) — leaks a clone with NO referencing
-   * row: nothing will ever drive or clean it up, and (being enabled+hot) it
-   * keeps encoding forever. Reclaim any such orphan, plus any transient
-   * profile snapshot left pointing at nothing once its owning placement is
-   * gone. Runs BEFORE FailoverSync.reconcileOnStartup's rowHygiene sees the
-   * final row set, so a placement whose row hygiene just dropped this same
-   * boot is caught too. Returns the reclaimed placements' node refs so
-   * callers can re-push those nodes' docs (the deleted clone was still in
-   * the desired set).
+   * partial). A transient=1 placement is normally driven to completion or
+   * cleanup by a restream_failover_state row referencing it. A crash between
+   * createCutoverClone and the requestFailover that would create that row
+   * leaks a clone with no referencing row: nothing will ever clean it up, and
+   * (being enabled+hot) it keeps encoding forever. Reclaim any such orphan,
+   * plus any transient profile snapshot left pointing at nothing. Runs BEFORE
+   * FailoverSync.reconcileOnStartup's rowHygiene sees the final row set, so a
+   * placement it just dropped this boot is caught too. Returns the reclaimed
+   * placements' node refs so callers can re-push those nodes' docs.
    */
   private async sweepOrphanedCutoverArtifacts(): Promise<NodeRef[]> {
     const transientPlacements = await this.db

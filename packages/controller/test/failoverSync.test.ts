@@ -495,9 +495,9 @@ describe('FailoverSync: full automatic procedure (lag trigger through completion
   });
 });
 
-// ---------- 1b. oldSessionGone matches the FROM placement id precisely (site #9) ----------
+// ---------- 1b. oldSessionGone matches the FROM placement id precisely ----------
 
-describe('FailoverSync: oldSessionGone matches the FROM placement id precisely (site #9 regression)', () => {
+describe('FailoverSync: oldSessionGone matches the FROM placement id precisely', () => {
   it('stays at awaiting-stop-confirm while a session named for the FROM placement id is present; an unrelated session name does not fool it', async () => {
     const h = await setup();
     const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
@@ -680,10 +680,9 @@ describe('FailoverSync: requestReset', () => {
     });
   });
 
-  it('regression: fails back to the first HOT placement even when a cold holds priority 1', async () => {
-    // the tvtokyo incident: priorities [1: cold, 2: hot, ...]; a failover
-    // landed on the priority-1 cold and Reset answered "already on its
-    // priority upstream" instead of failing back to the hot
+  it('fails back to the first HOT placement even when a cold holds priority 1', async () => {
+    // priorities [1: cold, 2: hot, ...]: Reset must fail back to the hot
+    // placement, not treat the cold priority-1 as already the target
     const h = await setup();
     const chanId = await insertChannel(h.db, { slug: 'tvtokyo' });
     const coldId = await insertPlacement(h.db, {
@@ -1038,9 +1037,9 @@ describe('FailoverSync: blocked auto-clear and explicit clearBlocked()', () => {
   });
 });
 
-// ---------- 8. event-log emission (site #4) ----------
+// ---------- 8. event-log emission ----------
 
-describe('FailoverSync: event-log emission (site #4)', () => {
+describe('FailoverSync: event-log emission', () => {
   it('warns on an automatic BEGIN and logs a normal on complete', async () => {
     const h = await setup();
     const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
@@ -1137,14 +1136,14 @@ describe('FailoverSync: event-log emission (site #4)', () => {
   });
 });
 
-// ---------- 9. cutover (Stage B.2) ----------
+// ---------- 9. cutover ----------
 //
-// Stage B.2 ships no trigger wiring — a cutover row is always created
-// directly (either via seedFailoverRowDirect + reconcileOnStartup(), which
+// These tests create a cutover row directly rather than through a real
+// trigger: either via seedFailoverRowDirect + reconcileOnStartup(), which
 // adopts a directly-seeded mid-procedure row as the active procedure without
 // going through beginNext, or via requestFailover's ordinary explicit-target
-// path, which is exercised once below to confirm reason:'cutover' needs no
-// special-casing there).
+// path, exercised once below to confirm reason:'cutover' needs no
+// special-casing there.
 
 describe('FailoverSync: cutover completion', () => {
   it('drives an explicit cutover through to complete, promoting the clone and entering draining', async () => {
@@ -1331,14 +1330,10 @@ describe('FailoverSync: cutover drain-expiry cleanup', () => {
 
 // ---------- 9b. reset mid-cutover must not leak the clone ----------
 //
-// requestReset's loss-free (pre-commit-point) abort branch is generic — it
-// predates cutover entirely — so before this fix it would delete the
-// failover_state row without ever calling deleteCutoverPlacement, leaking the
-// transient clone (it keeps encoding forever, reclaimed only by the next
-// controller-restart orphan sweep) and leaving `from` pinned to its
-// snapshot/frozen profile with nothing left to unpin it. An operator
-// hammering "reset" mid-cutover must get the exact same cleanup as the
-// automatic abortCutover path.
+// requestReset's loss-free (pre-commit-point) abort branch must reclaim a
+// cutover's transient clone just like the automatic abortCutover path —
+// otherwise the clone keeps encoding forever (reclaimed only by the next
+// controller-restart orphan sweep) with `from` left pinned to its snapshot.
 
 describe('FailoverSync: requestReset during an in-flight cutover (loss-free — mirrors abortCutover)', () => {
   it('reset before the commit point deletes the row, reclaims the clone, leaves `from` untouched, and logs nothing', async () => {
@@ -1474,19 +1469,14 @@ describe('FailoverSync: rowHygiene reclaims a cutover clone that falls out of va
 
 // ---------- 10. activePlacementOf never infers a transient clone as "active" ----------
 //
-// Regression for the live E2E bug: createCutoverClone copies `from`'s
-// priority and always uses mode:'hot', so a freshly-created clone TIES with
-// `from` in the (priority, id) order activePlacementOf's third fallback
-// falls back to before any failover row or switcher report names either one.
-// Whichever of the two has the lexically smaller id used to win that tie —
-// if it picked the clone, requestFailover's already-active early-exit would
-// silently drop the cutover request: no row ever created, so nothing ever
-// drives the clone to completion or cleans it up, and `from` never gets
-// unpinned from a frozen snapshot profile. The fix excludes transient
-// placements from that fallback outright.
+// createCutoverClone copies `from`'s priority and always uses mode:'hot', so
+// a freshly-created clone ties with `from` in the (priority, id) order that
+// activePlacementOf's third fallback uses before any failover row or
+// switcher report names either one — transient placements must be excluded
+// from that fallback outright, or the wrong one can be inferred active.
 
-describe('FailoverSync: activePlacementOf never infers a transient clone as "active" (tie-break regression)', () => {
-  /** clone id sorts lexically BEFORE from's id -- the exact ordering that used to win the coin flip */
+describe('FailoverSync: activePlacementOf never infers a transient clone as "active"', () => {
+  /** clone id sorts lexically BEFORE from's id, so it would win the (priority, id) tie if not excluded */
   const CLONE_ID = '0aaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
   const FROM_ID = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
 
@@ -1563,12 +1553,12 @@ describe('FailoverSync: activePlacementOf never infers a transient clone as "act
   });
 });
 
-// ---------- 12. reset-all recovery regression (fleet-wide probe-failure incident, end to end) ----------
+// ---------- 12. reset-all recovery flow, end to end ----------
 //
-// This is the operator's actual recovery move for a stuck-fleet incident:
-// hit reset on every affected channel. It must never get stuck behind
-// retriggerBackoff (that Map is scanTriggers-only) and a failed admission
-// attempt must leave the channel retryable, not wedged.
+// The operator's actual recovery move for a stuck-fleet incident: hit reset
+// on every affected channel. It must never get stuck behind retriggerBackoff
+// (that Map is scanTriggers-only) and a failed admission attempt must leave
+// the channel retryable, not wedged.
 
 describe('FailoverSync: reset-all recovery flow after a fleet-wide probe-failure incident', () => {
   it('requires-confirm -> force queues -> admission-reject sets blocked+backoff but stays retryable -> immediate retry succeeds once the node heals', async () => {

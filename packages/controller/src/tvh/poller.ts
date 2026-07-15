@@ -33,13 +33,13 @@ import { TvhClient } from './client.js';
 import { CometClient, type CometNotification } from './comet.js';
 import { classifyLogMessage, isNoisySubsystem, parseLogMessage } from './logMessage.js';
 
-/** site #2 (tvheadend log ingestion) rate limit: a bad mux can spew continuity
- * errors at 10+/sec — cap at LOG_RATE_LIMIT logged events per LOG_RATE_WINDOW_MS,
- * counting (not logging) the drops, then emitting one suppression summary. */
+/** tvheadend log rate limit: a bad mux can spew continuity errors at 10+/sec —
+ * cap at LOG_RATE_LIMIT logged events per LOG_RATE_WINDOW_MS, counting (not
+ * logging) the drops, then emitting one suppression summary. */
 const LOG_RATE_LIMIT = 20;
 const LOG_RATE_WINDOW_MS = 60_000;
 
-/** site #3 (recording failed) pure diff helper — exported for direct testing */
+/** recording-failed diff helper — exported for direct testing */
 export function diffNewFailures(prevUuids: ReadonlySet<string>, failed: TvhDvrEntry[]): TvhDvrEntry[] {
   return failed.filter((e) => !prevUuids.has(e.uuid));
 }
@@ -94,12 +94,12 @@ export class InstancePoller {
   onCapacityInputsChanged: (() => void) | null = null;
   onAutorecsChanged: (() => void) | null = null;
 
-  // ---- site #3 (recording failed) diff state ----
+  // ---- recording-failed diff state ----
   private failedUuids = new Set<string>();
-  /** first-poll baseline guard (site 3): seeds failedUuids without logging on the first pass */
+  /** first-poll baseline guard: seeds failedUuids without logging on the first pass */
   private failedBaselineSeeded = false;
 
-  // ---- site #2 (tvheadend log ingestion) rate-limit state ----
+  // ---- tvheadend log ingestion rate-limit state ----
   private logRateCount = 0;
   private logRateWindowStart = 0;
   private logRateDropped = 0;
@@ -191,7 +191,7 @@ export class InstancePoller {
     }
   }
 
-  // ---------- site #2: tvheadend log ingestion ----------
+  // ---------- tvheadend log ingestion ----------
 
   /**
    * tvheadend's own `logmessage` comet notification, ingested as event-log
@@ -214,7 +214,7 @@ export class InstancePoller {
   }
 
   /**
-   * Fixed-window rate limit for site #2: at most LOG_RATE_LIMIT events logged
+   * Fixed-window rate limit: at most LOG_RATE_LIMIT events logged
    * per LOG_RATE_WINDOW_MS. While capped, drops are only counted; when the
    * window next rolls over (on the following log line, if any) with drops>0,
    * one summary warning is emitted and the window resets.
@@ -351,7 +351,6 @@ export class InstancePoller {
     snap.summary.lastPollAt = new Date().toISOString();
     if (wasReachable !== snap.summary.reachable) {
       this.bus.publish({ type: 'instance-status', data: { ...snap.summary } });
-      // site #1: tvh instance up/down — transition-based (wasReachable already tracked)
       if (!firstObservation) {
         if (snap.summary.reachable) {
           this.events.log({
@@ -401,9 +400,8 @@ export class InstancePoller {
     if (dvrChanged(snap.finished, finished)) changed.push('finished');
     if (dvrChanged(snap.failed, failed)) changed.push('failed');
 
-    // site #3: recording failed — diff the failed grid by uuid; first-poll
-    // baseline guard (see failedBaselineSeeded) skips logging pre-existing
-    // failures on controller restart
+    // diff the failed grid by uuid; first-poll baseline guard (see
+    // failedBaselineSeeded) skips logging pre-existing failures on restart
     const newFailures = diffNewFailures(this.failedUuids, failed);
     if (this.failedBaselineSeeded) {
       for (const f of newFailures) {

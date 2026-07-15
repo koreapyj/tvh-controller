@@ -274,7 +274,6 @@ export class ProbeEngine {
     const prev = this.liveness.get(key);
     const next = applyProbeResult(prev, result, cfg.liveness, this.now(), detail);
     this.liveness.set(key, next);
-    // site #5: liveness trip/clear — transition-based only
     this.logProbeTransition('liveness', node.instanceId, node.nodeId, prev?.failed, next.failed, detail);
   }
 
@@ -294,7 +293,6 @@ export class ProbeEngine {
       ...next,
       lastSpeedRatio: m.speedRatio ?? prev?.lastSpeedRatio ?? null,
     });
-    // site #5: underspeed trip/clear — transition-based only
     this.logProbeTransition('underspeed', node.instanceId, node.nodeId, prev?.failed, next.failed, m.detail);
   }
 
@@ -436,7 +434,7 @@ export class ProbeEngine {
     };
     this.lag.set(p.placementId, merged);
     if (this.meaningfulChange(prev, merged)) this.onPlacementChange(p.channelId);
-    // site #5: lag trip/clear — channel-level, so the message must name the slug
+    // channel-level, so the message must name the slug
     this.logProbeTransition('lag', p.instanceId, p.nodeId, prev?.failed, merged.failed, merged.detail, p.slug);
   }
 
@@ -450,11 +448,11 @@ export class ProbeEngine {
   }
 
   /**
-   * Site #5 (probe trip/clear): logs only on a `failed` transition, never on
+   * Probe trip/clear events: logs only on a `failed` transition, never on
    * every tick. `prevFailed` undefined (never probed before) is treated as
    * "not failed" so a first-ever check that already fails still trips — the
    * counter-based hysteresis in probeState.ts already prevents flapping/spam,
-   * so this site does not need the first-poll baseline guard used elsewhere.
+   * so no first-poll baseline guard is needed here.
    */
   private logProbeTransition(
     kind: 'liveness' | 'underspeed' | 'lag',

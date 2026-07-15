@@ -17,14 +17,14 @@
  */
 
 /*
- * Event-log emission regressions for tvh/poller.ts (sites #1, #2, #3):
- *   - site #1 (instance up/down) and #2 (tvheadend log ingestion) are tested
- *     by constructing a REAL InstancePoller (its constructor does no network
+ * Event-log emission tests for tvh/poller.ts:
+ *   - instance up/down and tvheadend log ingestion are tested by
+ *     constructing a REAL InstancePoller (its constructor does no network
  *     I/O — TvhClient just stores config) with a real InstanceCache/EventBus
  *     and a capture-array `events` param, then invoking its private methods
  *     via a cast (same convention test/dispatcher.test.ts uses for
  *     UploadDispatcher internals).
- *   - site #3 (recording failed) additionally swaps the poller's `client`
+ *   - recording failed diffing additionally swaps the poller's `client`
  *     field for a fake exposing exactly the surface pollDvrAndStatus() calls
  *     — TS `readonly` is compile-time only, so this is a plain property
  *     overwrite, no network/mocking framework needed.
@@ -105,7 +105,7 @@ describe('classifyLogMessage', () => {
 });
 
 // ---------------------------------------------------------------------------
-// diffNewFailures (site #3 pure helper)
+// diffNewFailures (pure helper)
 // ---------------------------------------------------------------------------
 
 function dvrEntry(uuid: string, over: Partial<TvhDvrEntry> = {}): TvhDvrEntry {
@@ -163,7 +163,7 @@ function comet(poller: InstancePoller, n: CometNotification): void {
   (poller as unknown as { handleComet: (n: CometNotification) => void }).handleComet(n);
 }
 
-describe('InstancePoller: tvh instance up/down (site #1)', () => {
+describe('InstancePoller: tvh instance up/down', () => {
   it('the first observation (no prior poll) logs nothing; only later transitions log', () => {
     const { logs, poller } = setupPoller();
     const markReachable = (e: string | null): void =>
@@ -204,7 +204,7 @@ describe('InstancePoller: tvh instance up/down (site #1)', () => {
   });
 });
 
-describe('InstancePoller: tvheadend log ingestion (site #2)', () => {
+describe('InstancePoller: tvheadend log ingestion', () => {
   it('logs a normal event for a routine line, from a logmessage comet notification', () => {
     const { logs, poller } = setupPoller();
     comet(poller, {
@@ -268,7 +268,7 @@ describe('InstancePoller: tvheadend log ingestion (site #2)', () => {
   });
 });
 
-describe('InstancePoller: recording failed diff (site #3)', () => {
+describe('InstancePoller: recording failed diff', () => {
   interface FakeTvhDvrClient {
     dvrUpcoming: () => Promise<TvhDvrEntry[]>;
     dvrFinished: () => Promise<TvhDvrEntry[]>;
