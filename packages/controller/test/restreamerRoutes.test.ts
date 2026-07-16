@@ -20,7 +20,7 @@ import {
 } from '@tvhc/shared';
 import type { AppConfig } from '../src/config.js';
 import type { InstancePoller } from '../src/tvh/poller.js';
-import type { RestreamerClient, SwitcherClient } from '../src/restreamer/client.js';
+import type { RestreamerClient } from '../src/restreamer/client.js';
 import {
   RestreamerService,
   nodeKey,
@@ -34,6 +34,7 @@ import { EventBus } from '../src/state/events.js';
 import { InstanceCache, type TopologySnapshot } from '../src/state/instanceCache.js';
 import { createTestDb } from './support/testDb.js';
 import { fakeRestreamerNode } from './support/fakeRestreamerNode.js';
+import { FakeSwitcherHub, seedReplicaStatus } from './support/fakeSwitcherHub.js';
 
 // ---------- fixtures ----------
 
@@ -133,7 +134,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     pollIntervals: { dvr: 15_000, autorec: 60_000, topology: 600_000, epg: 600_000, restreamer: 15_000 },
     overlapThreshold: 0.7,
     autoUpload: { enabled: false, graceSeconds: 120 },
-    restreamer: { switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'http://sw.example' }] },
+    restreamer: { switcher: { publicUrl: 'http://sw.example' } },
     eventLogRetentionDays: 30,
     ...overrides,
   };
@@ -205,7 +206,7 @@ interface Harness {
   restartSession: ReturnType<typeof vi.fn>;
   sessionLog: ReturnType<typeof vi.fn>;
   resetSessionRestarts: ReturnType<typeof vi.fn>;
-  switchChannel: ReturnType<typeof vi.fn>;
+  hub: FakeSwitcherHub;
   tvhGetRaw: ReturnType<typeof vi.fn>;
   close: () => Promise<void>;
 }
@@ -234,12 +235,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
       } as unknown as RestreamerClient);
     }
   }
-  const switchChannel = vi.fn(async () => {});
-  const putDesired = vi.fn(async () => {});
-  const switcherClients = new Map<string, SwitcherClient>();
-  for (const sw of config.restreamer?.switchers ?? []) {
-    switcherClients.set(sw.id, { switchChannel, putDesired } as unknown as SwitcherClient);
-  }
+  const hub = new FakeSwitcherHub();
   const tvhGetRaw = vi.fn(
     async () => new Response('png', { status: 200, headers: { 'content-type': 'image/png' } }),
   );
@@ -247,8 +243,8 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
   for (const inst of config.instances) {
     tvhHttp.set(inst.id, { getRaw: tvhGetRaw } as unknown as TvhClient);
   }
-  // the service gets the switcher clients too (reset switching goes through it)
-  const service = new RestreamerService(db, cache, pollers, bus, config, clients, switcherClients);
+  // the service gets the switcher hub too (reset switching goes through it)
+  const service = new RestreamerService(db, cache, pollers, bus, config, clients, hub);
   const ctx = {
     config,
     db,
@@ -262,8 +258,6 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
     restreamer: service,
     restreamerClients,
     restreamerPollers: [],
-    switcherClients,
-    switcherPollers: [],
   } as unknown as AppContext;
   const app = Fastify();
   registerRestreamerRoutes(app, ctx);
@@ -276,7 +270,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
     restartSession,
     sessionLog,
     resetSessionRestarts,
-    switchChannel,
+    hub,
     tvhGetRaw,
     close: async () => {
       await app.close();
@@ -768,16 +762,9 @@ describe('POST /api/restreamer/channels/:id/switch', () => {
       upstreams: Array<{ id: string; healthy: boolean }>;
     }>,
   ): void {
-    h.cache.switchers.set('sw1', {
-      switcherId: 'sw1',
-      url: 'http://sw1:5581',
-      publicUrl: 'http://sw.example',
-      reachable: true,
-      error: null,
-      lastPollAt: null,
-      version: '1.0.0',
-      pendingPush: false,
+    seedReplicaStatus(h.cache, {
       channels: channels.map((c) => ({ ...c, lastSwitch: null })),
+      publicUrl: 'http://sw.example',
     });
   }
 
@@ -1311,7 +1298,7 @@ describe('GET /playlists/:slug.m3u', () => {
   it('config restreamer.publicUrl wins over forwarded headers as the logo-proxy base', async () => {
     const h = await harness({
       restreamer: {
-        switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'http://sw.example' }],
+        switcher: { publicUrl: 'http://sw.example' },
         publicUrl: 'https://pub.example',
       },
     });
@@ -2165,52 +2152,66 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/probes', () => {
 // ---------- per-node session capacity ----------
 
 describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/settings', () => {
-  it('GET returns {maxSessions: null} when no row is stored', async () => {
+  it('GET returns {maxSessions: null, initialDelaySec: null} when no row is stored', async () => {
     const { app } = await harness();
     const res = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n1/settings' });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ maxSessions: null });
+    expect(res.json()).toEqual({ maxSessions: null, initialDelaySec: null });
   });
 
-  it('PUT persists a non-negative integer; a later GET reflects it, and a different node is unaffected', async () => {
+  it('PUT persists both fields; a later GET reflects them, and a different node is unaffected', async () => {
     const { app } = await harness();
     const put = await app.inject({
       method: 'PUT',
       url: '/api/restreamer/nodes/zone1/n1/settings',
-      payload: { maxSessions: 3 },
+      payload: { maxSessions: 3, initialDelaySec: 45 },
     });
     expect(put.statusCode).toBe(200);
-    expect(put.json()).toEqual({ maxSessions: 3 });
+    expect(put.json()).toEqual({ maxSessions: 3, initialDelaySec: 45 });
 
     const get = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n1/settings' });
-    expect(get.json()).toEqual({ maxSessions: 3 });
+    expect(get.json()).toEqual({ maxSessions: 3, initialDelaySec: 45 });
     const other = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n2/settings' });
-    expect(other.json()).toEqual({ maxSessions: null });
+    expect(other.json()).toEqual({ maxSessions: null, initialDelaySec: null });
   });
 
-  it('PUT accepts 0 (fully capped) and explicit null (clears back to uncapped)', async () => {
+  it('PUT accepts 0 for maxSessions (fully capped) and explicit null for both (clears back to defaults)', async () => {
     const { app } = await harness();
     const zero = await app.inject({
       method: 'PUT',
       url: '/api/restreamer/nodes/zone1/n1/settings',
-      payload: { maxSessions: 0 },
+      payload: { maxSessions: 0, initialDelaySec: null },
     });
     expect(zero.statusCode).toBe(200);
-    expect(zero.json()).toEqual({ maxSessions: 0 });
+    expect(zero.json()).toEqual({ maxSessions: 0, initialDelaySec: null });
 
     const cleared = await app.inject({
       method: 'PUT',
       url: '/api/restreamer/nodes/zone1/n1/settings',
-      payload: { maxSessions: null },
+      payload: { maxSessions: null, initialDelaySec: null },
     });
     expect(cleared.statusCode).toBe(200);
-    expect(cleared.json()).toEqual({ maxSessions: null });
+    expect(cleared.json()).toEqual({ maxSessions: null, initialDelaySec: null });
+  });
+
+  it('PUT accepts a positive initialDelaySec and round-trips it alongside maxSessions', async () => {
+    const { app } = await harness();
+    const put = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/settings',
+      payload: { maxSessions: null, initialDelaySec: 12 },
+    });
+    expect(put.statusCode).toBe(200);
+    expect(put.json()).toEqual({ maxSessions: null, initialDelaySec: 12 });
+
+    const get = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/n1/settings' });
+    expect(get.json()).toEqual({ maxSessions: null, initialDelaySec: 12 });
   });
 
   it('PUT with an invalid body -> 400: negative, non-integer, wrong type, missing key, non-object', async () => {
     const { app } = await harness();
     const bad = [-1, 1.5, '6', undefined].map((maxSessions) =>
-      maxSessions === undefined ? {} : { maxSessions },
+      maxSessions === undefined ? { initialDelaySec: null } : { maxSessions, initialDelaySec: null },
     );
     for (const payload of bad) {
       const res = await app.inject({ method: 'PUT', url: '/api/restreamer/nodes/zone1/n1/settings', payload });
@@ -2220,7 +2221,7 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/settings', () => {
     const nullOk = await app.inject({
       method: 'PUT',
       url: '/api/restreamer/nodes/zone1/n1/settings',
-      payload: { maxSessions: null },
+      payload: { maxSessions: null, initialDelaySec: null },
     });
     expect(nullOk.statusCode).toBe(200);
 
@@ -2233,6 +2234,30 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/settings', () => {
     expect(nonObject.statusCode).toBe(400);
   });
 
+  it('PUT with an invalid initialDelaySec -> 400: zero, negative, non-integer, wrong type, missing key', async () => {
+    const { app } = await harness();
+    const bad = [0, -1, 1.5, '6', undefined].map((initialDelaySec) =>
+      initialDelaySec === undefined ? { maxSessions: null } : { maxSessions: null, initialDelaySec },
+    );
+    for (const payload of bad) {
+      const res = await app.inject({ method: 'PUT', url: '/api/restreamer/nodes/zone1/n1/settings', payload });
+      expect(res.statusCode).toBe(400);
+    }
+    // explicit null and a positive integer ARE valid
+    const nullOk = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/settings',
+      payload: { maxSessions: null, initialDelaySec: null },
+    });
+    expect(nullOk.statusCode).toBe(200);
+    const positiveOk = await app.inject({
+      method: 'PUT',
+      url: '/api/restreamer/nodes/zone1/n1/settings',
+      payload: { maxSessions: null, initialDelaySec: 1 },
+    });
+    expect(positiveOk.statusCode).toBe(200);
+  });
+
   it('an unknown node -> 400 on both GET and PUT', async () => {
     const { app } = await harness();
     const get = await app.inject({ method: 'GET', url: '/api/restreamer/nodes/zone1/ghost/settings' });
@@ -2240,7 +2265,7 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/settings', () => {
     const put = await app.inject({
       method: 'PUT',
       url: '/api/restreamer/nodes/zone1/ghost/settings',
-      payload: { maxSessions: 1 },
+      payload: { maxSessions: 1, initialDelaySec: null },
     });
     expect(put.statusCode).toBe(400);
   });
@@ -2393,7 +2418,7 @@ describe('POST /api/restreamer/channels/:id/apply', () => {
   it('persists placement profileId on new and existing placements; invalid type -> 400', async () => {
     // no switcher -- this tests the DIRECT-write path; switcher-fronted
     // cutover routing is covered in restreamerService.test.ts
-    const h = await harness({ restreamer: { switchers: [] } });
+    const h = await harness({ restreamer: {} });
     const channelProfile = await createProfile(h.app, 'channel-profile');
     const overrideProfile = await createProfile(h.app, 'override-profile');
     const created = await h.app.inject({
@@ -2505,21 +2530,11 @@ describe('POST /api/restreamer/nodes/:instanceId/:nodeId/sessions/:name/restarts
 // ---------- nodes / no-DB mode ----------
 
 describe('restreamer nodes + overview-only mode', () => {
-  it('GET /api/restreamer/nodes lists cache statuses and switchers (no DB required)', async () => {
+  it('GET /api/restreamer/nodes lists cache statuses and the aggregate switcher entry (no DB required)', async () => {
     const cache = new InstanceCache();
     cache.init('zone1', 'zone1', 'http://zone1:9981');
     seedNodeStatus(cache, 'zone1', 'n1', [sessionStatus('at-x')]);
-    cache.switchers.set('sw1', {
-      switcherId: 'sw1',
-      url: 'http://sw1:5581',
-      publicUrl: 'http://sw.example',
-      reachable: true,
-      error: null,
-      lastPollAt: null,
-      version: '0.0.0-test',
-      pendingPush: false,
-      channels: [],
-    });
+    seedReplicaStatus(cache, { channels: [], publicUrl: 'http://sw.example', replicaCount: 2 });
     const ctx = {
       config: makeConfig(),
       cache,
@@ -2534,9 +2549,10 @@ describe('restreamer nodes + overview-only mode', () => {
 
     const nodes = await app.inject({ method: 'GET', url: '/api/restreamer/nodes' });
     expect(nodes.statusCode).toBe(200);
-    const body = nodes.json() as { nodes: unknown[]; switchers: unknown[] };
+    const body = nodes.json() as { nodes: unknown[]; switchers: Array<{ replicaCount?: number }> };
     expect(body.nodes).toHaveLength(1);
     expect(body.switchers).toHaveLength(1);
+    expect(body.switchers[0]!.replicaCount).toBe(2);
 
     // DB-backed routes 503 in overview-only mode
     for (const url of ['/api/restreamer/profiles', '/api/restreamer/channels', '/playlists/tv.m3u']) {

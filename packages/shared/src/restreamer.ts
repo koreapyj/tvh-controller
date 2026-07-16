@@ -68,7 +68,15 @@ export interface NodeProbeSettings {
 export interface NodeSettings {
   /** null = uncapped; 0 = admit no new sessions */
   maxSessions: number | null;
+  /**
+   * On-demand start grace for encodes launched on this node — how long a
+   * master-playlist fetch keeps the wake-up armed before the first
+   * media-playlist fetch must arrive; null = default.
+   */
+  initialDelaySec: number | null;
 }
+
+export const ON_DEMAND_INITIAL_DELAY_DEFAULT_SEC = 30;
 
 /**
  * Live probe counters. `failed` trips after failureThreshold consecutive
@@ -124,7 +132,8 @@ export type FailoverTriggerReason =
   | 'manual'
   | 'reset'
   | 'rebalance'
-  | 'cutover';
+  | 'cutover'
+  | 'on-demand';
 
 /**
  * UI indicator for one placement badge: yellow transitions
@@ -296,4 +305,6 @@ export interface SwitcherNodeStatus {
   /** the controller has a desired doc for this switcher that isn't confirmed pushed */
   pendingPush: boolean;
   channels: SwitcherChannelStatus[];
+  /** number of connected switcher replicas backing this aggregate status entry */
+  replicaCount?: number;
 }

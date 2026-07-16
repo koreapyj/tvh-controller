@@ -188,6 +188,7 @@ export interface RestreamNodeSettingsTable {
   instance_id: string;
   node_id: string;
   max_sessions: number | null;
+  initial_delay_sec: number | null;
   updated_at: ColumnType<Date, string, string>;
 }
 
@@ -211,17 +212,6 @@ export interface RestreamPlaylistsTable {
 export interface RestreamPlaylistMembersTable {
   playlist_id: string;
   channel_id: string;
-}
-
-/**
- * push state for switcher desired docs, parallel to restream_node_state.
- * Active upstream selection is NOT stored here — the switcher's own state
- * file is authoritative; the controller mirrors it via status poll.
- */
-export interface RestreamSwitcherStateTable {
-  switcher_id: string;
-  pushed_hash: string;
-  pushed_at: ColumnType<Date, string, string>;
 }
 
 /** persisted history row: failovers, outages, drift, failed pushes etc */
@@ -249,6 +239,5 @@ export interface Database {
   restream_node_state: RestreamNodeStateTable;
   restream_playlists: RestreamPlaylistsTable;
   restream_playlist_members: RestreamPlaylistMembersTable;
-  restream_switcher_state: RestreamSwitcherStateTable;
   event_log: EventLogTable;
 }

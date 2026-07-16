@@ -71,7 +71,7 @@ import {
   type FailoverCandidate,
 } from './failoverPolicy.js';
 import type { ProbeSnapshot } from './probeEngine.js';
-import type { SwitcherNodeClient } from './switcherSync.js';
+import { SWITCHER_CACHE_KEY, type SwitcherHubLike } from './switcherHubTypes.js';
 
 export { FAILOVER_TICK_MS } from './failoverPolicy.js';
 
@@ -86,8 +86,6 @@ export interface FailoverSyncHooks {
   pushNodes(nodes: FailoverNodeRef[]): Promise<void>;
   pushSwitchers(): Promise<void>;
   publishChannel(channelId: string): void;
-  /** a switch was just ordered — poke the switcher poller so confirmation isn't stuck behind its 15s cadence */
-  onSwitchIssued?(): void;
   /** cutover complete: promote the clone (transient=1 -> 0) into a permanent, ordinary placement */
   markCutoverComplete?(placementId: string): Promise<void>;
   /** cutover abort/drain cleanup: delete a placement (+ its orphaned transient profile, if any) */
@@ -191,7 +189,7 @@ export class FailoverSync {
     private readonly db: Db,
     private readonly cache: InstanceCache,
     private readonly config: AppConfig,
-    private readonly switcherClients: Map<string, SwitcherNodeClient>,
+    private readonly hub: SwitcherHubLike,
     private readonly probes: () => ProbeSnapshot,
     private readonly settings: () => Promise<Map<string, NodeProbeSettings>>,
     private readonly hooks: FailoverSyncHooks,
@@ -289,6 +287,15 @@ export class FailoverSync {
    * reported active upstream, else the preferred (lowest-(priority,id))
    * enabled hot placement.
    *
+   * The switcher-report fallback only honors a HOT placement: a cold one is
+   * only ever active via a failover row — which the first fallback already
+   * covers — so a cold id in the switcher's report is the doc's pre-seeded
+   * idle selection (embedded activeUpstreamId), not a running encode.
+   * An idle all-cold channel therefore resolves to null (the third fallback
+   * requires hot too): scanTriggers skips it, and an on-demand start begins
+   * with from=null, leaving every enabled placement a candidate so
+   * selectTarget picks the preferred one.
+   *
    * The third fallback never returns a transient (cutover-owned) placement —
    * it starts tied with `from` on (priority, mode='hot'), so an unguarded
    * tie-break could pick the clone and make requestFailover treat the
@@ -302,12 +309,12 @@ export class FailoverSync {
     }
     const slug = data.channels.get(channelId)?.slug;
     if (slug) {
-      for (const sw of this.config.restreamer?.switchers ?? []) {
-        const chan = this.cache.switchers.get(sw.id)?.channels.find((c) => c.slug === slug);
-        if (chan?.activeUpstreamId) {
-          const p = data.placementById.get(chan.activeUpstreamId);
-          if (p && p.channel_id === channelId) return p;
-        }
+      const chan = this.cache.switchers
+        .get(SWITCHER_CACHE_KEY)
+        ?.channels.find((c) => c.slug === slug);
+      if (chan?.activeUpstreamId) {
+        const p = data.placementById.get(chan.activeUpstreamId);
+        if (p && p.channel_id === channelId && p.mode === 'hot') return p;
       }
     }
     const list = data.placementsByChannel.get(channelId) ?? [];
@@ -327,15 +334,11 @@ export class FailoverSync {
     return real.find((p) => p.mode === 'hot') ?? real[0] ?? null;
   }
 
-  private switcherReport(slug: string): {
-    switcherId: string;
-    activeUpstreamId: string | null;
-  } | null {
-    for (const sw of this.config.restreamer?.switchers ?? []) {
-      const chan = this.cache.switchers.get(sw.id)?.channels.find((c) => c.slug === slug);
-      if (chan) return { switcherId: sw.id, activeUpstreamId: chan.activeUpstreamId };
-    }
-    return null;
+  private switcherReport(slug: string): { activeUpstreamId: string | null } | null {
+    const chan = this.cache.switchers
+      .get(SWITCHER_CACHE_KEY)
+      ?.channels.find((c) => c.slug === slug);
+    return chan ? { activeUpstreamId: chan.activeUpstreamId } : null;
   }
 
   /** the switcher's own health/lag view of one upstream (lag-probe-disabled fallback) */
@@ -343,12 +346,10 @@ export class FailoverSync {
     slug: string,
     upstreamId: string,
   ): { healthy: boolean; playlistLagSec?: number } | null {
-    for (const sw of this.config.restreamer?.switchers ?? []) {
-      const chan = this.cache.switchers.get(sw.id)?.channels.find((c) => c.slug === slug);
-      const up = chan?.upstreams.find((u) => u.id === upstreamId);
-      if (up) return up;
-    }
-    return null;
+    const chan = this.cache.switchers
+      .get(SWITCHER_CACHE_KEY)
+      ?.channels.find((c) => c.slug === slug);
+    return chan?.upstreams.find((u) => u.id === upstreamId) ?? null;
   }
 
   // -------------------------------------------------------------------------
@@ -746,8 +747,10 @@ export class FailoverSync {
     console.error(
       `restreamer: failover BEGIN for "${channel.slug}" (${item.reason}) — ${from?.id ?? '(none)'} → ${targetId}`,
     );
-    // automatic failover lifecycle — skip manual/reset (user-initiated)
-    if (item.reason !== 'manual' && item.reason !== 'reset') {
+    // lifecycle logging is skipped when the initiator owns it: user-initiated
+    // procedures (manual/reset) are never event-logged, and on-demand
+    // start/stop is logged by the on-demand engine
+    if (item.reason !== 'manual' && item.reason !== 'reset' && item.reason !== 'on-demand') {
       this.events.log({
         type: 'warning',
         service: 'restreamer',
@@ -810,7 +813,6 @@ export class FailoverSync {
         await this.setPhase(channelId, 'awaiting-switch-confirm');
         row!.phase = 'awaiting-switch-confirm';
         this.phaseEnteredAtMs = this.now().getTime();
-        this.hooks.onSwitchIssued?.();
         this.hooks.publishChannel(channelId);
         continue;
       }
@@ -887,20 +889,20 @@ export class FailoverSync {
     };
   }
 
+  /**
+   * Broadcast the switch to every connected replica. Zero connections =
+   * not issued — the caller retries next tick, and once confirmation is
+   * awaited the SWITCH_REISSUE_MS loop re-broadcasts (a replica that
+   * reconnects meanwhile also converges via the doc it receives on connect).
+   */
   private async issueSwitch(slug: string, toPlacementId: string): Promise<boolean> {
-    const report = this.switcherReport(slug);
-    const client = report
-      ? this.switcherClients.get(report.switcherId)
-      : this.switcherClients.values().next().value;
-    if (!client) return false;
-    try {
-      await client.switchChannel(slug, toPlacementId);
-      this.lastSwitchIssueMs = this.now().getTime();
-      return true;
-    } catch (err) {
-      console.error(`restreamer: failover switch for "${slug}" failed:`, err);
+    const sent = this.hub.broadcastSwitch(slug, toPlacementId);
+    if (sent === 0) {
+      console.error(`restreamer: failover switch for "${slug}" failed: no switcher replicas connected`);
       return false;
     }
+    this.lastSwitchIssueMs = this.now().getTime();
+    return true;
   }
 
   /** pick the next untried candidate, or abort loss-free (nothing switched yet) */
@@ -972,8 +974,11 @@ export class FailoverSync {
       await this.finishCutover(data, channelId, row, changed);
       return;
     }
-    // automatic failover lifecycle (complete) — skip manual/reset
-    if (row.trigger_reason !== 'manual' && row.trigger_reason !== 'reset') {
+    // lifecycle logging is skipped when the initiator owns it: user-initiated
+    // procedures (manual/reset) are never event-logged, and on-demand
+    // start/stop is logged by the on-demand engine (a "failover complete"
+    // line for a routine channel-open would be noise)
+    if (row.trigger_reason !== 'manual' && row.trigger_reason !== 'reset' && row.trigger_reason !== 'on-demand') {
       const slug = data.channels.get(channelId)?.slug ?? channelId;
       this.events.log({
         type: 'normal',
@@ -1207,6 +1212,25 @@ export class FailoverSync {
       explicitTargetId: natural.id,
     });
     return { ok: true, queued: true };
+  }
+
+  /**
+   * Release an on-demand activation row whose viewer demand has expired: the
+   * row is deleted and the follow-up node push stops the encode. A channel
+   * with a procedure active/queued, or whose row is mid-procedure, is left
+   * alone — the release re-evaluates after the procedure settles. No event
+   * log here; the caller owns the demand-expiry logging.
+   */
+  async releaseOnDemand(channelId: string): Promise<void> {
+    if (this.active === channelId || this.queuedIds.has(channelId)) return;
+    const data = await this.loadData();
+    const row = data.rows.get(channelId);
+    if (!row || midProcedure(row.phase)) return;
+    await this.deleteRow(channelId);
+    data.rows.delete(channelId);
+    await this.hooks.pushNodes(this.channelNodes(data, channelId)).catch(() => {});
+    await this.hooks.pushSwitchers().catch(() => {});
+    this.hooks.publishChannel(channelId);
   }
 
   /** is the ORIGINAL trigger of a completed failover still failing? null = cleared */

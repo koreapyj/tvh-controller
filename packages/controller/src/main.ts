@@ -32,9 +32,10 @@ import { abortLogRelays, registerRestreamerRoutes } from './routes/restreamer.js
 import { registerRuleRoutes } from './routes/rules.js';
 import { registerUnifiedRoutes } from './routes/unified.js';
 import { registerUploadRoutes } from './routes/uploads.js';
-import { RestreamerClient, SwitcherClient } from './restreamer/client.js';
-import { RestreamerPoller, SwitcherPoller } from './restreamer/poller.js';
+import { RestreamerClient } from './restreamer/client.js';
+import { RestreamerPoller } from './restreamer/poller.js';
 import { RestreamerService, nodeKey } from './restreamer/service.js';
+import { SwitcherHub } from './restreamer/switcherHub.js';
 import { registerEventLogRoutes } from './routes/eventLog.js';
 import type { AppContext } from './routes/context.js';
 import { EventLog } from './state/eventLog.js';
@@ -103,15 +104,37 @@ async function main(): Promise<void> {
       restreamerClients.set(nodeKey(inst.id, node.id), new RestreamerClient(node));
     }
   }
-  const switcherClients = new Map<string, SwitcherClient>();
-  for (const sw of config.restreamer?.switchers ?? []) {
-    switcherClients.set(sw.id, new SwitcherClient(sw));
-  }
-
-  const restreamer = db
-    ? new RestreamerService(db, cache, pollers, bus, config, restreamerClients, switcherClients, eventLog)
+  // switcher replicas dial the controller over WebSocket; the hub needs the
+  // service (doc computation needs the DB) and the service broadcasts through
+  // the hub, so the hub closes over the service variable assigned just below
+  let restreamer: RestreamerService | null = null;
+  const switcherHub =
+    db && config.restreamer?.switcher
+      ? new SwitcherHub({
+          cache,
+          bus,
+          events: eventLog,
+          getDoc: async () => (await restreamer!.computeSwitcherDoc()).doc,
+          onDemand: (events) => restreamer?.noteSwitcherDemand(events),
+          getExpectedRevision: () => restreamer?.switcherExpectedRevision() ?? null,
+          publicUrl: config.restreamer.switcher.publicUrl,
+          serverVersion: process.env.npm_package_version ?? 'unknown',
+        })
+      : null;
+  restreamer = db
+    ? new RestreamerService(
+        db,
+        cache,
+        pollers,
+        bus,
+        config,
+        restreamerClients,
+        switcherHub ?? undefined,
+        eventLog,
+      )
     : null;
   if (restreamer) {
+    const svc = restreamer;
     // chain into the topology-change callback set above (fires after every
     // pollTopology, next to ConflictService.recompute) — the service
     // debounces and hash-skips, so extra invocations are cheap
@@ -121,7 +144,7 @@ async function main(): Promise<void> {
       const prev = poller.onCapacityInputsChanged;
       poller.onCapacityInputsChanged = () => {
         prev?.();
-        restreamer.onTopologyChanged(inst.id);
+        svc.onTopologyChanged(inst.id);
       };
     }
   }
@@ -171,20 +194,6 @@ async function main(): Promise<void> {
       );
     }
   }
-  const switcherHooks = restreamer?.switcherPollerHooks() ?? {};
-  const switcherPollers = (config.restreamer?.switchers ?? []).map(
-    (sw) =>
-      new SwitcherPoller(
-        sw,
-        switcherClients.get(sw.id)!,
-        cache,
-        bus,
-        config.pollIntervals.restreamer,
-        switcherHooks,
-        eventLog,
-      ),
-  );
-
   const ledger = db ? new UploadLedger(db, config.overlapThreshold) : null;
   const dispatcher = ledger ? new UploadDispatcher(config, ledger, bus, eventLog) : null;
   const autoUploader =
@@ -206,8 +215,6 @@ async function main(): Promise<void> {
     restreamer,
     restreamerClients,
     restreamerPollers,
-    switcherClients,
-    switcherPollers,
   };
 
   // request logging is disabled: the dashboard polls several endpoints every
@@ -245,15 +252,8 @@ async function main(): Promise<void> {
   // resume persisted failover procedures / prune orphaned rows, before the
   // pollers/sweep start acting on the persisted state
   await restreamer?.reconcileFailoverOnStartup();
-  // a just-ordered switch shouldn't wait out the switcher poll interval
-  if (restreamer) {
-    restreamer.onSwitchIssued = () => {
-      for (const poller of switcherPollers) void poller.pollOnce().catch(() => {});
-    };
-  }
   for (const [, poller] of pollers) poller.start();
   for (const poller of restreamerPollers) poller.start();
-  for (const poller of switcherPollers) poller.start();
   restreamer?.startSweep();
   restreamer?.startRebalance();
   restreamer?.startFailover();
@@ -272,16 +272,17 @@ async function main(): Promise<void> {
       autoUploader?.stop();
       for (const [, poller] of pollers) poller.stop();
       for (const poller of restreamerPollers) poller.stop();
-      for (const poller of switcherPollers) poller.stop();
       restreamer?.stopSweep();
       restreamer?.stopRebalance();
       restreamer?.stopFailover();
       // give in-flight upload loops a bounded chance to checkpoint before the
       // database goes away; resume() recovers anything still unfinished
       await dispatcher?.stop();
-      // abort open log-stream relays first — app.close() waits for in-flight
-      // responses and would otherwise hang on them into the 10s failsafe
+      // abort open log-stream relays and terminate switcher WS sockets first
+      // — app.close() waits for in-flight connections and would otherwise
+      // hang on them into the 10s failsafe
       abortLogRelays();
+      switcherHub?.close();
       await app.close();
       await db?.destroy();
     } catch (err) {
@@ -293,6 +294,7 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => void close());
   process.on('SIGTERM', () => void close());
 
+  switcherHub?.attach(app.server);
   await app.listen({ port: config.port, host: '0.0.0.0' });
   // single explicit restart marker (log() no-ops without a db)
   eventLog.log({ type: 'normal', service: 'controller', source: 'controller', message: 'controller started' });

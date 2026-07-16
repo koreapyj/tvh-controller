@@ -75,10 +75,6 @@ describe('migration 008_restreamer', () => {
       .insertInto('restream_node_state')
       .values({ instance_id: 'tyo1', node_id: 'node1', pushed_hash: 'abc', pushed_at: NOW })
       .execute();
-    await t.db
-      .insertInto('restream_switcher_state')
-      .values({ switcher_id: 'main', pushed_hash: 'def', pushed_at: NOW })
-      .execute();
   }
 
   it('inserts and reads back one row per table', async () => {
@@ -133,12 +129,6 @@ describe('migration 008_restreamer', () => {
       .executeTakeFirstOrThrow();
     expect(nodeState.pushed_hash).toBe('abc');
     expect(nodeState.pushed_at).toBeInstanceOf(Date);
-
-    const switcherState = await t.db
-      .selectFrom('restream_switcher_state')
-      .selectAll()
-      .executeTakeFirstOrThrow();
-    expect(switcherState).toMatchObject({ switcher_id: 'main', pushed_hash: 'def' });
   });
 
   it('cascades channel deletion to placements and playlist members', async () => {
@@ -1212,6 +1202,50 @@ describe('migration 008_restreamer', () => {
         expect(after).toEqual(before);
         expect(await db.selectFrom('restream_placements').selectAll().execute()).toHaveLength(1);
         await assertResumedToCorrectSchema(db);
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
+  describe('023_drop_switcher_state', () => {
+    it('the table is gone on the latest schema', async () => {
+      const leftover = await sql<{ name: string }>`
+        select name from sqlite_master where type = 'table' and name = 'restream_switcher_state'
+      `.execute(t.db);
+      expect(leftover.rows).toHaveLength(0);
+    });
+
+    it('up drops a populated table; migrating back down recreates it empty', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '022_on_demand_delay');
+
+        interface SwitcherStateRow022 {
+          switcher_id: string;
+          pushed_hash: string;
+          pushed_at: string;
+        }
+        const oldDb = db as unknown as Kysely<{ restream_switcher_state: SwitcherStateRow022 }>;
+        await oldDb
+          .insertInto('restream_switcher_state')
+          .values({ switcher_id: 'main', pushed_hash: 'def', pushed_at: NOW })
+          .execute();
+
+        await migrateToLatest(db);
+
+        await expect(
+          oldDb.selectFrom('restream_switcher_state').selectAll().execute(),
+        ).rejects.toThrow(/no such table/i);
+
+        await migrateTo(db, '022_on_demand_delay');
+
+        expect(await oldDb.selectFrom('restream_switcher_state').selectAll().execute()).toEqual([]);
       } finally {
         await db.destroy();
       }

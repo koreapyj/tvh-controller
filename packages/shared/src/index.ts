@@ -23,5 +23,6 @@ export * from './channel-identity.js';
 export * from './rclone-rc.js';
 export * from './controller-api.js';
 export * from './restreamer-contract.js';
+export * from './restreamer-ws-contract.js';
 export * from './restreamProfile.js';
 export * from './restreamer.js';

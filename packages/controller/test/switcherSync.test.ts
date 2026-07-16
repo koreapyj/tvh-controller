@@ -1,12 +1,13 @@
 /*
- * Switcher desired-doc + push tests (B5): hermetic in-memory SQLite
+ * Switcher desired-doc + push tests: hermetic in-memory SQLite
  * (createTestDb), real InstanceCache/EventBus, hand-built topology snapshots,
- * fake restreamer nodes AND fake switchers at the client boundary. No network.
+ * fake restreamer nodes AND a fake switcher hub at the SwitcherHubLike
+ * boundary. No network.
  */
 
 import { describe, expect, it, vi } from 'vitest';
 import type { Kysely } from 'kysely';
-import type { SseEvent, SwitcherChannelStatus, SwitcherNodeStatus } from '@tvhc/shared';
+import type { SseEvent, SwitcherChannelStatus } from '@tvhc/shared';
 import type { Database } from '../src/db/schema.js';
 import type { AppConfig } from '../src/config.js';
 import type { InstancePoller } from '../src/tvh/poller.js';
@@ -17,11 +18,10 @@ import {
   nodeKey,
   sessionsHash,
   type RestreamerNodeClient,
-  type SwitcherNodeClient,
 } from '../src/restreamer/service.js';
 import { createTestDb } from './support/testDb.js';
 import { fakeRestreamerNode } from './support/fakeRestreamerNode.js';
-import { fakeSwitcher, type FakeSwitcher } from './support/fakeSwitcher.js';
+import { FakeSwitcherHub, seedReplicaStatus } from './support/fakeSwitcherHub.js';
 
 // ---------- fixtures ----------
 
@@ -93,7 +93,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     pollIntervals: { dvr: 15_000, autorec: 60_000, topology: 600_000, epg: 600_000, restreamer: 15_000 },
     overlapThreshold: 0.7,
     autoUpload: { enabled: false, graceSeconds: 120 },
-    restreamer: { switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'https://tv.example' }] },
+    restreamer: { switcher: { publicUrl: 'https://tv.example' } },
     eventLogRetentionDays: 30,
     ...overrides,
   };
@@ -116,7 +116,7 @@ interface Harness {
   cache: InstanceCache;
   events: SseEvent[];
   service: RestreamerService;
-  switcher: FakeSwitcher;
+  hub: FakeSwitcherHub;
   config: AppConfig;
   logs: LoggedEvent[];
 }
@@ -138,41 +138,12 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
       clients.set(nodeKey(inst.id, n.id), fakeRestreamerNode());
     }
   }
-  const switcher = fakeSwitcher();
-  const switcherClients = new Map<string, SwitcherNodeClient>();
-  for (const sw of config.restreamer?.switchers ?? []) switcherClients.set(sw.id, switcher);
+  const hub = new FakeSwitcherHub();
   const logs: LoggedEvent[] = [];
-  const service = new RestreamerService(db, cache, pollers, bus, config, clients, switcherClients, {
+  const service = new RestreamerService(db, cache, pollers, bus, config, clients, hub, {
     log: (e) => logs.push(e),
   });
-  return { db, destroy, cache, events, service, switcher, config, logs };
-}
-
-function switcherStateRow(db: Kysely<Database>, switcherId: string) {
-  return db
-    .selectFrom('restream_switcher_state')
-    .selectAll()
-    .where('switcher_id', '=', switcherId)
-    .executeTakeFirst();
-}
-
-function seedSwitcherStatus(
-  cache: InstanceCache,
-  switcherId: string,
-  channels: SwitcherChannelStatus[] = [],
-): void {
-  const status: SwitcherNodeStatus = {
-    switcherId,
-    url: `http://${switcherId}:5581`,
-    publicUrl: 'https://tv.example',
-    reachable: true,
-    error: null,
-    lastPollAt: null,
-    version: '1.0.0',
-    pendingPush: false,
-    channels,
-  };
-  cache.switchers.set(switcherId, status);
+  return { db, destroy, cache, events, service, hub, config, logs };
 }
 
 let profileSeq = 0;
@@ -466,56 +437,165 @@ describe('computeSwitcherDoc: failover state placements', () => {
     expect(ch.upstreams.map((u) => u.id).sort()).toEqual([fromId, toId].sort());
     await h.destroy();
   });
+
+  it('an all-cold channel with no failover row is still included (idle on-demand): onDemandIdle=true, activeUpstreamId is the lowest-priority upstream', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'BBB',
+      channelNumber: '10',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1', mode: 'cold', priority: 1 },
+        { instanceId: 'zone2', nodeId: 'n1', mode: 'cold', priority: 2 },
+      ],
+      force: true,
+    });
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    const p1 = placements.find((pl) => pl.priority === 1)!;
+    const p2 = placements.find((pl) => pl.priority === 2)!;
+
+    const { doc, blocked } = await h.service.computeSwitcherDoc();
+    expect(blocked).toEqual([]);
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(ch.upstreams.map((u) => u.id)).toEqual([p1.id, p2.id]);
+    expect(ch.onDemandIdle).toBe(true);
+    expect(ch.activeUpstreamId).toBe(p1.id);
+    await h.destroy();
+  });
+
+  it('an all-cold channel with a complete failover row is included with no onDemandIdle, activeUpstreamId = the row target', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'BBB',
+      channelNumber: '10',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1', mode: 'cold', priority: 1 },
+        { instanceId: 'zone2', nodeId: 'n1', mode: 'cold', priority: 2 },
+      ],
+      force: true,
+    });
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    const p1 = placements.find((pl) => pl.priority === 1)!;
+    const p2 = placements.find((pl) => pl.priority === 2)!;
+    // activated onto the HIGHER-priority-number placement — the row wins over the priority default
+    await insertFailoverRow(h, { channelId: chan.id, fromPlacementId: null, toPlacementId: p2.id });
+
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(ch.upstreams.map((u) => u.id)).toEqual([p1.id, p2.id]);
+    expect(ch.onDemandIdle).toBeUndefined();
+    expect(ch.activeUpstreamId).toBe(p2.id);
+    await h.destroy();
+  });
+
+  it('a hot channel with no failover row: activeUpstreamId is the lowest-priority hot placement, no onDemandIdle', async () => {
+    const h = await setup();
+    const { placements } = await seedRedundant(h);
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(ch.activeUpstreamId).toBe(placements[0]!.id); // priority 1
+    expect(ch.onDemandIdle).toBeUndefined();
+    await h.destroy();
+  });
+
+  it('a hot channel with a failover row: activeUpstreamId is the row target even when it is not the lowest priority', async () => {
+    const h = await setup();
+    const { channel, placements } = await seedRedundant(h);
+    await insertFailoverRow(h, {
+      channelId: channel.id,
+      fromPlacementId: placements[0]!.id,
+      toPlacementId: placements[1]!.id, // priority 2 — NOT the lowest
+    });
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(ch.activeUpstreamId).toBe(placements[1]!.id);
+    await h.destroy();
+  });
+
+  it('the row target is skipped (no serveUrl): activeUpstreamId falls back to the preferred hot upstream', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'BBB',
+      channelNumber: '10',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1', mode: 'hot', priority: 1 }, // usable
+        { instanceId: 'zone1', nodeId: 'n2', mode: 'cold', priority: 2 }, // no serveUrl
+      ],
+      force: true,
+    });
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    const hotId = placements.find((pl) => pl.priority === 1)!.id;
+    const coldId = placements.find((pl) => pl.priority === 2)!.id;
+    await insertFailoverRow(h, { channelId: chan.id, fromPlacementId: hotId, toPlacementId: coldId });
+
+    const { doc, blocked } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(ch.upstreams.map((u) => u.id)).toEqual([hotId]); // the cold target is blocked, not emitted
+    expect(blocked.some((b) => b.placementId === coldId)).toBe(true);
+    expect(ch.activeUpstreamId).toBe(hotId); // falls back past the (unemitted) row target to the preferred hot
+    await h.destroy();
+  });
 });
 
-// ---------- push ----------
+// ---------- push (hub broadcast) ----------
 
 describe('switcher push', () => {
-  it('a mutation that creates a redundant channel pushes the switcher doc automatically', async () => {
+  it('a mutation that creates a redundant channel broadcasts the switcher doc automatically', async () => {
     const h = await setup();
     await seedRedundant(h);
-    expect(h.switcher.puts()).toHaveLength(1);
-    expect(h.switcher.desired!.channels.map((c) => c.slug)).toEqual(['bbb']);
-    const state = await switcherStateRow(h.db, 'sw1');
-    expect(state!.pushed_hash).toBe(h.switcher.desired!.revision);
+    expect(h.hub.docs).toHaveLength(1);
+    expect(h.hub.lastDoc()!.channels.map((c) => c.slug)).toEqual(['bbb']);
+    expect(h.service.switcherExpectedRevision()).toBe(h.hub.lastDoc()!.revision);
     await h.destroy();
   });
 
-  it('hash-skip on unchanged doc; force bypasses; upsert roundtrip', async () => {
+  it('revision-skip on unchanged doc; force bypasses; a real change re-broadcasts', async () => {
     const h = await setup();
     await seedRedundant(h);
-    const firstHash = (await switcherStateRow(h.db, 'sw1'))!.pushed_hash;
+    const firstRevision = h.hub.lastDoc()!.revision;
 
-    const second = await h.service.pushSwitcher('sw1');
+    const second = await h.service.pushAllSwitchers();
     expect(second.action).toBe('skipped');
-    expect(h.switcher.puts()).toHaveLength(1);
+    expect(h.hub.docs).toHaveLength(1);
 
-    const forced = await h.service.pushSwitcher('sw1', true);
+    const forced = await h.service.pushAllSwitchers(true);
     expect(forced.action).toBe('pushed');
-    expect(h.switcher.puts()).toHaveLength(2);
-    expect((await switcherStateRow(h.db, 'sw1'))!.pushed_hash).toBe(firstHash);
+    expect(h.hub.docs).toHaveLength(2);
+    expect(h.hub.lastDoc()!.revision).toBe(firstRevision);
 
-    // a real change updates the stored hash (upsert, not insert-only)
+    // a real change broadcasts a new revision
     const { channel } = { channel: (await h.service.listChannels())[0]! };
     await h.service.updateChannel(channel.id, { slug: 'bbb-renamed' });
-    const after = await switcherStateRow(h.db, 'sw1');
-    expect(after!.pushed_hash).not.toBe(firstHash);
-    expect(h.switcher.desired!.channels[0]!.slug).toBe('bbb-renamed');
+    expect(h.hub.lastDoc()!.revision).not.toBe(firstRevision);
+    expect(h.hub.lastDoc()!.channels[0]!.slug).toBe('bbb-renamed');
+    expect(h.service.switcherExpectedRevision()).toBe(h.hub.lastDoc()!.revision);
     await h.destroy();
   });
 
-  it('a never-pushed switcher with an empty doc is left alone', async () => {
+  it('nothing broadcast yet + an empty doc is left alone', async () => {
     const h = await setup();
-    const results = await h.service.pushAllSwitchers();
-    expect(results).toEqual([
-      { switcherId: 'sw1', action: 'skipped', detail: 'nothing to manage', blocked: [] },
-    ]);
-    expect(h.switcher.puts()).toHaveLength(0);
-    expect(await switcherStateRow(h.db, 'sw1')).toBeUndefined();
+    const result = await h.service.pushAllSwitchers();
+    expect(result).toEqual({ action: 'skipped', detail: 'nothing to manage', blocked: [] });
+    expect(h.hub.docs).toHaveLength(0);
+    expect(h.service.switcherExpectedRevision()).toBeNull();
     await h.destroy();
   });
 
-  it('a single-placement channel is pushed too; placements change the upstream list, not membership', async () => {
+  it('no switcher configured: pushAllSwitchers is a no-op skip', async () => {
+    const h = await setup({ restreamer: undefined });
+    await seedRedundant(h);
+    const result = await h.service.pushAllSwitchers();
+    expect(result.action).toBe('skipped');
+    expect(h.hub.docs).toHaveLength(0);
+    await h.destroy();
+  });
+
+  it('a single-placement channel is broadcast too; placements change the upstream list, not membership', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     const chan = await h.service.createChannel({
@@ -525,32 +605,36 @@ describe('switcher push', () => {
       placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
     });
     // single placement: with a switcher configured this IS its business now
-    expect(h.switcher.puts()).toHaveLength(1);
-    expect(h.switcher.desired!.channels.map((c) => c.slug)).toEqual(['bbb']);
-    expect(h.switcher.desired!.channels[0]!.upstreams).toHaveLength(1);
+    expect(h.hub.docs).toHaveLength(1);
+    expect(h.hub.lastDoc()!.channels.map((c) => c.slug)).toEqual(['bbb']);
+    expect(h.hub.lastDoc()!.channels[0]!.upstreams).toHaveLength(1);
 
     await h.service.addPlacement(chan.id, { instanceId: 'zone2', nodeId: 'n1' });
-    expect(h.switcher.puts()).toHaveLength(2);
-    expect(h.switcher.desired!.channels[0]!.upstreams).toHaveLength(2);
+    expect(h.hub.docs).toHaveLength(2);
+    expect(h.hub.lastDoc()!.channels[0]!.upstreams).toHaveLength(2);
 
     // removing it again shrinks the upstream list back to one — the channel
     // stays in the doc (its playback URL never changes)
     const placements = (await h.service.listChannels())[0]!.placements;
     await h.service.deletePlacement(placements[1]!.id);
-    expect(h.switcher.desired!.channels.map((c) => c.slug)).toEqual(['bbb']);
-    expect(h.switcher.desired!.channels[0]!.upstreams).toHaveLength(1);
+    expect(h.hub.lastDoc()!.channels.map((c) => c.slug)).toEqual(['bbb']);
+    expect(h.hub.lastDoc()!.channels[0]!.upstreams).toHaveLength(1);
     await h.destroy();
   });
 
-  it('a push failure keeps the mutation successful and the old state; the sweep heals', async () => {
+  it('a doc-computation failure keeps the mutation successful; the sweep heals with the new doc', async () => {
+    const { SwitcherSync } = await import('../src/restreamer/switcherSync.js');
     const h = await setup();
     await seedRedundant(h);
-    const oldHash = (await switcherStateRow(h.db, 'sw1'))!.pushed_hash;
+    const oldRevision = h.service.switcherExpectedRevision();
 
-    h.switcher.failNextPut();
+    const spy = vi
+      .spyOn(SwitcherSync.prototype, 'computeDoc')
+      .mockRejectedValueOnce(new Error('database gone'));
     const { channel } = { channel: (await h.service.listChannels())[0]! };
     await h.service.updateChannel(channel.id, { slug: 'bbb-x' }); // does not throw
-    expect((await switcherStateRow(h.db, 'sw1'))!.pushed_hash).toBe(oldHash);
+    expect(h.service.switcherExpectedRevision()).toBe(oldRevision);
+    spy.mockRestore();
 
     vi.useFakeTimers();
     h.service.startSweep();
@@ -559,65 +643,8 @@ describe('switcher push', () => {
     vi.useRealTimers();
     await h.service.pushAllSwitchers(); // join the op chain
 
-    expect((await switcherStateRow(h.db, 'sw1'))!.pushed_hash).not.toBe(oldHash);
-    expect(h.switcher.desired!.channels[0]!.slug).toBe('bbb-x');
-    await h.destroy();
-  });
-
-  it('push outcomes patch the cached switcher status and publish SSE', async () => {
-    const h = await setup();
-    seedSwitcherStatus(h.cache, 'sw1');
-    h.switcher.failNextPut(new Error('boom'));
-    await seedRedundant(h);
-    let entry = h.cache.switchers.get('sw1')!;
-    expect(entry.pendingPush).toBe(true);
-    expect(entry.error).toBe('boom');
-    expect(h.events.some((e) => e.type === 'restreamer-switcher')).toBe(true);
-
-    await h.service.pushSwitcher('sw1');
-    entry = h.cache.switchers.get('sw1')!;
-    expect(entry.pendingPush).toBe(false);
-    await h.destroy();
-  });
-});
-
-// ---------- poller hooks ----------
-
-describe('switcher poller hooks', () => {
-  it('getExpectedRevision is the stored pushed hash, null before any push', async () => {
-    const h = await setup();
-    const hooks = h.service.switcherPollerHooks();
-    expect(await hooks.getExpectedRevision!('sw1')).toBeNull();
-    await seedRedundant(h);
-    expect(await hooks.getExpectedRevision!('sw1')).toBe(h.switcher.desired!.revision);
-    await h.destroy();
-  });
-
-  it('getPendingPush reflects computed-vs-pushed drift', async () => {
-    const h = await setup();
-    const hooks = h.service.switcherPollerHooks();
-    expect(await hooks.getPendingPush!('sw1')).toBe(false); // empty doc, nothing pushed
-    await seedRedundant(h);
-    expect(await hooks.getPendingPush!('sw1')).toBe(false); // pushed by the mutation
-
-    h.switcher.failNextPut();
-    const chan = (await h.service.listChannels())[0]!;
-    await h.service.updateChannel(chan.id, { slug: 'bbb-y' });
-    expect(await hooks.getPendingPush!('sw1')).toBe(true);
-    await h.destroy();
-  });
-
-  it('onRevisionMismatch force-pushes (switcher lost its PVC/state file)', async () => {
-    const h = await setup();
-    await seedRedundant(h);
-    expect(h.switcher.puts()).toHaveLength(1);
-    h.switcher.desired = null; // simulate state loss
-
-    const hooks = h.service.switcherPollerHooks();
-    hooks.onRevisionMismatch!('sw1', null);
-    await h.service.pushAllSwitchers(); // join the serialized op chain
-    expect(h.switcher.puts().length).toBeGreaterThanOrEqual(2);
-    expect(h.switcher.desired!.channels.map((c) => c.slug)).toEqual(['bbb']);
+    expect(h.service.switcherExpectedRevision()).not.toBe(oldRevision);
+    expect(h.hub.lastDoc()!.channels[0]!.slug).toBe('bbb-x');
     await h.destroy();
   });
 });
@@ -680,18 +707,20 @@ describe('rebalanceTick', () => {
     const a = await seedRedundant(h, 'BBB', '10');
     const b = await seedRedundant(h, 'BBB', '10'); // slug uniquified to bbb-2
     const ids = (ps: typeof a.placements) => ps.map((p) => p.id);
-    seedSwitcherStatus(h.cache, 'sw1', [
-      switcherChannel('bbb', a.placements[0]!.id, ids(a.placements), null),
-      switcherChannel('bbb-2', b.placements[0]!.id, ids(b.placements), null),
-    ]);
+    seedReplicaStatus(h.cache, {
+      channels: [
+        switcherChannel('bbb', a.placements[0]!.id, ids(a.placements), null),
+        switcherChannel('bbb-2', b.placements[0]!.id, ids(b.placements), null),
+      ],
+    });
 
     await h.service.rebalanceTick(new Date());
     // enqueued only — no row yet, and definitely no direct switch
-    expect(h.switcher.switches()).toHaveLength(0);
+    expect(h.hub.switches).toHaveLength(0);
     expect(await h.db.selectFrom('restream_failover_state').selectAll().execute()).toHaveLength(0);
 
     await h.service.failoverTick();
-    expect(h.switcher.switches()).toHaveLength(0); // still no direct switch — the procedure owns it
+    expect(h.hub.switches).toHaveLength(0); // still no direct switch — the procedure owns it
     const rows = await h.db.selectFrom('restream_failover_state').selectAll().execute();
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
@@ -711,11 +740,13 @@ describe('rebalanceTick', () => {
     const now = new Date();
     const recent = new Date(now.getTime() - 10 * 60_000).toISOString();
     const stale = new Date(now.getTime() - 2 * 3_600_000).toISOString();
-    seedSwitcherStatus(h.cache, 'sw1', [
-      // bbb (the lower slug, otherwise preferred) switched 10 min ago — sticky
-      switcherChannel('bbb', a.placements[0]!.id, a.placements.map((p) => p.id), recent),
-      switcherChannel('bbb-2', b.placements[0]!.id, b.placements.map((p) => p.id), stale),
-    ]);
+    seedReplicaStatus(h.cache, {
+      channels: [
+        // bbb (the lower slug, otherwise preferred) switched 10 min ago — sticky
+        switcherChannel('bbb', a.placements[0]!.id, a.placements.map((p) => p.id), recent),
+        switcherChannel('bbb-2', b.placements[0]!.id, b.placements.map((p) => p.id), stale),
+      ],
+    });
 
     await h.service.rebalanceTick(now);
     await h.service.failoverTick();
@@ -735,15 +766,17 @@ describe('rebalanceTick', () => {
     seedNodeReachable(h, 'zone2', 'n1');
     const a = await seedRedundant(h, 'BBB', '10');
     await seedRedundant(h, 'BBB', '10'); // bbb-2: NOT in the switcher status
-    seedSwitcherStatus(h.cache, 'sw1', [
-      // only bbb is known: its own move buys nothing (same spread), and the
-      // unreported bbb-2 must contribute neither load nor a move
-      switcherChannel('bbb', a.placements[0]!.id, a.placements.map((p) => p.id), null),
-    ]);
+    seedReplicaStatus(h.cache, {
+      channels: [
+        // only bbb is known: its own move buys nothing (same spread), and the
+        // unreported bbb-2 must contribute neither load nor a move
+        switcherChannel('bbb', a.placements[0]!.id, a.placements.map((p) => p.id), null),
+      ],
+    });
 
     await h.service.rebalanceTick(new Date());
     await h.service.failoverTick();
-    expect(h.switcher.switches()).toHaveLength(0);
+    expect(h.hub.switches).toHaveLength(0);
     expect(await h.db.selectFrom('restream_failover_state').selectAll().execute()).toHaveLength(0);
     await h.destroy();
   });
@@ -755,15 +788,17 @@ describe('rebalanceTick', () => {
     const a = await seedRedundant(h, 'BBB', '10');
     const b = await seedRedundant(h, 'BBB', '10'); // slug uniquified to bbb-2
     const ids = (ps: typeof a.placements) => ps.map((p) => p.id);
-    seedSwitcherStatus(h.cache, 'sw1', [
-      switcherChannel('bbb', a.placements[0]!.id, ids(a.placements), null),
-      switcherChannel('bbb-2', b.placements[0]!.id, ids(b.placements), null),
-    ]);
+    seedReplicaStatus(h.cache, {
+      channels: [
+        switcherChannel('bbb', a.placements[0]!.id, ids(a.placements), null),
+        switcherChannel('bbb-2', b.placements[0]!.id, ids(b.placements), null),
+      ],
+    });
 
     await h.service.rebalanceTick(new Date());
     const moveLogs = h.logs.filter((l) => l.message.includes('rebalance queued'));
     expect(moveLogs).toHaveLength(1);
-    expect(moveLogs[0]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'switcher.sw1' });
+    expect(moveLogs[0]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'switcher' });
     expect(moveLogs[0]!.message).toContain('bbb');
     await h.destroy();
   });
@@ -772,44 +807,30 @@ describe('rebalanceTick', () => {
 // ---------- event-log emission: switcher push failed/healed ----------
 
 describe('SwitcherSync: switcher push failed/healed event-log emission', () => {
-  it('logs a warning on the first push failure, nothing on a repeat, and a normal once it recovers', async () => {
+  it('logs a warning on the first doc-computation failure, nothing on a repeat, and a normal once it recovers', async () => {
+    const { SwitcherSync } = await import('../src/restreamer/switcherSync.js');
     const h = await setup();
-    seedSwitcherStatus(h.cache, 'sw1', []); // updateStatus() is a no-op until a status entry exists
     await seedRedundant(h); // gives the switcher something to push
 
-    h.switcher.failNextPut(new Error('putDesired: connection refused'));
-    const failed = await h.service.pushSwitcher('sw1', true);
+    const spy = vi
+      .spyOn(SwitcherSync.prototype, 'computeDoc')
+      .mockRejectedValue(new Error('database gone'));
+    const failed = await h.service.pushAllSwitchers(true);
     expect(failed.action).toBe('error');
     expect(h.logs).toHaveLength(1);
-    expect(h.logs[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'switcher.sw1' });
-    expect(h.logs[0]!.message).toContain('connection refused');
+    expect(h.logs[0]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'switcher' });
+    expect(h.logs[0]!.message).toContain('database gone');
 
     // still down (e.g. the 60s sweep retrying) must not spam
-    h.switcher.unreachable = true;
-    const stillFailing = await h.service.pushSwitcher('sw1', true);
+    const stillFailing = await h.service.pushAllSwitchers(true);
     expect(stillFailing.action).toBe('error');
     expect(h.logs).toHaveLength(1);
 
-    // the exact spam bug being fixed: the SwitcherPoller runs concurrently
-    // and overwrites cache.switchers' error every tick with its OWN
-    // reachability result, independent of push outcomes — simulate it
-    // resetting the cached error back to null while the push is still broken
-    const entry = h.cache.switchers.get('sw1')!;
-    h.cache.switchers.set('sw1', { ...entry, error: null });
-    h.switcher.unreachable = true;
-    const stillFailingAfterPollerReset = await h.service.pushSwitcher('sw1', true);
-    expect(stillFailingAfterPollerReset.action).toBe('error');
-    // must NOT re-log: the transition guard reads the dedicated pushProblems
-    // map, not the poller-owned cache field the code above just reset
-    expect(h.logs).toHaveLength(1);
-
-    h.switcher.unreachable = false;
-    const healed = await h.service.pushSwitcher('sw1', true);
+    spy.mockRestore();
+    const healed = await h.service.pushAllSwitchers(true);
     expect(healed.action).toBe('pushed');
     expect(h.logs).toHaveLength(2);
-    expect(h.logs[1]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'switcher.sw1' });
-    // the successful push also clears the stale error on the cached status
-    expect(h.cache.switchers.get('sw1')!.error).toBeNull();
+    expect(h.logs[1]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'switcher' });
 
     await h.destroy();
   });

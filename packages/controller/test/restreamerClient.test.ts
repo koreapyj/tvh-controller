@@ -1,22 +1,15 @@
 /*
- * RestreamerClient / SwitcherClient tests against a fake fetch — no network.
- * Covers per-endpoint URL/method/body shapes, the 404 -> null desired
- * read-back, non-2xx -> RestreamerError, the AbortSignal timeout mapping,
- * and transient-vs-permanent error classification.
+ * RestreamerClient tests against a fake fetch — no network. Covers
+ * per-endpoint URL/method/body shapes, the 404 -> null desired read-back,
+ * non-2xx -> RestreamerError, the AbortSignal timeout mapping, and
+ * transient-vs-permanent error classification.
  */
 
 import { describe, expect, it } from 'vitest';
-import type {
-  DesiredState,
-  SourcesResponse,
-  StatusResponse,
-  SwitcherDesiredState,
-  SwitcherStatus,
-} from '@tvhc/shared';
+import type { DesiredState, SourcesResponse, StatusResponse } from '@tvhc/shared';
 import {
   RestreamerClient,
   RestreamerError,
-  SwitcherClient,
   isTransientRestreamerError,
 } from '../src/restreamer/client.js';
 
@@ -50,7 +43,6 @@ function json(data: unknown, status = 200): Response {
 }
 
 const NODE = { id: 'n1', url: 'http://node1:5580' };
-const SWITCHER = { id: 'sw1', url: 'http://switcher:5581', publicUrl: 'https://tv.example' };
 
 const STATUS: StatusResponse = {
   apiVersion: 1,
@@ -208,64 +200,5 @@ describe('isTransientRestreamerError', () => {
   it('4xx is permanent', () => {
     expect(isTransientRestreamerError(new RestreamerError(400, '/x', 'bad doc'))).toBe(false);
     expect(isTransientRestreamerError(new RestreamerError(404, '/x', 'missing'))).toBe(false);
-  });
-});
-
-describe('SwitcherClient endpoints', () => {
-  const SW_STATUS: SwitcherStatus = {
-    apiVersion: 1,
-    switcherVersion: '1.0.0',
-    startedAt: '2026-07-06T00:00:00Z',
-    uptimeSec: 10,
-    desiredRevision: null,
-    channels: [],
-  };
-  const SW_DESIRED: SwitcherDesiredState = { apiVersion: 1, revision: 'rev-2', channels: [] };
-
-  it('status(): GET /v1/status', async () => {
-    const { fetchImpl, calls } = fakeFetch(json(SW_STATUS));
-    const client = new SwitcherClient(SWITCHER, fetchImpl);
-    expect(await client.status()).toEqual(SW_STATUS);
-    expect(calls[0]).toMatchObject({ url: 'http://switcher:5581/v1/status', method: 'GET' });
-  });
-
-  it('getDesired(): 404 -> null, 200 -> doc', async () => {
-    const { fetchImpl } = fakeFetch(new Response('nope', { status: 404 }), json(SW_DESIRED));
-    const client = new SwitcherClient(SWITCHER, fetchImpl);
-    expect(await client.getDesired()).toBeNull();
-    expect(await client.getDesired()).toEqual(SW_DESIRED);
-  });
-
-  it('putDesired(): PUT /v1/desired with the JSON doc', async () => {
-    const { fetchImpl, calls } = fakeFetch(new Response(null, { status: 204 }));
-    const client = new SwitcherClient(SWITCHER, fetchImpl);
-    await client.putDesired(SW_DESIRED);
-    expect(calls[0]).toEqual({
-      url: 'http://switcher:5581/v1/desired',
-      method: 'PUT',
-      body: JSON.stringify(SW_DESIRED),
-      contentType: 'application/json',
-    });
-  });
-
-  it('switchChannel(): POST /v1/channels/:slug/switch with {upstreamId}', async () => {
-    const { fetchImpl, calls } = fakeFetch(new Response(null, { status: 204 }));
-    const client = new SwitcherClient(SWITCHER, fetchImpl);
-    await client.switchChannel('at-x', 'placement-7');
-    expect(calls[0]).toEqual({
-      url: 'http://switcher:5581/v1/channels/at-x/switch',
-      method: 'POST',
-      body: JSON.stringify({ upstreamId: 'placement-7' }),
-      contentType: 'application/json',
-    });
-  });
-
-  it('non-2xx -> RestreamerError', async () => {
-    const { fetchImpl } = fakeFetch(new Response('bad', { status: 400 }));
-    const client = new SwitcherClient(SWITCHER, fetchImpl);
-    const err = await client.putDesired(SW_DESIRED).catch((e: unknown) => e);
-    expect(err).toBeInstanceOf(RestreamerError);
-    expect((err as RestreamerError).status).toBe(400);
-    expect(isTransientRestreamerError(err)).toBe(false);
   });
 });

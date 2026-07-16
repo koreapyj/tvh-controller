@@ -66,19 +66,18 @@ rclone:
 # is auto-detected via the co-located rclone rcd, or set per instance:
 #   serverOffset: "+00:00"
 
-# Standalone HLS switcher service(s) for redundant restream channels
-# (multi-placement failover). Omit when no channel is placed on more than
-# one instance. Each switcher's publicUrl is the viewer-facing base used in
-# M3U playlists. The top-level publicUrl is the CONTROLLER's own viewer-facing
-# base, used for controller-hosted M3U links (the channel-logo proxy); when
-# omitted it is derived per request from X-Forwarded-Proto/Host set by the
-# reverse proxy (or from the request itself).
+# HLS switcher for redundant restream channels (multi-placement failover).
+# Omit the `switcher` key when no channel is placed on more than one
+# instance. Switcher replicas dial the controller over WebSocket
+# (/ws/switcher), so the only setting is the switcher's viewer-facing base
+# used in M3U playlists. The top-level publicUrl is the CONTROLLER's own
+# viewer-facing base, used for controller-hosted M3U links (the channel-logo
+# proxy); when omitted it is derived per request from X-Forwarded-Proto/Host
+# set by the reverse proxy (or from the request itself).
 # restreamer:
 #   publicUrl: https://ctrl.example.com
-#   switchers:
-#     - id: main
-#       url: http://switcher.internal:5581
-#       publicUrl: https://tv.example.com
+#   switcher:
+#     publicUrl: https://tv.example.com
 #   # Active segment-path probe of each node serveUrl origin (cache server).
 #   # Playlists stay fast even through a struggling cache, so the cold-backup
 #   # "delivery-slow" trigger needs a real segment download to notice a slow

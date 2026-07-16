@@ -475,13 +475,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     {#each switcherList as sw (sw.switcherId)}
       <div class="card">
         <h3>
-          switcher {sw.switcherId}
+          switcher
           {#if sw.reachable}<span class="badge ok">reachable</span>{:else}<span class="badge bad">unreachable</span>{/if}
           {#if sw.pendingPush}<span class="badge warn" title="the controller's desired doc is not confirmed pushed to this switcher">pending push</span>{/if}
         </h3>
         <div class="muted small">
           {sw.url}
           {#if sw.version}&nbsp;· v{sw.version}{/if}
+          {#if sw.replicaCount != null}&nbsp;· {sw.replicaCount} replica{sw.replicaCount === 1 ? '' : 's'}{/if}
         </div>
         {#if sw.error}<div class="small" style="color:var(--bad)">{sw.error}</div>{/if}
         {#if sw.channels.length}

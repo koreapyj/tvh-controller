@@ -933,6 +933,34 @@ migrations['021_node_settings'] = {
   },
 };
 
+migrations['022_on_demand_delay'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // per-node on-demand start grace (UI-editable); NULL initial_delay_sec ⇒
+    // default (ON_DEMAND_INITIAL_DELAY_DEFAULT_SEC).
+    await db.schema.alterTable('restream_node_settings').addColumn('initial_delay_sec', 'integer').execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('restream_node_settings').dropColumn('initial_delay_sec').execute();
+  },
+};
+
+migrations['023_drop_switcher_state'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // switcher replicas dial the controller over WebSocket and persist the
+    // desired doc themselves, echoing its revision back in every status
+    // frame — the controller holds no durable per-switcher push state.
+    await db.schema.dropTable('restream_switcher_state').ifExists().execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema
+      .createTable('restream_switcher_state')
+      .addColumn('switcher_id', 'varchar(64)', (c) => c.primaryKey())
+      .addColumn('pushed_hash', 'varchar(64)', (c) => c.notNull())
+      .addColumn('pushed_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

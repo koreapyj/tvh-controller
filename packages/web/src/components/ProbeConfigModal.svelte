@@ -17,7 +17,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 -->
 <script lang="ts">
   import type { NodeProbeSettings, NodeSettings } from '@tvhc/shared';
-  import { maxSessionsToInput, parseMaxSessionsInput } from '../lib/nodeCapacity.js';
+  import {
+    initialDelayToInput,
+    maxSessionsToInput,
+    parseInitialDelayInput,
+    parseMaxSessionsInput,
+  } from '../lib/nodeCapacity.js';
   import { buildProbesPayload, PROBE_FIELDS, PROBE_GROUPS, probesToVals } from '../lib/probeFields.js';
 
   // Pure form — no fetching in here; the page loads `initial`/`initialSettings`
@@ -39,6 +44,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
   let vals: Record<string, string> = $state(probesToVals(initial));
   let maxSessionsVal = $state(maxSessionsToInput(initialSettings.maxSessions));
+  let initialDelayVal = $state(initialDelayToInput(initialSettings.initialDelaySec));
   let formError = $state('');
 
   function save(): void {
@@ -48,12 +54,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       formError = 'Max sessions must be a non-negative integer, or blank for uncapped';
       return;
     }
+    const initialDelaySec = parseInitialDelayInput(initialDelayVal);
+    if (initialDelaySec === undefined) {
+      formError = 'On-demand start delay must be a positive integer number of seconds, or blank for the default';
+      return;
+    }
     const built = buildProbesPayload($state.snapshot(vals));
     if (!built.ok) {
       formError = built.error;
       return;
     }
-    onsave({ probes: built.payload, settings: { maxSessions } });
+    onsave({ probes: built.payload, settings: { maxSessions, initialDelaySec } });
   }
 </script>
 
@@ -82,6 +93,20 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         <div class="muted small">
           Benchmark: ramp sessions until speed/lag degrade, then set 1–2 below the stable max — that
           margin is what failover and profile-cutover admissions consume. Empty = uncapped.
+        </div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <label for="pc-initial-delay" style="margin:0;width:160px;flex:none">On-demand start delay</label>
+          <input
+            id="pc-initial-delay"
+            style="flex:1"
+            inputmode="numeric"
+            placeholder="default (30 s)"
+            bind:value={initialDelayVal}
+          />
+        </div>
+        <div class="muted small">
+          Delay before an on-demand channel's encode is stopped again if the viewer never starts
+          playback after opening it. Blank = 30 s.
         </div>
       </div>
       {#each PROBE_GROUPS as group (group.key)}

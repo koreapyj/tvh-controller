@@ -23,13 +23,12 @@ import type {
   RestreamerNodeStatus,
   SessionStatus,
   SourceCatalogEntry,
-  SwitcherNodeStatus,
 } from '@tvhc/shared';
-import type { RestreamerNodeConfig, SwitcherConfig } from '../config.js';
+import type { RestreamerNodeConfig } from '../config.js';
 import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
 import type { InstanceCache } from '../state/instanceCache.js';
-import type { RestreamerClient, SwitcherClient } from './client.js';
+import type { RestreamerClient } from './client.js';
 
 /**
  * Push-state hooks the pollers consume; RestreamerService provides real
@@ -85,18 +84,11 @@ export interface RestreamerPollerHooks {
   ) => Promise<EnrichedSessionStatus[]> | EnrichedSessionStatus[];
 }
 
-/** switcher-side twin of RestreamerPollerHooks, keyed by switcherId */
-export interface SwitcherPollerHooks {
-  getPendingPush?: (switcherId: string) => Promise<boolean> | boolean;
-  getExpectedRevision?: (switcherId: string) => Promise<string | null> | string | null;
-  onRevisionMismatch?: (switcherId: string, seenRevision: string | null) => void | Promise<void>;
-}
-
 /**
  * JSON key of the meaningful fields — lastPollAt alone must not re-publish,
  * and neither must a probe round that only refreshed its lastCheckedAt.
  */
-function statusKey(status: RestreamerNodeStatus | SwitcherNodeStatus): string {
+function statusKey(status: RestreamerNodeStatus): string {
   const { lastPollAt: _lastPollAt, ...meaningful } = status;
   return JSON.stringify(meaningful, (key, value: unknown) =>
     key === 'lastCheckedAt' ? undefined : value,
@@ -386,137 +378,4 @@ export class RestreamerPoller {
     }
   }
 
-}
-
-/**
- * Polls one standalone switcher's `/v1/status` into `cache.switchers` and
- * publishes SSE `restreamer-switcher` events on meaningful change. Same
- * scheduling, changed-only publish, and revision-mismatch trigger as
- * RestreamerPoller.
- */
-export class SwitcherPoller {
-  private timer: NodeJS.Timeout | null = null;
-  private stopped = false;
-  private lastStatusKey = '';
-
-  constructor(
-    private readonly cfg: SwitcherConfig,
-    private readonly client: Pick<SwitcherClient, 'status'>,
-    private readonly cache: InstanceCache,
-    private readonly bus: EventBus,
-    private readonly intervalMs: number,
-    private readonly hooks: SwitcherPollerHooks = {},
-    private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
-  ) {}
-
-  start(): void {
-    this.schedule(Math.random() * 2000);
-  }
-
-  stop(): void {
-    this.stopped = true;
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = null;
-  }
-
-  private schedule(delay: number): void {
-    this.timer = setTimeout(() => {
-      void (async () => {
-        if (this.stopped) return;
-        await this.pollOnce();
-        if (!this.stopped) this.schedule(this.intervalMs);
-      })();
-    }, delay);
-  }
-
-  /** one poll tick; never throws (errors become reachable:false status) */
-  async pollOnce(): Promise<void> {
-    const pendingPush = await this.getPendingPushSafe();
-    let status: SwitcherNodeStatus;
-    try {
-      const res = await this.client.status();
-      status = {
-        switcherId: this.cfg.id,
-        url: this.cfg.url,
-        publicUrl: this.cfg.publicUrl,
-        reachable: true,
-        error: null,
-        lastPollAt: new Date().toISOString(),
-        version: res.switcherVersion,
-        pendingPush,
-        channels: res.channels,
-      };
-      await this.checkRevision(res.desiredRevision);
-    } catch (err) {
-      status = {
-        switcherId: this.cfg.id,
-        url: this.cfg.url,
-        publicUrl: this.cfg.publicUrl,
-        reachable: false,
-        error: err instanceof Error ? err.message : String(err),
-        lastPollAt: new Date().toISOString(),
-        version: null,
-        pendingPush,
-        channels: [],
-      };
-    }
-
-    // read prev reachable before overwriting
-    const prevReachable = this.cache.switchers.get(this.cfg.id)?.reachable;
-    this.cache.switchers.set(this.cfg.id, status);
-    this.logReachabilityTransition(prevReachable, status);
-
-    const key = statusKey(status);
-    if (key !== this.lastStatusKey) {
-      this.lastStatusKey = key;
-      this.bus.publish({ type: 'restreamer-switcher', data: status });
-    }
-  }
-
-  /** switcher up/down — transition-based only */
-  private logReachabilityTransition(prevReachable: boolean | undefined, status: SwitcherNodeStatus): void {
-    if (prevReachable === undefined || prevReachable === status.reachable) return;
-    const source = `switcher.${this.cfg.id}`;
-    if (status.reachable) {
-      this.events.log({
-        type: 'normal',
-        service: 'restreamer',
-        source,
-        message: `${source} came online`,
-      });
-    } else {
-      this.events.log({
-        type: 'warning',
-        service: 'restreamer',
-        source,
-        message: `${source} is unreachable: ${status.error}`,
-      });
-    }
-  }
-
-  private async getPendingPushSafe(): Promise<boolean> {
-    try {
-      return (await this.hooks.getPendingPush?.(this.cfg.id)) ?? false;
-    } catch {
-      return false;
-    }
-  }
-
-  private async checkRevision(seenRevision: string | null): Promise<void> {
-    if (!this.hooks.onRevisionMismatch || !this.hooks.getExpectedRevision) return;
-    let expected: string | null | undefined;
-    try {
-      expected = await this.hooks.getExpectedRevision(this.cfg.id);
-    } catch {
-      return;
-    }
-    if (expected == null || expected === seenRevision) return;
-    try {
-      void Promise.resolve(this.hooks.onRevisionMismatch(this.cfg.id, seenRevision)).catch(
-        () => {},
-      );
-    } catch {
-      // fire-and-forget: a failing push trigger must not fail the poll
-    }
-  }
 }

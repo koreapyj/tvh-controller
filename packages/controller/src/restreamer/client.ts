@@ -16,15 +16,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-import type {
-  DesiredState,
-  LogLine,
-  SourcesResponse,
-  StatusResponse,
-  SwitcherDesiredState,
-  SwitcherStatus,
-} from '@tvhc/shared';
-import type { RestreamerNodeConfig, SwitcherConfig } from '../config.js';
+import type { DesiredState, LogLine, SourcesResponse, StatusResponse } from '@tvhc/shared';
+import type { RestreamerNodeConfig } from '../config.js';
 
 export class RestreamerError extends Error {
   constructor(
@@ -50,10 +43,9 @@ export function isTransientRestreamerError(err: unknown): boolean {
 }
 
 /**
- * Shared HTTP helper for the daemon and switcher clients: JSON in/out,
- * per-request AbortSignal timeout, non-2xx -> RestreamerError. The APIs are
- * unauthenticated by contract (LAN-isolated, same trust model as
- * `rclone rcd --rc-no-auth`).
+ * HTTP helper for the daemon client: JSON in/out, per-request AbortSignal
+ * timeout, non-2xx -> RestreamerError. The API is unauthenticated by
+ * contract (LAN-isolated, same trust model as `rclone rcd --rc-no-auth`).
  */
 async function request<T>(
   fetchImpl: typeof fetch,
@@ -167,52 +159,6 @@ export class RestreamerClient {
     return this.fetchImpl(`${this.baseUrl}/v1/sessions/${encodeURIComponent(name)}/log/stream`, {
       method: 'GET',
       signal,
-    });
-  }
-}
-
-/**
- * Client for one standalone switcher service's HTTP API (same contract file,
- * switcher section). Same conventions as RestreamerClient.
- */
-export class SwitcherClient {
-  private readonly baseUrl: string;
-
-  constructor(
-    cfg: SwitcherConfig,
-    private readonly fetchImpl: typeof fetch = fetch,
-    private readonly timeoutMs = 10_000,
-  ) {
-    this.baseUrl = cfg.url.replace(/\/+$/, '');
-  }
-
-  private req<T>(method: 'GET' | 'POST' | 'PUT', path: string, body?: unknown): Promise<T> {
-    return request<T>(this.fetchImpl, this.baseUrl, path, { method, body, timeoutMs: this.timeoutMs });
-  }
-
-  status(): Promise<SwitcherStatus> {
-    return this.req<SwitcherStatus>('GET', '/v1/status');
-  }
-
-  /** persisted desired-doc read-back; null when never pushed (e.g. after PVC loss) */
-  async getDesired(): Promise<SwitcherDesiredState | null> {
-    try {
-      return await this.req<SwitcherDesiredState>('GET', '/v1/desired');
-    } catch (err) {
-      if (err instanceof RestreamerError && err.status === 404) return null;
-      throw err;
-    }
-  }
-
-  /** full replacement, atomic persist, all-or-nothing validation */
-  async putDesired(doc: SwitcherDesiredState): Promise<void> {
-    await this.req<unknown>('PUT', '/v1/desired', doc);
-  }
-
-  /** manual/rebalance switch of a redundant channel's active upstream */
-  async switchChannel(slug: string, upstreamId: string): Promise<void> {
-    await this.req<unknown>('POST', `/v1/channels/${encodeURIComponent(slug)}/switch`, {
-      upstreamId,
     });
   }
 }

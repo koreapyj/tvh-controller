@@ -169,14 +169,14 @@ function nodeServeUrl(config: AppConfig, instanceId: string, nodeId: string): st
 
 /**
  * Viewer-facing entry URL: with a switcher configured EVERY channel with ≥1
- * enabled placement points at the first switcher's publicUrl (uniform viewer
- * URLs — adding a second placement later never changes the entry). Without a
+ * enabled placement points at the switcher's publicUrl (uniform viewer URLs
+ * — adding a second placement later never changes the entry). Without a
  * switcher: direct at the first enabled placement whose node has a serveUrl.
  */
 function entryUrl(config: AppConfig, channel: RestreamChannelWithStatus): string | null {
   const enabled = channel.placements.filter((p) => p.enabled);
   if (enabled.length === 0) return null;
-  const sw = config.restreamer?.switchers[0];
+  const sw = config.restreamer?.switcher;
   if (sw) return `${sw.publicUrl}/hls/${channel.slug}/playlist.m3u8`;
   for (const p of enabled) {
     const serveUrl = nodeServeUrl(config, p.instanceId, p.nodeId);

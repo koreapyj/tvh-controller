@@ -58,7 +58,6 @@ const CONFLICT_TARGETS: Record<string, string[]> = {
   rule_bindings: ['master_rule_id', 'instance_id'],
   ignored_orphans: ['instance_id', 'tvh_uuid'],
   restream_node_state: ['instance_id', 'node_id'],
-  restream_switcher_state: ['switcher_id'],
   restream_node_probes: ['instance_id', 'node_id'],
   restream_node_settings: ['instance_id', 'node_id'],
   restream_failover_state: ['channel_id'],

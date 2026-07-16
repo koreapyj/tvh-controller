@@ -17,7 +17,6 @@ import type {
   RestreamProfile,
   SourceCatalogEntry,
   SseEvent,
-  SwitcherNodeStatus,
 } from '@tvhc/shared';
 import type { Database } from '../src/db/schema.js';
 import type { AppConfig } from '../src/config.js';
@@ -35,6 +34,7 @@ import {
 import { buildRawArgvParams } from '../src/restreamer/argv/index.js';
 import { createTestDb } from './support/testDb.js';
 import { fakeRestreamerNode, type FakeRestreamerNode } from './support/fakeRestreamerNode.js';
+import { FakeSwitcherHub, seedReplicaStatus } from './support/fakeSwitcherHub.js';
 
 const TS = '2026-01-01 00:00:00';
 
@@ -123,7 +123,7 @@ function makeConfig(overrides: Partial<AppConfig> = {}): AppConfig {
     pollIntervals: { dvr: 15_000, autorec: 60_000, topology: 600_000, epg: 600_000, restreamer: 15_000 },
     overlapThreshold: 0.7,
     autoUpload: { enabled: false, graceSeconds: 120 },
-    restreamer: { switchers: [{ id: 'sw1', url: 'http://sw1:5581', publicUrl: 'https://tv.example' }] },
+    restreamer: { switcher: { publicUrl: 'https://tv.example' } },
     eventLogRetentionDays: 30,
     ...overrides,
   };
@@ -173,7 +173,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
     }
   }
   const logs: LoggedEvent[] = [];
-  const service = new RestreamerService(db, cache, pollers, bus, config, clients, new Map(), {
+  const service = new RestreamerService(db, cache, pollers, bus, config, clients, new FakeSwitcherHub(), {
     log: (e) => logs.push(e),
   });
   return { db, destroy, cache, events, service, nodes, pollers, config, logs };
@@ -363,7 +363,7 @@ describe('profiles', () => {
   it('updateProfile with a payload change re-pushes every node hosting the profile', async () => {
     // no switcher -- this tests the DIRECT-write path; the switcher-fronted
     // cutover path is covered separately in its own describe block
-    const h = await setup({ restreamer: { switchers: [] } });
+    const h = await setup({ restreamer: {} });
     const profile = await h.service.createProfile('p', profilePayload());
     await h.service.createChannel({
       channelName: 'AT-X',
@@ -398,7 +398,7 @@ describe('profiles', () => {
 
   it('deleteProfile is blocked with 409 while only a placement overrides it (channel uses a different profile)', async () => {
     // no switcher -- this tests the DIRECT-write path (see comment above)
-    const h = await setup({ restreamer: { switchers: [] } });
+    const h = await setup({ restreamer: {} });
     const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
     const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
     await h.service.createChannel({
@@ -418,7 +418,7 @@ describe('profiles', () => {
 
   it('updateProfile re-pushes a node whose only link to the profile is a placement override', async () => {
     // no switcher -- this tests the DIRECT-write path (see comment above)
-    const h = await setup({ restreamer: { switchers: [] } });
+    const h = await setup({ restreamer: {} });
     const channelProfile = await h.service.createProfile(
       'channel-profile',
       profilePayload({ mode: 'ivtc', bitrate: '3M' }),
@@ -756,7 +756,7 @@ describe('desired doc determinism and push', () => {
   it('a per-placement profile override changes only that placement\'s pipeline; clearing it reverts the doc revision', async () => {
     // no switcher -- this tests the DIRECT-write path; switcher-fronted
     // cutover routing has its own describe block with equivalent coverage
-    const h = await setup({ restreamer: { switchers: [] } });
+    const h = await setup({ restreamer: {} });
     const profileA = await h.service.createProfile('profile-a', profilePayload({ mode: 'ivtc', bitrate: '3M' }));
     const profileB = await h.service.createProfile('profile-b', profilePayload({ mode: 'ivtc', bitrate: '6M' }));
     await h.service.createChannel({
@@ -1222,7 +1222,7 @@ describe('channel and placement CRUD', () => {
 
   it('updatePlacement profileId round-trips; null clears the override (inherits the channel profile)', async () => {
     // no switcher -- this tests the DIRECT-write path (see comment above)
-    const h = await setup({ restreamer: { switchers: [] } });
+    const h = await setup({ restreamer: {} });
     const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
     const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
     const chan = await h.service.createChannel({ channelName: 'AT-X', profileId: channelProfile.id });
@@ -1239,7 +1239,7 @@ describe('channel and placement CRUD', () => {
 
   it('applyChannelChanges persists profileId on new and existing placements', async () => {
     // no switcher -- this tests the DIRECT-write path (see comment above)
-    const h = await setup({ restreamer: { switchers: [] } });
+    const h = await setup({ restreamer: {} });
     const channelProfile = await h.service.createProfile('channel-profile', profilePayload());
     const overrideProfile = await h.service.createProfile('override-profile', profilePayload());
     const chan = await h.service.createChannel({ channelName: 'AT-X', profileId: channelProfile.id });
@@ -1508,7 +1508,7 @@ describe('listChannels status', () => {
     await h.destroy();
   });
 
-  it('playbackUrl: a redundant channel points at the first switcher; null without switchers', async () => {
+  it('playbackUrl: a redundant channel points at the switcher; null without a switcher', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     await h.service.createChannel({
@@ -1556,15 +1556,7 @@ describe('listChannels status', () => {
     });
     const placementId = (await h.service.listChannels())[0]!.placements[0]!.id;
     seedNodeStatusEntry(h.cache, 'zone1', 'n1', [sessionStatus(placementId), sessionStatus('other')]);
-    const swStatus: SwitcherNodeStatus = {
-      switcherId: 'sw1',
-      url: 'http://sw1:5581',
-      publicUrl: 'https://tv.example',
-      reachable: true,
-      error: null,
-      lastPollAt: null,
-      version: '1.0.0',
-      pendingPush: false,
+    seedReplicaStatus(h.cache, {
       channels: [
         {
           slug: 'at-x',
@@ -1573,8 +1565,7 @@ describe('listChannels status', () => {
           lastSwitch: { at: '2026-07-06T00:00:00Z', from: null, to: placementId, reason: 'push' },
         },
       ],
-    };
-    h.cache.switchers.set('sw1', swStatus);
+    });
 
     const [listed] = await h.service.listChannels();
     const zone1Placement = listed!.placements.find((x) => x.instanceId === 'zone1')!;
@@ -2649,7 +2640,7 @@ describe('profile-change cutover routing', () => {
   });
 
   it('no switcher configured: profile-change routing degrades entirely to direct writes (no cutover clone ever created)', async () => {
-    const h = await setup({ restreamer: { switchers: [] } });
+    const h = await setup({ restreamer: {} });
     const pOld = await h.service.createProfile('old', profilePayload());
     const pNew = await h.service.createProfile('new', profilePayload());
     const chan = await h.service.createChannel({
@@ -2821,31 +2812,58 @@ describe('poller hooks', () => {
 // ---------- node settings (per-node session capacity) ----------
 
 describe('node settings (per-node session capacity)', () => {
-  it('getNodeSettings defaults to {maxSessions: null} when no row exists', async () => {
+  it('getNodeSettings defaults to {maxSessions: null, initialDelaySec: null} when no row exists', async () => {
     const h = await setup();
-    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({ maxSessions: null });
+    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({
+      maxSessions: null,
+      initialDelaySec: null,
+    });
     await h.destroy();
   });
 
   it('setNodeSettings round-trips a value, and back to null (row persists, not deleted)', async () => {
     const h = await setup();
-    expect(await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 3 })).toEqual<NodeSettings>({
+    expect(
+      await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 3, initialDelaySec: null }),
+    ).toEqual<NodeSettings>({ maxSessions: 3, initialDelaySec: null });
+    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({
       maxSessions: 3,
+      initialDelaySec: null,
     });
-    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({ maxSessions: 3 });
 
-    expect(await h.service.setNodeSettings('zone1', 'n1', { maxSessions: null })).toEqual<NodeSettings>({
+    expect(
+      await h.service.setNodeSettings('zone1', 'n1', { maxSessions: null, initialDelaySec: null }),
+    ).toEqual<NodeSettings>({ maxSessions: null, initialDelaySec: null });
+    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({
       maxSessions: null,
+      initialDelaySec: null,
     });
-    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({ maxSessions: null });
+    await h.destroy();
+  });
+
+  it('setNodeSettings round-trips initialDelaySec alongside maxSessions', async () => {
+    const h = await setup();
+    expect(
+      await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 3, initialDelaySec: 45 }),
+    ).toEqual<NodeSettings>({ maxSessions: 3, initialDelaySec: 45 });
+    expect(await h.service.getNodeSettings('zone1', 'n1')).toEqual<NodeSettings>({
+      maxSessions: 3,
+      initialDelaySec: 45,
+    });
     await h.destroy();
   });
 
   it('setNodeSettings only touches the targeted node — a sibling node keeps its own row (or default)', async () => {
     const h = await setup();
-    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 2 });
-    expect(await h.service.getNodeSettings('zone1', 'n2')).toEqual<NodeSettings>({ maxSessions: null });
-    expect(await h.service.getNodeSettings('zone2', 'n1')).toEqual<NodeSettings>({ maxSessions: null });
+    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 2, initialDelaySec: 10 });
+    expect(await h.service.getNodeSettings('zone1', 'n2')).toEqual<NodeSettings>({
+      maxSessions: null,
+      initialDelaySec: null,
+    });
+    expect(await h.service.getNodeSettings('zone2', 'n1')).toEqual<NodeSettings>({
+      maxSessions: null,
+      initialDelaySec: null,
+    });
     await h.destroy();
   });
 
@@ -2854,10 +2872,10 @@ describe('node settings (per-node session capacity)', () => {
     const hooks = h.service.pollerHooks();
     expect(await hooks.getMaxSessions!('zone1', 'n1')).toBeNull();
 
-    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 5 });
+    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: 5, initialDelaySec: null });
     expect(await hooks.getMaxSessions!('zone1', 'n1')).toBe(5);
 
-    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: null });
+    await h.service.setNodeSettings('zone1', 'n1', { maxSessions: null, initialDelaySec: null });
     expect(await hooks.getMaxSessions!('zone1', 'n1')).toBeNull();
     await h.destroy();
   });
@@ -2866,12 +2884,12 @@ describe('node settings (per-node session capacity)', () => {
     const h = await setup();
     await expect(h.service.getNodeSettings('zone9', 'n1')).rejects.toMatchObject({ statusCode: 400 });
     await expect(h.service.getNodeSettings('zone1', 'n99')).rejects.toMatchObject({ statusCode: 400 });
-    await expect(h.service.setNodeSettings('zone9', 'n1', { maxSessions: 1 })).rejects.toMatchObject({
-      statusCode: 400,
-    });
-    await expect(h.service.setNodeSettings('zone1', 'n99', { maxSessions: 1 })).rejects.toMatchObject({
-      statusCode: 400,
-    });
+    await expect(
+      h.service.setNodeSettings('zone9', 'n1', { maxSessions: 1, initialDelaySec: null }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    await expect(
+      h.service.setNodeSettings('zone1', 'n99', { maxSessions: 1, initialDelaySec: null }),
+    ).rejects.toMatchObject({ statusCode: 400 });
     await h.destroy();
   });
 });
@@ -3554,9 +3572,9 @@ describe('tvh-less instance (url: null)', () => {
 describe('RestreamerService: node push failed/healed event-log emission', () => {
   it('logs a warning on the first push failure, nothing on a repeated failure, and a normal once it recovers', async () => {
     const h = await setup();
-    // this harness's config also carries a switcher ('sw1') with no client
-    // wired up — filter this test's assertions down to node.zone1.n1 logs so
-    // node and switcher push coverage stay independent
+    // this harness's config also carries a switcher — filter this test's
+    // assertions down to node.zone1.n1 logs so node and switcher push
+    // coverage stay independent
     const nodeLogs = () => h.logs.filter((l) => l.source === 'node.zone1.n1');
     // updateNodeStatus() (and therefore the cached-error read the push
     // transition guard relies on) is a no-op until the node has a cached

@@ -57,11 +57,12 @@ export interface InstanceConfig {
   restreamer?: { nodes: RestreamerNodeConfig[] };
 }
 
-/** standalone HLS switcher service (redundant-channel failover) */
-export interface SwitcherConfig {
-  id: string;
-  url: string;
-  /** viewer-facing base used for redundant-channel links in the M3U output */
+/**
+ * The HLS switcher (redundant-channel failover). Replicas dial the
+ * controller over WebSocket, so the only configuration is the viewer-facing
+ * base used for redundant-channel links in the M3U output.
+ */
+export interface SwitcherAppConfig {
   publicUrl: string;
 }
 
@@ -95,12 +96,12 @@ export interface AppConfig {
   /** auto-archive every finished recording's best copy */
   autoUpload: { enabled: boolean; graceSeconds: number };
   /**
-   * standalone switcher service(s) (absent block = redundancy feature off)
-   * plus the controller's own viewer-facing base URL (`publicUrl`), used for
+   * the switcher (absent `switcher` key = redundancy feature off) plus the
+   * controller's own viewer-facing base URL (`publicUrl`), used for
    * controller-hosted links in M3U output (logo proxy); when unset the base
    * is derived per request from X-Forwarded-Proto/Host or the request itself
    */
-  restreamer?: { switchers: SwitcherConfig[]; publicUrl?: string; deliveryProbe?: DeliveryProbeAppConfig };
+  restreamer?: { switcher?: SwitcherAppConfig; publicUrl?: string; deliveryProbe?: DeliveryProbeAppConfig };
   webDistDir?: string;
   /** persisted event_log rows older than this are pruned hourly */
   eventLogRetentionDays: number;
@@ -124,7 +125,9 @@ interface RawConfig {
   overlapThreshold?: number;
   eventLogRetentionDays?: number;
   restreamer?: {
-    switchers?: SwitcherConfig[];
+    switcher?: { publicUrl?: string };
+    /** legacy shape: an array of controller-dialed switcher services */
+    switchers?: Array<{ id?: string; url?: string; publicUrl?: string }>;
     publicUrl?: string;
     deliveryProbe?: Partial<DeliveryProbeAppConfig> | boolean;
   };
@@ -163,23 +166,24 @@ function parseRestreamerNodes(
   return { nodes };
 }
 
-function parseSwitchers(
+function parseRestreamerBlock(
   raw: RawConfig['restreamer'] | undefined,
 ): AppConfig['restreamer'] | undefined {
   if (!raw) return undefined;
-  const ids = new Set<string>();
-  const switchers = (raw.switchers ?? []).map((s) => {
-    if (!s.id) throw new Error('restreamer switcher without an id');
-    if (!s.url) throw new Error(`restreamer switcher "${s.id}" has no url`);
-    if (!s.publicUrl) throw new Error(`restreamer switcher "${s.id}" has no publicUrl`);
-    if (ids.has(s.id)) throw new Error(`duplicate restreamer switcher id "${s.id}"`);
-    ids.add(s.id);
-    return {
-      id: s.id,
-      url: s.url.replace(/\/+$/, ''),
-      publicUrl: s.publicUrl.replace(/\/+$/, ''),
-    };
-  });
+  let switcher: SwitcherAppConfig | undefined;
+  if (raw.switcher) {
+    if (!raw.switcher.publicUrl) throw new Error('restreamer.switcher has no publicUrl');
+    switcher = { publicUrl: raw.switcher.publicUrl.replace(/\/+$/, '') };
+  } else if (raw.switchers?.length) {
+    // legacy controller-dialed switchers array: only publicUrl survives —
+    // switcher replicas dial the controller now, so id/url are meaningless
+    const legacy = raw.switchers[0]!;
+    if (!legacy.publicUrl) throw new Error('restreamer switcher has no publicUrl');
+    console.warn(
+      'config: restreamer.switchers is deprecated — use restreamer.switcher: { publicUrl } (switchers dial the controller now)',
+    );
+    switcher = { publicUrl: legacy.publicUrl.replace(/\/+$/, '') };
+  }
   // `deliveryProbe: true` = defaults; a partial block overrides individual keys
   const rawProbe = raw.deliveryProbe;
   const deliveryProbe =
@@ -190,7 +194,7 @@ function parseSwitchers(
           ttfbMs: (rawProbe === true ? undefined : rawProbe.ttfbMs) ?? 3000,
           minSpeedFactor: (rawProbe === true ? undefined : rawProbe.minSpeedFactor) ?? 1.5,
         };
-  return { switchers, publicUrl: raw.publicUrl?.replace(/\/+$/, ''), deliveryProbe };
+  return { switcher, publicUrl: raw.publicUrl?.replace(/\/+$/, ''), deliveryProbe };
 }
 
 function defaultConfigPath(): string {
@@ -275,7 +279,7 @@ export function loadConfig(path = defaultConfigPath()): AppConfig {
       typeof raw.autoUpload === 'object'
         ? { enabled: raw.autoUpload.enabled ?? true, graceSeconds: raw.autoUpload.graceSeconds ?? 120 }
         : { enabled: raw.autoUpload ?? false, graceSeconds: 120 },
-    restreamer: parseSwitchers(raw.restreamer),
+    restreamer: parseRestreamerBlock(raw.restreamer),
     webDistDir: process.env.WEB_DIST_DIR,
     eventLogRetentionDays: raw.eventLogRetentionDays ?? 30,
   };

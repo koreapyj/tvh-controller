@@ -18,8 +18,8 @@
 
 import type { AppConfig } from '../config.js';
 import type { Db } from '../db/db.js';
-import type { RestreamerClient, SwitcherClient } from '../restreamer/client.js';
-import type { RestreamerPoller, SwitcherPoller } from '../restreamer/poller.js';
+import type { RestreamerClient } from '../restreamer/client.js';
+import type { RestreamerPoller } from '../restreamer/poller.js';
 import type { RestreamerService } from '../restreamer/service.js';
 import type { EventLog } from '../state/eventLog.js';
 import type { EventBus } from '../state/events.js';
@@ -49,9 +49,6 @@ export interface AppContext {
   /** keyed by nodeKey(instanceId, nodeId); empty when no nodes are configured */
   restreamerClients: Map<string, RestreamerClient>;
   restreamerPollers: RestreamerPoller[];
-  /** keyed by switcherId; empty when no switchers are configured */
-  switcherClients: Map<string, SwitcherClient>;
-  switcherPollers: SwitcherPoller[];
 }
 
 // Re-exported so existing route handlers can keep importing httpError from

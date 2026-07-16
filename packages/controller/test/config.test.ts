@@ -6,7 +6,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadConfig, parseOffset } from '../src/config.js';
 
 describe('parseOffset', () => {
@@ -211,10 +211,8 @@ instances:
         - id: node2
           url: http://b.local:5580
 restreamer:
-  switchers:
-    - id: main
-      url: http://switcher.internal:5581/
-      publicUrl: https://tv.example.com/
+  switcher:
+    publicUrl: https://tv.example.com/
 `);
     const cfg = loadConfig(path);
     expect(cfg.instances[0]?.restreamer?.nodes).toEqual([
@@ -226,31 +224,28 @@ restreamer:
       },
       { id: 'node2', url: 'http://b.local:5580', serveUrl: undefined, egressMbps: undefined },
     ]);
-    expect(cfg.restreamer?.switchers).toEqual([
-      { id: 'main', url: 'http://switcher.internal:5581', publicUrl: 'https://tv.example.com' },
-    ]);
-    // switchers-only block: no controller publicUrl
+    // trailing slash trimmed
+    expect(cfg.restreamer?.switcher).toEqual({ publicUrl: 'https://tv.example.com' });
+    // switcher-only block: no controller publicUrl
     expect(cfg.restreamer?.publicUrl).toBeUndefined();
   });
 
-  it('parses restreamer.publicUrl (trailing slash trimmed) alongside switchers', () => {
+  it('parses restreamer.publicUrl (trailing slash trimmed) alongside the switcher', () => {
     const path = writeConfig(`
 instances:
   - id: tyo1
     url: http://a.local
 restreamer:
   publicUrl: https://ctrl.example.com/
-  switchers:
-    - id: main
-      url: http://switcher.internal:5581
-      publicUrl: https://tv.example.com
+  switcher:
+    publicUrl: https://tv.example.com
 `);
     const cfg = loadConfig(path);
     expect(cfg.restreamer?.publicUrl).toBe('https://ctrl.example.com');
-    expect(cfg.restreamer?.switchers).toHaveLength(1);
+    expect(cfg.restreamer?.switcher).toEqual({ publicUrl: 'https://tv.example.com' });
   });
 
-  it('accepts a restreamer block with only publicUrl (no switchers)', () => {
+  it('accepts a restreamer block with only publicUrl (no switcher)', () => {
     const path = writeConfig(`
 instances:
   - id: tyo1
@@ -260,7 +255,62 @@ restreamer:
 `);
     const cfg = loadConfig(path);
     expect(cfg.restreamer?.publicUrl).toBe('https://ctrl.example.com');
-    expect(cfg.restreamer?.switchers).toEqual([]);
+    expect(cfg.restreamer?.switcher).toBeUndefined();
+  });
+
+  it('maps a legacy switchers array to the singular switcher with a deprecation warning', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+restreamer:
+  switchers:
+    - id: main
+      url: http://switcher.internal:5581
+      publicUrl: https://tv.example.com/
+`);
+      const cfg = loadConfig(path);
+      expect(cfg.restreamer?.switcher).toEqual({ publicUrl: 'https://tv.example.com' });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('restreamer.switchers is deprecated'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('an explicit switcher block wins over a legacy switchers array', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+restreamer:
+  switcher:
+    publicUrl: https://new.example.com
+  switchers:
+    - id: main
+      url: http://switcher.internal:5581
+      publicUrl: https://old.example.com
+`);
+      const cfg = loadConfig(path);
+      expect(cfg.restreamer?.switcher).toEqual({ publicUrl: 'https://new.example.com' });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('rejects a switcher block without publicUrl', () => {
+    const path = writeConfig(`
+instances:
+  - id: tyo1
+    url: http://a.local
+restreamer:
+  switcher: {}
+`);
+    expect(() => loadConfig(path)).toThrow(/restreamer\.switcher has no publicUrl/);
   });
 
   it('leaves restreamer undefined when the blocks are absent', () => {
@@ -287,23 +337,6 @@ instances:
           url: http://b.local:5580
 `);
     expect(() => loadConfig(path)).toThrow(/duplicate restreamer node id "node1"/);
-  });
-
-  it('rejects duplicate switcher ids', () => {
-    const path = writeConfig(`
-instances:
-  - id: tyo1
-    url: http://a.local
-restreamer:
-  switchers:
-    - id: main
-      url: http://s1.internal:5581
-      publicUrl: https://tv.example.com
-    - id: main
-      url: http://s2.internal:5581
-      publicUrl: https://tv2.example.com
-`);
-    expect(() => loadConfig(path)).toThrow(/duplicate restreamer switcher id "main"/);
   });
 
   it('rejects a restreamer node without an id or url', () => {

@@ -1,7 +1,7 @@
 /*
- * RestreamerPoller / SwitcherPoller tests: fake client + real InstanceCache +
- * real EventBus. Tick-level behavior is driven via pollOnce(); the scheduling
- * loop (start/stop) is exercised with fake timers.
+ * RestreamerPoller tests: fake client + real InstanceCache + real EventBus.
+ * Tick-level behavior is driven via pollOnce(); the scheduling loop
+ * (start/stop) is exercised with fake timers.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -12,14 +12,12 @@ import type {
   SourcesResponse,
   SseEvent,
   StatusResponse,
-  SwitcherStatus,
 } from '@tvhc/shared';
 import { EventBus } from '../src/state/events.js';
 import { InstanceCache } from '../src/state/instanceCache.js';
-import { RestreamerPoller, SwitcherPoller } from '../src/restreamer/poller.js';
+import { RestreamerPoller } from '../src/restreamer/poller.js';
 
 const NODE = { id: 'n1', url: 'http://node1:5580', serveUrl: 'http://node1' };
-const SWITCHER = { id: 'sw1', url: 'http://switcher:5581', publicUrl: 'https://tv.example' };
 
 function nodeStatus(overrides: Partial<StatusResponse> = {}): StatusResponse {
   return {
@@ -31,18 +29,6 @@ function nodeStatus(overrides: Partial<StatusResponse> = {}): StatusResponse {
     templates: [{ id: 'raw-argv', version: 1 }],
     desiredRevision: 'rev-1',
     sessions: [],
-    ...overrides,
-  };
-}
-
-function switcherStatus(overrides: Partial<SwitcherStatus> = {}): SwitcherStatus {
-  return {
-    apiVersion: 1,
-    switcherVersion: '2.0.0',
-    startedAt: '2026-07-06T00:00:00Z',
-    uptimeSec: 7,
-    desiredRevision: 'rev-9',
-    channels: [],
     ...overrides,
   };
 }
@@ -698,117 +684,6 @@ describe('RestreamerPoller', () => {
       expect(logs).toHaveLength(1);
       expect(logs[0]!.message).toContain('"at-x"');
       expect(logs[0]!.message).toContain('("at-x-slug")');
-    });
-  });
-});
-
-describe('SwitcherPoller', () => {
-  function setupSwitcher(hooks = {}) {
-    const cache = new InstanceCache();
-    const bus = new EventBus();
-    const events: SseEvent[] = [];
-    bus.subscribe((e) => events.push(e));
-    const status = vi.fn<() => Promise<SwitcherStatus>>();
-    const logs: LoggedEvent[] = [];
-    const poller = new SwitcherPoller(SWITCHER, { status }, cache, bus, 15_000, hooks, {
-      log: (e) => logs.push(e),
-    });
-    return { cache, events, status, poller, logs };
-  }
-
-  it('successful tick stores the status in cache.switchers and publishes once', async () => {
-    const { cache, events, status, poller } = setupSwitcher();
-    status.mockResolvedValue(switcherStatus());
-
-    await poller.pollOnce();
-    await poller.pollOnce(); // identical -> no re-publish
-
-    expect(cache.switchers.get('sw1')).toMatchObject({
-      switcherId: 'sw1',
-      url: 'http://switcher:5581',
-      publicUrl: 'https://tv.example',
-      reachable: true,
-      error: null,
-      version: '2.0.0',
-      pendingPush: false,
-      channels: [],
-    });
-    expect(events).toHaveLength(1);
-    expect(events[0]?.type).toBe('restreamer-switcher');
-  });
-
-  it('error tick -> reachable false, then recovery publishes again', async () => {
-    const { cache, events, status, poller } = setupSwitcher();
-    status.mockResolvedValue(switcherStatus());
-    await poller.pollOnce();
-    status.mockRejectedValue(new Error('gone'));
-    await poller.pollOnce();
-
-    expect(cache.switchers.get('sw1')).toMatchObject({
-      reachable: false,
-      error: 'gone',
-      version: null,
-      channels: [],
-    });
-
-    status.mockResolvedValue(switcherStatus());
-    await poller.pollOnce();
-    expect(events.map((e) => e.type)).toEqual([
-      'restreamer-switcher',
-      'restreamer-switcher',
-      'restreamer-switcher',
-    ]);
-  });
-
-  it('revision-mismatch trigger fires with the switcher id (e.g. after PVC loss)', async () => {
-    const onRevisionMismatch = vi.fn();
-    const { status, poller } = setupSwitcher({
-      getExpectedRevision: () => 'rev-9',
-      onRevisionMismatch,
-    });
-    status.mockResolvedValue(switcherStatus({ desiredRevision: null }));
-    await poller.pollOnce();
-    expect(onRevisionMismatch).toHaveBeenCalledWith('sw1', null);
-
-    onRevisionMismatch.mockClear();
-    status.mockResolvedValue(switcherStatus({ desiredRevision: 'rev-9' }));
-    await poller.pollOnce();
-    expect(onRevisionMismatch).not.toHaveBeenCalled();
-  });
-
-  it('stop() halts rescheduling', async () => {
-    vi.useFakeTimers();
-    const { status, poller } = setupSwitcher();
-    status.mockResolvedValue(switcherStatus());
-
-    poller.start();
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(status).toHaveBeenCalledTimes(1);
-    poller.stop();
-    await vi.advanceTimersByTimeAsync(60_000);
-    expect(status).toHaveBeenCalledTimes(1);
-  });
-
-  describe('event-log emission: switcher up/down', () => {
-    it('logs nothing on the first poll, then a normal/warning only on transitions', async () => {
-      const { logs, status, poller } = setupSwitcher();
-      status.mockRejectedValue(new Error('down'));
-      await poller.pollOnce(); // first-ever entry
-      expect(logs).toHaveLength(0);
-
-      status.mockResolvedValue(switcherStatus());
-      await poller.pollOnce(); // false -> true
-      expect(logs).toHaveLength(1);
-      expect(logs[0]).toMatchObject({ type: 'normal', service: 'restreamer', source: 'switcher.sw1' });
-
-      await poller.pollOnce(); // unchanged
-      expect(logs).toHaveLength(1);
-
-      status.mockRejectedValue(new Error('gone'));
-      await poller.pollOnce(); // true -> false
-      expect(logs).toHaveLength(2);
-      expect(logs[1]).toMatchObject({ type: 'warning', service: 'restreamer', source: 'switcher.sw1' });
-      expect(logs[1]!.message).toContain('gone');
     });
   });
 });

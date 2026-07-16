@@ -52,19 +52,20 @@ import { buildRawArgvParams } from './argv/index.js';
 import type { RestreamerClient } from './client.js';
 import { FAILOVER_TICK_MS, FailoverSync, type ResetOutcome } from './failoverSync.js';
 import { midProcedure, placementIndicators } from './failoverPolicy.js';
+import { OnDemandEngine, type OnDemandChannelTick } from './onDemand.js';
 import { ProbeEngine, type ProbeTargets } from './probeEngine.js';
 import { NODE_PROBE_DEFAULTS, probeSettingsToRow, rowToProbeSettings } from './probeSettings.js';
-import type { RestreamerPollerHooks, SwitcherPollerHooks } from './poller.js';
+import type { RestreamerPollerHooks } from './poller.js';
+import { SWITCHER_CACHE_KEY, type DemandEvent, type SwitcherHubLike } from './switcherHubTypes.js';
 import {
   SwitcherSync,
   type ComputedSwitcherDoc,
-  type SwitcherNodeClient,
   type SwitcherPushResult,
 } from './switcherSync.js';
 
 export type { ResetOutcome } from './failoverSync.js';
 
-export type { ComputedSwitcherDoc, SwitcherNodeClient, SwitcherPushResult } from './switcherSync.js';
+export type { ComputedSwitcherDoc, SwitcherPushResult } from './switcherSync.js';
 
 /** the client surface the service actually uses (the fake node implements exactly this) */
 export type RestreamerNodeClient = Pick<RestreamerClient, 'putDesired' | 'getDesired'>;
@@ -388,6 +389,8 @@ export class RestreamerService {
   readonly probeEngine: ProbeEngine;
   /** serialized failover orchestrator — shares this op chain via failoverTick */
   private readonly failoverSync: FailoverSync;
+  /** viewer-demand-driven start/stop of all-cold channels — shares this op chain via failoverTick */
+  private readonly onDemand: OnDemandEngine;
   private failoverTimer: NodeJS.Timeout | null = null;
   /** dedup keys for `restreamer-channel` SSE publishes, by channel id */
   private readonly lastChannelPublishKey = new Map<string, string>();
@@ -411,8 +414,6 @@ export class RestreamerService {
    * next poll tick heals it.
    */
   private placementSlugCache: { at: number; map: Map<string, string> } | null = null;
-  /** a switch was just ordered — main.ts wires this to SwitcherPoller.pollOnce */
-  onSwitchIssued: (() => void) | null = null;
 
   constructor(
     private readonly db: Db,
@@ -422,11 +423,15 @@ export class RestreamerService {
     private readonly config: AppConfig,
     /** keyed by nodeKey(instanceId, nodeId) */
     private readonly clients: Map<string, RestreamerNodeClient>,
-    /** keyed by switcherId; empty = no switchers configured */
-    private readonly switcherClients: Map<string, SwitcherNodeClient> = new Map(),
+    /** WS hub the switcher replicas are connected to */
+    private readonly switcherHub: SwitcherHubLike = {
+      broadcastDoc: () => {},
+      broadcastSwitch: () => 0,
+      connectedCount: () => 0,
+    },
     private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {
-    this.switcherSync = new SwitcherSync(db, cache, bus, config, switcherClients, events);
+    this.switcherSync = new SwitcherSync(db, cache, config, switcherHub, events);
     this.probeEngine = new ProbeEngine(
       () => this.probeTargets(),
       () => this.allProbeSettings(),
@@ -441,7 +446,7 @@ export class RestreamerService {
       db,
       cache,
       config,
-      switcherClients,
+      switcherHub,
       () => this.probeEngine.snapshot(),
       () => this.allProbeSettings(),
       {
@@ -450,13 +455,17 @@ export class RestreamerService {
         publishChannel: (channelId) => {
           void this.publishChannelStatus(channelId).catch(() => {});
         },
-        onSwitchIssued: () => this.onSwitchIssued?.(),
         markCutoverComplete: (placementId) => this.markCutoverCompleteInner(placementId),
         deleteCutoverPlacement: (placementId) => this.deleteCutoverPlacementInner(placementId),
       },
       undefined,
       events,
     );
+    this.onDemand = new OnDemandEngine({
+      requestFailover: (channelId, opts) => this.failoverSync.requestFailover(channelId, opts),
+      releaseOnDemand: (channelId) => this.failoverSync.releaseOnDemand(channelId),
+      events,
+    });
   }
 
   private serialize<T>(fn: () => Promise<T>): Promise<T> {
@@ -856,17 +865,16 @@ export class RestreamerService {
     activePlacementId: string | null;
     lastSwitch: { at: string; from: string | null; to: string; reason: SwitchReason } | null;
   } {
-    for (const sw of this.config.restreamer?.switchers ?? []) {
-      const status = this.cache.switchers.get(sw.id);
-      const chan = status?.channels.find((ch) => ch.slug === slug);
-      if (chan) return { activePlacementId: chan.activeUpstreamId, lastSwitch: chan.lastSwitch };
-    }
+    const chan = this.cache.switchers
+      .get(SWITCHER_CACHE_KEY)
+      ?.channels.find((ch) => ch.slug === slug);
+    if (chan) return { activePlacementId: chan.activeUpstreamId, lastSwitch: chan.lastSwitch };
     return { activePlacementId: null, lastSwitch: null };
   }
 
   /**
    * Viewer-facing URL: with a switcher configured EVERY channel with ≥1
-   * enabled placement is fronted by the first switcher's public base (uniform
+   * enabled placement is fronted by the switcher's public base (uniform
    * viewer URLs — adding a second placement later never changes the URL).
    * Without a switcher: one enabled placement → straight at that node's
    * serveUrl; several → null (no single node is authoritative); none
@@ -877,7 +885,7 @@ export class RestreamerService {
     enabledPlacements: Array<{ id: string; instance_id: string; node_id: string }>,
   ): string | null {
     if (enabledPlacements.length === 0) return null;
-    const sw = this.config.restreamer?.switchers[0];
+    const sw = this.config.restreamer?.switcher;
     if (sw) return `${sw.publicUrl}/hls/${slug}/playlist.m3u8`;
     if (enabledPlacements.length === 1) {
       const p = enabledPlacements[0]!;
@@ -1792,7 +1800,7 @@ export class RestreamerService {
    * side by side.
    */
   private isSwitcherFronted(_slug: string): boolean {
-    return (this.config.restreamer?.switchers.length ?? 0) > 0;
+    return this.config.restreamer?.switcher != null;
   }
 
   /**
@@ -2944,32 +2952,29 @@ export class RestreamerService {
     };
   }
 
-  // ---------- switcher desired doc + push (B5, delegated to SwitcherSync) ----------
+  // ---------- switcher desired doc + push (delegated to SwitcherSync) ----------
 
   /** global switcher desired doc (read-only, safe outside the op chain) */
   computeSwitcherDoc(): Promise<ComputedSwitcherDoc> {
     return this.switcherSync.computeDoc();
   }
 
-  pushSwitcher(switcherId: string, force = false): Promise<SwitcherPushResult> {
-    return this.serialize(() => this.switcherSync.pushInner(switcherId, force));
+  pushAllSwitchers(force = false): Promise<SwitcherPushResult> {
+    return this.serialize(() => this.switcherSync.pushAllInner(force));
   }
 
-  pushAllSwitchers(): Promise<SwitcherPushResult[]> {
-    return this.serialize(() => this.switcherSync.pushAllInner());
+  /** revision the switcher replicas are expected to report (hub pendingPush input) */
+  switcherExpectedRevision(): string | null {
+    return this.switcherSync.getExpectedRevision();
   }
 
-  /** SwitcherPollerHooks implementation backed by this service (B4's pollers consume it) */
-  switcherPollerHooks(): SwitcherPollerHooks {
-    return {
-      getPendingPush: (switcherId) => this.switcherSync.getPendingPush(switcherId),
-      getExpectedRevision: (switcherId) => this.switcherSync.getExpectedRevision(switcherId),
-      // a switcher that lost its state file (PVC loss) gets re-pushed
-      // immediately, force bypassing the hash-skip; serialized via the wrapper
-      onRevisionMismatch: (switcherId) => {
-        void this.pushSwitcher(switcherId, true).catch(() => {});
-      },
-    };
+  /**
+   * Viewer playlist-fetch demand events reported by the switcher replicas.
+   * The on-demand engine consumes these to wake idle encodes and keep
+   * viewer-active ones running.
+   */
+  noteSwitcherDemand(events: DemandEvent[]): void {
+    this.onDemand.noteDemand(events);
   }
 
   /** one rebalance evaluation, serialized; moves route through the failover queue */
@@ -3134,7 +3139,7 @@ export class RestreamerService {
       .where('instance_id', '=', instanceId)
       .where('node_id', '=', nodeId)
       .executeTakeFirst();
-    return { maxSessions: row?.max_sessions ?? null };
+    return { maxSessions: row?.max_sessions ?? null, initialDelaySec: row?.initial_delay_sec ?? null };
   }
 
   setNodeSettings(instanceId: string, nodeId: string, settings: NodeSettings): Promise<NodeSettings> {
@@ -3142,8 +3147,18 @@ export class RestreamerService {
       this.assertNodeConfigured(instanceId, nodeId);
       await this.db
         .insertInto('restream_node_settings')
-        .values({ instance_id: instanceId, node_id: nodeId, max_sessions: settings.maxSessions, updated_at: now() })
-        .onDuplicateKeyUpdate({ max_sessions: settings.maxSessions, updated_at: now() })
+        .values({
+          instance_id: instanceId,
+          node_id: nodeId,
+          max_sessions: settings.maxSessions,
+          initial_delay_sec: settings.initialDelaySec,
+          updated_at: now(),
+        })
+        .onDuplicateKeyUpdate({
+          max_sessions: settings.maxSessions,
+          initial_delay_sec: settings.initialDelaySec,
+          updated_at: now(),
+        })
         .execute();
       this.nodeCapacityCache = null;
       return settings;
@@ -3172,9 +3187,85 @@ export class RestreamerService {
     this.probeEngine.stop();
   }
 
-  /** one orchestrator evaluation, serialized like every other op */
+  /**
+   * one orchestrator evaluation, serialized like every other op — the
+   * on-demand engine runs right after, in the same op-chain turn, so its
+   * start/stop requests observe this pass's rows and queue cleanly into the
+   * next
+   */
   failoverTick(): Promise<void> {
-    return this.serialize(() => this.failoverSync.tick());
+    return this.serialize(async () => {
+      await this.failoverSync.tick();
+      if (!this.config.restreamer?.switcher) return;
+      await this.onDemand.tick(await this.onDemandTickData());
+    });
+  }
+
+  /**
+   * Lean per-channel input for the on-demand engine: only all-cold channels
+   * (no enabled hot placement) are candidates, since a channel with a hot
+   * placement is served by ordinary failover. `initialDelaySec` is read from
+   * `restream_node_settings` for the channel's presumptive activation
+   * target — its lowest (priority, id) enabled placement, the same one
+   * `requestFailover` with no explicit target would pick.
+   */
+  private async onDemandTickData(): Promise<OnDemandChannelTick[]> {
+    const [channels, placements, rows, nodeSettings] = await Promise.all([
+      this.db
+        .selectFrom('restream_channels as c')
+        .innerJoin('restream_profiles as pr', 'pr.id', 'c.profile_id')
+        .select(['c.id', 'c.slug', 'pr.payload as profile_payload'])
+        .where('c.enabled', '=', 1)
+        .execute(),
+      this.db
+        .selectFrom('restream_placements')
+        .select(['id', 'channel_id', 'instance_id', 'node_id', 'priority', 'mode'])
+        .where('enabled', '=', 1)
+        .orderBy('channel_id')
+        .orderBy('priority')
+        .orderBy('id')
+        .execute(),
+      this.db.selectFrom('restream_failover_state').select(['channel_id', 'phase']).execute(),
+      this.db
+        .selectFrom('restream_node_settings')
+        .select(['instance_id', 'node_id', 'initial_delay_sec'])
+        .execute(),
+    ]);
+
+    const placementsByChannel = new Map<string, typeof placements>();
+    for (const p of placements) {
+      let list = placementsByChannel.get(p.channel_id);
+      if (!list) placementsByChannel.set(p.channel_id, (list = []));
+      list.push(p);
+    }
+    const rowByChannel = new Map(rows.map((r) => [r.channel_id, r.phase]));
+    const initialDelayByNode = new Map(
+      nodeSettings.map((s) => [nodeKey(s.instance_id, s.node_id), s.initial_delay_sec]),
+    );
+
+    const out: OnDemandChannelTick[] = [];
+    for (const c of channels) {
+      const all = placementsByChannel.get(c.id) ?? [];
+      if (all.length === 0 || all.some((p) => p.mode === 'hot')) continue;
+      const target = all[0]!;
+      let segmentSeconds = 5;
+      try {
+        const payload = JSON.parse(c.profile_payload) as AribHlsParams;
+        segmentSeconds = payload.hls?.segmentSeconds ?? 5;
+      } catch {
+        /* defaults */
+      }
+      out.push({
+        channelId: c.id,
+        slug: c.slug,
+        allCold: true,
+        hasRow: rowByChannel.has(c.id),
+        rowPhase: rowByChannel.get(c.id) ?? null,
+        segmentSeconds,
+        initialDelaySec: initialDelayByNode.get(nodeKey(target.instance_id, target.node_id)) ?? null,
+      });
+    }
+    return out;
   }
 
   /** resume persisted procedures + prune orphaned rows on boot */
@@ -3189,6 +3280,10 @@ export class RestreamerService {
       if (nodes.length) {
         await this.pushNodesInner(nodes).catch(() => {});
         await this.pushAllSwitchersSafe();
+      }
+      if (this.config.restreamer?.switcher) {
+        const data = await this.onDemandTickData();
+        this.onDemand.seedActive(data.filter((d) => d.hasRow).map((d) => d.slug));
       }
     });
   }

@@ -79,3 +79,21 @@ export function parseMaxSessionsInput(raw: string): number | null | undefined {
   if (!Number.isInteger(n) || n < 0) return undefined;
   return n;
 }
+
+// ---------------------------------------------------------------------------
+// NodeSettings.initialDelaySec form <-> value (ProbeConfigModal's Capacity field)
+// ---------------------------------------------------------------------------
+
+/** initialDelaySec -> form string ('' = default) */
+export function initialDelayToInput(v: number | null): string {
+  return v === null ? '' : String(v);
+}
+
+/** form string -> initialDelaySec; '' = null (default); undefined = invalid (non-integer or < 1) */
+export function parseInitialDelayInput(raw: string): number | null | undefined {
+  const t = raw.trim();
+  if (t === '') return null;
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < 1) return undefined;
+  return n;
+}

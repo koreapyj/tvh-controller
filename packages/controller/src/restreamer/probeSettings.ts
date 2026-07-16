@@ -144,9 +144,15 @@ export function parseProbeSettings(raw: unknown): NodeProbeSettings {
 /** validate an untrusted PUT body into a full NodeSettings; missing key is invalid (null must be explicit) */
 export function parseNodeSettings(raw: unknown): NodeSettings {
   if (typeof raw !== 'object' || raw === null) throw httpError(400, 'body must be an object');
-  const { maxSessions } = raw as Record<string, unknown>;
+  const { maxSessions, initialDelaySec } = raw as Record<string, unknown>;
   if (maxSessions !== null && (typeof maxSessions !== 'number' || !Number.isInteger(maxSessions) || maxSessions < 0)) {
     throw httpError(400, 'maxSessions must be null or a non-negative integer');
   }
-  return { maxSessions };
+  if (
+    initialDelaySec !== null &&
+    (typeof initialDelaySec !== 'number' || !Number.isInteger(initialDelaySec) || initialDelaySec < 1)
+  ) {
+    throw httpError(400, 'initialDelaySec must be null or a positive integer');
+  }
+  return { maxSessions, initialDelaySec };
 }

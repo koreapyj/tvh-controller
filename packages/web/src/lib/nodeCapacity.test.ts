@@ -19,9 +19,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   configuredHotCount,
+  initialDelayToInput,
   isAtCapacity,
   isOverCapacity,
   maxSessionsToInput,
+  parseInitialDelayInput,
   parseMaxSessionsInput,
 } from './nodeCapacity.js';
 
@@ -135,5 +137,34 @@ describe('maxSessionsToInput / parseMaxSessionsInput', () => {
 
   it('rejects non-numeric input', () => {
     expect(parseMaxSessionsInput('abc')).toBeUndefined();
+  });
+});
+
+describe('initialDelayToInput / parseInitialDelayInput', () => {
+  it('round-trips null (default) as an empty string', () => {
+    expect(initialDelayToInput(null)).toBe('');
+    expect(parseInitialDelayInput('')).toBe(null);
+    expect(parseInitialDelayInput('   ')).toBe(null);
+  });
+
+  it('round-trips a positive integer', () => {
+    expect(initialDelayToInput(45)).toBe('45');
+    expect(parseInitialDelayInput('45')).toBe(45);
+  });
+
+  it('rejects 0 (the encode would stop before starting)', () => {
+    expect(parseInitialDelayInput('0')).toBeUndefined();
+  });
+
+  it('rejects negative numbers', () => {
+    expect(parseInitialDelayInput('-1')).toBeUndefined();
+  });
+
+  it('rejects non-integers', () => {
+    expect(parseInitialDelayInput('2.5')).toBeUndefined();
+  });
+
+  it('rejects non-numeric input', () => {
+    expect(parseInitialDelayInput('abc')).toBeUndefined();
   });
 });
