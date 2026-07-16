@@ -207,8 +207,10 @@ export class SwitcherSync {
    * once past the ≥1-upstream check below). `onDemandIdle` is set exactly on
    * an all-cold channel with no failover row — the switcher must not
    * health-probe those upstreams (the encode is down by design) and answers
-   * playlist fetches with 503 until the controller wakes it; it is omitted
-   * (not `false`) otherwise, keeping hot-channel doc hashes stable.
+   * playlist fetches with 503 until the controller wakes it; `onDemand` is
+   * set on every all-cold channel regardless of row/phase, so the switcher
+   * can hold playlist fetches through bring-up instead of 503ing. Both are
+   * omitted (not `false`) on hot channels, keeping those doc hashes stable.
    *
    * NOTE: the ≥2→≥1 rule change (single-placement channels now included)
    * changes the doc hash on upgrade — harmless: the hash-skip push notices the
@@ -268,6 +270,7 @@ export class SwitcherSync {
         activeUpstreamId = fallback?.placementId;
       }
       const onDemandIdle = g.allCold && g.rowTarget === null ? true : undefined;
+      const onDemand = g.allCold ? true : undefined;
 
       const payload = JSON.parse(g.profilePayload) as AribHlsParams;
       channels.push({
@@ -276,6 +279,7 @@ export class SwitcherSync {
         upstreams,
         ...(activeUpstreamId !== undefined ? { activeUpstreamId } : {}),
         ...(onDemandIdle !== undefined ? { onDemandIdle } : {}),
+        ...(onDemand !== undefined ? { onDemand } : {}),
       });
     }
 

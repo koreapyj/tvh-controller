@@ -438,7 +438,7 @@ describe('computeSwitcherDoc: failover state placements', () => {
     await h.destroy();
   });
 
-  it('an all-cold channel with no failover row is still included (idle on-demand): onDemandIdle=true, activeUpstreamId is the lowest-priority upstream', async () => {
+  it('an all-cold channel with no failover row is still included (idle on-demand): onDemand=true, onDemandIdle=true, activeUpstreamId is the lowest-priority upstream', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     const chan = await h.service.createChannel({
@@ -459,12 +459,13 @@ describe('computeSwitcherDoc: failover state placements', () => {
     expect(blocked).toEqual([]);
     const ch = doc.channels.find((c) => c.slug === 'bbb')!;
     expect(ch.upstreams.map((u) => u.id)).toEqual([p1.id, p2.id]);
+    expect(ch.onDemand).toBe(true);
     expect(ch.onDemandIdle).toBe(true);
     expect(ch.activeUpstreamId).toBe(p1.id);
     await h.destroy();
   });
 
-  it('an all-cold channel with a complete failover row is included with no onDemandIdle, activeUpstreamId = the row target', async () => {
+  it('an all-cold channel with a complete failover row is included with onDemand=true, no onDemandIdle, activeUpstreamId = the row target', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
     const chan = await h.service.createChannel({
@@ -486,17 +487,48 @@ describe('computeSwitcherDoc: failover state placements', () => {
     const { doc } = await h.service.computeSwitcherDoc();
     const ch = doc.channels.find((c) => c.slug === 'bbb')!;
     expect(ch.upstreams.map((u) => u.id)).toEqual([p1.id, p2.id]);
+    expect(ch.onDemand).toBe(true);
     expect(ch.onDemandIdle).toBeUndefined();
     expect(ch.activeUpstreamId).toBe(p2.id);
     await h.destroy();
   });
 
-  it('a hot channel with no failover row: activeUpstreamId is the lowest-priority hot placement, no onDemandIdle', async () => {
+  it('an all-cold channel with a bringing-up failover row is included with onDemand=true, no onDemandIdle', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'BBB',
+      channelNumber: '10',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1', mode: 'cold', priority: 1 },
+        { instanceId: 'zone2', nodeId: 'n1', mode: 'cold', priority: 2 },
+      ],
+      force: true,
+    });
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    const p2 = placements.find((pl) => pl.priority === 2)!;
+    await insertFailoverRow(h, {
+      channelId: chan.id,
+      fromPlacementId: null,
+      toPlacementId: p2.id,
+      phase: 'bringing-up',
+    });
+
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(ch.onDemand).toBe(true);
+    expect(ch.onDemandIdle).toBeUndefined();
+    await h.destroy();
+  });
+
+  it('a hot channel with no failover row: activeUpstreamId is the lowest-priority hot placement, no onDemand/onDemandIdle', async () => {
     const h = await setup();
     const { placements } = await seedRedundant(h);
     const { doc } = await h.service.computeSwitcherDoc();
     const ch = doc.channels.find((c) => c.slug === 'bbb')!;
     expect(ch.activeUpstreamId).toBe(placements[0]!.id); // priority 1
+    expect(ch.onDemand).toBeUndefined();
     expect(ch.onDemandIdle).toBeUndefined();
     await h.destroy();
   });
@@ -512,6 +544,8 @@ describe('computeSwitcherDoc: failover state placements', () => {
     const { doc } = await h.service.computeSwitcherDoc();
     const ch = doc.channels.find((c) => c.slug === 'bbb')!;
     expect(ch.activeUpstreamId).toBe(placements[1]!.id);
+    expect(ch.onDemand).toBeUndefined();
+    expect(ch.onDemandIdle).toBeUndefined();
     await h.destroy();
   });
 
