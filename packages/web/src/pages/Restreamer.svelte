@@ -200,6 +200,11 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   const sessionModalSession = $derived(
     sessionModal ? sessionModalNode?.sessions.find((s) => s.name === sessionModal!.name) : undefined,
   );
+  const sessionModalChannel = $derived(
+    sessionModalSession?.channelSlug
+      ? (mergedChannels.find((c) => c.slug === sessionModalSession!.channelSlug) ?? null)
+      : null,
+  );
 
   // ---------- channels ----------
 
@@ -480,7 +485,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {#if sw.pendingPush}<span class="badge warn" title="the controller's desired doc is not confirmed pushed to this switcher">pending push</span>{/if}
         </h3>
         <div class="muted small">
-          {sw.url}
           {#if sw.version}&nbsp;· v{sw.version}{/if}
           {#if sw.replicaCount != null}&nbsp;· {sw.replicaCount} replica{sw.replicaCount === 1 ? '' : 's'}{/if}
         </div>
@@ -919,6 +923,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     nodeId={sessionModal.nodeId}
     session={sessionModalSession}
     serveUrl={sessionModalNode?.serveUrl ?? null}
+    channelId={sessionModalChannel?.id ?? null}
+    onDemandStopAt={sessionModalChannel?.onDemandStopAt ?? null}
     onclose={() => (sessionModal = null)}
   />
 {/if}

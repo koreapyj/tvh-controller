@@ -223,3 +223,37 @@ describe('OnDemandEngine: stop', () => {
     expect(h.releaseOnDemand).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('OnDemandEngine: stopDeadlineMs', () => {
+  it('returns null for a channel never seen with a row', async () => {
+    const h = makeHarness();
+    expect(h.engine.stopDeadlineMs('c1')).toBeNull();
+    await h.engine.tick([ch({ hasRow: false })]);
+    expect(h.engine.stopDeadlineMs('c1')).toBeNull();
+  });
+
+  it('returns the tick-computed deadline for an active all-cold channel with a row, extends on newer demand + re-tick', async () => {
+    const h = makeHarness();
+    const t0 = h.nowMs;
+    h.engine.noteDemand([h.demand('bbb', 'master', t0)]);
+    await h.engine.tick([ch({ hasRow: true, rowPhase: 'bringing-up', initialDelaySec: 30 })]);
+    expect(h.engine.stopDeadlineMs('c1')).toBe(t0 + 30_000);
+
+    h.advance(5_000);
+    h.engine.noteDemand([h.demand('bbb', 'master', h.nowMs)]);
+    await h.engine.tick([ch({ hasRow: true, rowPhase: 'bringing-up', initialDelaySec: 30 })]);
+    expect(h.engine.stopDeadlineMs('c1')).toBe(t0 + 5_000 + 30_000);
+  });
+
+  it('clears once the row disappears', async () => {
+    const h = makeHarness();
+    h.engine.noteDemand([h.demand('bbb', 'master', h.nowMs)]);
+    await h.engine.tick([ch({ hasRow: true, rowPhase: 'complete', initialDelaySec: 30 })]);
+    expect(h.engine.stopDeadlineMs('c1')).not.toBeNull();
+
+    h.advance(30_001); // past the deadline — no spurious restart once the row vanishes
+    await h.engine.tick([ch({ hasRow: false })]);
+    expect(h.engine.stopDeadlineMs('c1')).toBeNull();
+    expect(h.requestFailover).not.toHaveBeenCalled();
+  });
+});

@@ -230,6 +230,8 @@ export interface RestreamChannelWithStatus extends RestreamChannel {
   lastSwitch: { at: string; from: string | null; to: string; reason: SwitchReason } | null;
   /** viewer-facing URL (node serveUrl or switcher publicUrl); null when not serveable */
   playbackUrl: string | null;
+  /** ISO deadline when the on-demand activation stops absent further demand; null = not an active on-demand channel */
+  onDemandStopAt: string | null;
 }
 
 /** DB-managed master playlist, served at GET /playlists/<slug>.m3u */

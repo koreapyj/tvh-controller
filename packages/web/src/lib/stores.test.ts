@@ -140,6 +140,7 @@ function channel(over: Partial<RestreamChannelWithStatus> = {}): RestreamChannel
     activePlacementId: null,
     lastSwitch: null,
     playbackUrl: null,
+    onDemandStopAt: null,
     ...over,
   };
 }

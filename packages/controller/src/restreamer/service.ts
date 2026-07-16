@@ -820,6 +820,7 @@ export class RestreamerService {
         };
       });
       const { activePlacementId, lastSwitch } = this.switcherView(c.slug);
+      const stopDeadlineMs = this.onDemand.stopDeadlineMs(c.id);
       const failover: ChannelFailoverStatus | null = fo
         ? {
             fromPlacementId: fo.from_placement_id,
@@ -842,6 +843,7 @@ export class RestreamerService {
           c.slug,
           chanPlacements.filter((p) => !!p.enabled),
         ),
+        onDemandStopAt: stopDeadlineMs == null ? null : new Date(stopDeadlineMs).toISOString(),
       };
     });
   }

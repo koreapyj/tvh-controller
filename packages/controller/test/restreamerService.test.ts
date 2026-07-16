@@ -8,15 +8,16 @@
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Kysely } from 'kysely';
-import type {
-  AribHlsParams,
-  DesiredState,
-  EnrichedSessionStatus,
-  NodeSettings,
-  RawArgvParams,
-  RestreamProfile,
-  SourceCatalogEntry,
-  SseEvent,
+import {
+  ON_DEMAND_INITIAL_DELAY_DEFAULT_SEC,
+  type AribHlsParams,
+  type DesiredState,
+  type EnrichedSessionStatus,
+  type NodeSettings,
+  type RawArgvParams,
+  type RestreamProfile,
+  type SourceCatalogEntry,
+  type SseEvent,
 } from '@tvhc/shared';
 import type { Database } from '../src/db/schema.js';
 import type { AppConfig } from '../src/config.js';
@@ -3718,6 +3719,97 @@ describe('raw-argv rendering', () => {
     expect(filterComplex).toContain(
       'hwmap=derive_device=opencl,yadif_opencl,hwmap=derive_device=qsv:reverse=1',
     );
+    await h.destroy();
+  });
+});
+
+// ---------- on-demand status (DTO) ----------
+
+describe('on-demand status (DTO)', () => {
+  async function seedAllColdChannel(h: Harness) {
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', mode: 'cold' }],
+    });
+    const placement = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements[0]!;
+    return { chan, placement };
+  }
+
+  async function insertOnDemandRow(
+    h: Harness,
+    channelId: string,
+    placementId: string,
+    phase = 'bringing-up',
+  ): Promise<void> {
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: channelId,
+        from_placement_id: null,
+        to_placement_id: placementId,
+        phase,
+        trigger_reason: 'on-demand',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: TS,
+        updated_at: TS,
+      })
+      .execute();
+  }
+
+  it('carries onDemandStopAt for an active on-demand channel, null otherwise', async () => {
+    const h = await setup();
+    const { chan, placement } = await seedAllColdChannel(h);
+
+    let listed = (await h.service.listChannels()).find((c) => c.id === chan.id)!;
+    expect(listed.onDemandStopAt).toBeNull();
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      await insertOnDemandRow(h, chan.id, placement.id);
+      h.service.noteSwitcherDemand([{ slug: chan.slug, kind: 'master', at: new Date().toISOString() }]);
+      await h.service.failoverTick();
+
+      listed = (await h.service.listChannels()).find((c) => c.id === chan.id)!;
+      expect(listed.onDemandStopAt).toBe(
+        new Date(Date.now() + ON_DEMAND_INITIAL_DELAY_DEFAULT_SEC * 1000).toISOString(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+    await h.destroy();
+  });
+
+  it('does not churn the restreamer-channel SSE feed on deadline-only changes', async () => {
+    const h = await setup();
+    const { chan, placement } = await seedAllColdChannel(h);
+    await insertOnDemandRow(h, chan.id, placement.id);
+
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      h.service.noteSwitcherDemand([{ slug: chan.slug, kind: 'master', at: new Date().toISOString() }]);
+      await h.service.failoverTick();
+      await h.service.publishChannelStatus(chan.id);
+      const before = (await h.service.listChannels()).find((c) => c.id === chan.id)!.onDemandStopAt;
+      const countAfterFirst = h.events.filter((e) => e.type === 'restreamer-channel').length;
+      expect(countAfterFirst).toBeGreaterThan(0);
+
+      vi.setSystemTime(Date.now() + 5_000);
+      h.service.noteSwitcherDemand([{ slug: chan.slug, kind: 'master', at: new Date().toISOString() }]);
+      await h.service.failoverTick();
+      const after = (await h.service.listChannels()).find((c) => c.id === chan.id)!.onDemandStopAt;
+      expect(after).not.toBe(before);
+
+      await h.service.publishChannelStatus(chan.id);
+      expect(h.events.filter((e) => e.type === 'restreamer-channel').length).toBe(countAfterFirst);
+    } finally {
+      vi.useRealTimers();
+    }
     await h.destroy();
   });
 });

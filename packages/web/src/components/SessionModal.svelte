@@ -36,12 +36,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     nodeId,
     session,
     serveUrl,
+    channelId,
+    onDemandStopAt,
     onclose,
   }: {
     instanceId: string;
     nodeId: string;
     session: EnrichedSessionStatus;
     serveUrl: string | null;
+    channelId: string | null;
+    onDemandStopAt: string | null;
     onclose: () => void;
   } = $props();
 
@@ -50,12 +54,33 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   let pane: HTMLDivElement | undefined = $state();
   let busyReset = $state(false);
   let busyRestart = $state(false);
+  let liveStopAt: string | null = $state(onDemandStopAt);
 
   // session.name is a bare placement uuid post-rename; channelSlug (resolved
   // controller-side) is what a human should see first, with the uuid kept
   // around (muted / tooltip) to disambiguate two placements of the same
   // channel mid-cutover.
   const displayName = $derived(session.channelSlug ?? session.name);
+
+  // deadline-only changes never trigger a `restreamer-channel` SSE publish
+  // (dedup key excludes it), so keep it current with a direct poll instead
+  $effect(() => {
+    liveStopAt = onDemandStopAt;
+  });
+
+  $effect(() => {
+    if (!channelId) return;
+    const id = channelId;
+    const timer = setInterval(() => {
+      void api
+        .restreamChannel(id)
+        .then((c) => {
+          liveStopAt = c.onDemandStopAt;
+        })
+        .catch(() => {});
+    }, 5000);
+    return () => clearInterval(timer);
+  });
 
   $effect(() => {
     const es = new EventSource(sessionLogStreamUrl(instanceId, nodeId, session.name));
@@ -127,6 +152,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     </h2>
 
     <div class="muted small" style="display:flex;flex-direction:column;gap:6px">
+      {#if liveStopAt}
+        <div>on-demand · stops at {dateTime(liveStopAt)}</div>
+      {/if}
       <div>
         Playlist:
         {#if serveUrl}

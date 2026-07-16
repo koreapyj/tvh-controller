@@ -79,11 +79,18 @@ export class OnDemandEngine {
   private readonly demand = new Map<string, DemandRecord>();
   /** channelIds with a requestFailover call in flight, cleared once hasRow observes it landed (or it fails) */
   private readonly starting = new Set<string>();
+  /** last tick's computed stop deadline per channelId — active all-cold channels with a row only */
+  private readonly stopDeadlines = new Map<string, number>();
 
   constructor(private readonly deps: OnDemandDeps) {}
 
   private now(): number {
     return this.deps.now ? this.deps.now() : Date.now();
+  }
+
+  /** the deadline the next stop decision will use; null when not an active on-demand channel */
+  stopDeadlineMs(channelId: string): number | null {
+    return this.stopDeadlines.get(channelId) ?? null;
   }
 
   /** merge viewer demand events, per slug, keeping the max timestamp seen for each kind */
@@ -133,6 +140,7 @@ export class OnDemandEngine {
    */
   async tick(channels: OnDemandChannelTick[]): Promise<void> {
     const nowMs = this.now();
+    const nextDeadlines = new Map<string, number>();
     for (const ch of channels) {
       if (!ch.allCold) continue;
       const rec = this.demand.get(ch.slug);
@@ -145,6 +153,7 @@ export class OnDemandEngine {
 
       if (ch.hasRow) {
         this.starting.delete(ch.channelId);
+        if (Number.isFinite(deadlineMs)) nextDeadlines.set(ch.channelId, deadlineMs);
         if (ch.rowPhase === 'complete' && deadlineMs <= nowMs) {
           try {
             await this.deps.releaseOnDemand(ch.channelId);
@@ -184,5 +193,7 @@ export class OnDemandEngine {
         });
       }
     }
+    this.stopDeadlines.clear();
+    for (const [channelId, ms] of nextDeadlines) this.stopDeadlines.set(channelId, ms);
   }
 }
