@@ -309,6 +309,12 @@ export const api = {
       'GET',
       `/api/restreamer/nodes/${instanceId}/${nodeId}/sessions/${name}/log${lines !== undefined ? `?lines=${lines}` : ''}`,
     ),
+  /** tail of the daemon's own log ring (not any one session) */
+  restreamerNodeLog: (instanceId: string, nodeId: string, lines?: number) =>
+    http<LogLine[]>(
+      'GET',
+      `/api/restreamer/nodes/${instanceId}/${nodeId}/log${lines !== undefined ? `?lines=${lines}` : ''}`,
+    ),
 
   restreamProfiles: () => http<RestreamProfile[]>('GET', '/api/restreamer/profiles'),
   createRestreamProfile: (name: string, payload: AribHlsParams) =>

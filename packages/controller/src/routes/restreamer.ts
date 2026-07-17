@@ -34,6 +34,7 @@ import {
 } from '../restreamer/service.js';
 import { parseNodeSettings, parseProbeSettings } from '../restreamer/probeSettings.js';
 import { RestreamerError } from '../restreamer/client.js';
+import { sessionNameFor } from '../restreamer/sessionName.js';
 import { httpError, requireDb, type AppContext } from './context.js';
 import { mergeEpg, type EpgMergeInput } from './epg.js';
 
@@ -178,9 +179,12 @@ function entryUrl(config: AppConfig, channel: RestreamChannelWithStatus): string
   if (enabled.length === 0) return null;
   const sw = config.restreamer?.switcher;
   if (sw) return `${sw.publicUrl}/hls/${channel.slug}/playlist.m3u8`;
+  const row = channel.failover
+    ? { activation_uuid: channel.failover.activationUuid, to_placement_id: channel.failover.toPlacementId }
+    : null;
   for (const p of enabled) {
     const serveUrl = nodeServeUrl(config, p.instanceId, p.nodeId);
-    if (serveUrl) return `${serveUrl}/${p.id}/playlist.m3u8`;
+    if (serveUrl) return `${serveUrl}/${sessionNameFor(p.id, row)}/playlist.m3u8`;
   }
   return null;
 }
@@ -657,6 +661,100 @@ export function registerRestreamerRoutes(app: FastifyInstance, ctx: AppContext):
         let upstream: Response;
         try {
           upstream = await client.sessionLogStream(name, abort.signal);
+        } catch (err) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              error: `restreamer node unreachable: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+          );
+          cleanup();
+          return;
+        }
+        if (!upstream.ok || !upstream.body) {
+          res.writeHead(upstream.status || 502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: `daemon log stream HTTP ${upstream.status}` }));
+          cleanup();
+          return;
+        }
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+          'x-accel-buffering': 'no',
+        });
+        try {
+          const reader = upstream.body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) res.write(Buffer.from(value));
+          }
+        } catch {
+          /* upstream ended or client vanished */
+        } finally {
+          cleanup();
+        }
+      })();
+    },
+  );
+
+  app.get<{ Params: { instanceId: string; nodeId: string }; Querystring: { lines?: string } }>(
+    '/api/restreamer/nodes/:instanceId/:nodeId/log',
+    async (req) => {
+      const { instanceId, nodeId } = req.params;
+      const client = ctx.restreamerClients.get(nodeKey(instanceId, nodeId));
+      if (!client) throw httpError(404, `unknown restreamer node ${nodeKey(instanceId, nodeId)}`);
+      let lines: number | undefined;
+      if (req.query.lines !== undefined) {
+        lines = Number(req.query.lines);
+        if (!Number.isInteger(lines) || lines <= 0) {
+          throw httpError(400, 'lines must be a positive integer');
+        }
+      }
+      try {
+        return await client.log(lines);
+      } catch (err) {
+        throw passthroughError(err);
+      }
+    },
+  );
+
+  /**
+   * Transparent byte relay of the daemon's own SSE log stream — same
+   * hijack/abort/tracked-relay contract as the per-session stream above, just
+   * without a session name (the daemon's own log, src 'daemon').
+   */
+  app.get<{ Params: { instanceId: string; nodeId: string } }>(
+    '/api/restreamer/nodes/:instanceId/:nodeId/log/stream',
+    (req, reply) => {
+      const { instanceId, nodeId } = req.params;
+      const client = ctx.restreamerClients.get(nodeKey(instanceId, nodeId));
+      if (!client) {
+        void reply
+          .status(404)
+          .send({ error: `unknown restreamer node ${nodeKey(instanceId, nodeId)}` });
+        return;
+      }
+      reply.hijack();
+      const res = reply.raw;
+      const abort = new AbortController();
+      logRelayAborts.add(abort);
+      const cleanup = (): void => {
+        logRelayAborts.delete(abort);
+        abort.abort();
+        try {
+          res.end();
+        } catch {
+          /* already gone */
+        }
+      };
+      req.raw.on('close', cleanup);
+      req.raw.on('error', cleanup);
+      void (async () => {
+        let upstream: Response;
+        try {
+          upstream = await client.logStream(abort.signal);
         } catch (err) {
           res.writeHead(502, { 'content-type': 'application/json' });
           res.end(

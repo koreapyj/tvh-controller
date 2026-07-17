@@ -23,13 +23,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { dateTime } from '../lib/format.js';
   import { notify } from '../lib/notifications.js';
   import { sessionStateBadge } from '../lib/restreamFields.js';
-  import { appendLogLine, sessionLogStreamUrl } from '../lib/sessionLog.js';
+  import { appendLogLine, nodeLogStreamUrl, sessionLogStreamUrl } from '../lib/sessionLog.js';
 
   // One session's detail: live info (lag/memory/restarts), restart /
   // reset-restarts controls, and a live-tailing log pane. The log pane opens
   // its own EventSource (no one-shot REST seed — the stream itself replays a
   // ring tail on connect) and re-seeds `lines` on every 'open' so an
   // auto-reconnect never shows the replay twice.
+  //
+  // `session: null` is the node-level "daemon log" variant: no per-session
+  // state/lag/memory/restart controls, just the log pane tailing the
+  // daemon's own log ring instead of one session's.
 
   let {
     instanceId,
@@ -42,7 +46,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }: {
     instanceId: string;
     nodeId: string;
-    session: EnrichedSessionStatus;
+    session: EnrichedSessionStatus | null;
     serveUrl: string | null;
     channelId: string | null;
     onDemandStopAt: string | null;
@@ -60,7 +64,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   // controller-side) is what a human should see first, with the uuid kept
   // around (muted / tooltip) to disambiguate two placements of the same
   // channel mid-cutover.
-  const displayName = $derived(session.channelSlug ?? session.name);
+  const displayName = $derived(session ? (session.channelSlug ?? session.name) : 'Daemon log');
 
   // deadline-only changes never trigger a `restreamer-channel` SSE publish
   // (dedup key excludes it), so keep it current with a direct poll instead
@@ -83,7 +87,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   });
 
   $effect(() => {
-    const es = new EventSource(sessionLogStreamUrl(instanceId, nodeId, session.name));
+    const es = new EventSource(
+      session ? sessionLogStreamUrl(instanceId, nodeId, session.name) : nodeLogStreamUrl(instanceId, nodeId),
+    );
     es.addEventListener('open', () => {
       lines = []; // dedup the replayed ring tail across auto-reconnects
     });
@@ -118,6 +124,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 
   async function resetRestarts(): Promise<void> {
+    if (!session) return; // no restart-count control in the daemon-log variant
     busyReset = true;
     try {
       await api.resetRestreamSessionRestarts(instanceId, nodeId, session.name);
@@ -129,6 +136,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   }
 
   async function restart(): Promise<void> {
+    if (!session) return; // no restart control in the daemon-log variant
     if (!confirm(`Restart session "${displayName}"? Playback glitches briefly.`)) return;
     busyRestart = true;
     try {
@@ -144,41 +152,45 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 <svelte:window onkeydown={(e) => e.key === 'Escape' && onclose()} />
 
 <div class="modal-backdrop" role="presentation" onclick={(e) => e.target === e.currentTarget && onclose()}>
-  <div class="modal" role="dialog" aria-modal="true" aria-label={`Session ${displayName}`}>
+  <div class="modal" role="dialog" aria-modal="true" aria-label={session ? `Session ${displayName}` : displayName}>
     <h2 style="margin-top:0">
       {displayName}
-      {#if session.channelSlug}<span class="muted small" title={session.name}>{session.name}</span>{/if}
-      <span class="badge {sessionStateBadge(session.state)}">{session.state}</span>
+      {#if session}
+        {#if session.channelSlug}<span class="muted small" title={session.name}>{session.name}</span>{/if}
+        <span class="badge {sessionStateBadge(session.state)}">{session.state}</span>
+      {/if}
     </h2>
 
-    <div class="muted small" style="display:flex;flex-direction:column;gap:6px">
-      {#if liveStopAt}
-        <div>on-demand · stops at {dateTime(liveStopAt)}</div>
-      {/if}
-      <div>
-        Playlist:
-        {#if serveUrl}
-          <a href="{serveUrl}/{session.name}/playlist.m3u8" target="_blank">
-            {serveUrl}/{session.name}/playlist.m3u8
-          </a>
-        {:else}—{/if}
+    {#if session}
+      <div class="muted small" style="display:flex;flex-direction:column;gap:6px">
+        {#if liveStopAt}
+          <div>on-demand · stops at {dateTime(liveStopAt)}</div>
+        {/if}
+        <div>
+          Playlist:
+          {#if serveUrl}
+            <a href="{serveUrl}/{session.name}/playlist.m3u8" target="_blank">
+              {serveUrl}/{session.name}/playlist.m3u8
+            </a>
+          {:else}—{/if}
+        </div>
+        <div>Lag: {session.playlistLagSec !== undefined ? `${Math.round(session.playlistLagSec)}s` : '—'}</div>
+        <div>
+          Memory: {session.memoryRssMb !== undefined ? `${Math.round(session.memoryRssMb)} MB` : '—'}
+        </div>
+        <div>
+          Last exit:
+          {session.lastExit ? `${session.lastExit.class} @ ${dateTime(session.lastExit.at)}` : '—'}
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span>Restarts: {session.restarts}</span>
+          <button disabled={busyReset} onclick={() => void resetRestarts()}>Reset count</button>
+          <button disabled={busyRestart} title="kill + respawn, reset backoff" onclick={() => void restart()}>
+            Restart
+          </button>
+        </div>
       </div>
-      <div>Lag: {session.playlistLagSec !== undefined ? `${Math.round(session.playlistLagSec)}s` : '—'}</div>
-      <div>
-        Memory: {session.memoryRssMb !== undefined ? `${Math.round(session.memoryRssMb)} MB` : '—'}
-      </div>
-      <div>
-        Last exit:
-        {session.lastExit ? `${session.lastExit.class} @ ${dateTime(session.lastExit.at)}` : '—'}
-      </div>
-      <div style="display:flex;gap:8px;align-items:center">
-        <span>Restarts: {session.restarts}</span>
-        <button disabled={busyReset} onclick={() => void resetRestarts()}>Reset count</button>
-        <button disabled={busyRestart} title="kill + respawn, reset backoff" onclick={() => void restart()}>
-          Restart
-        </button>
-      </div>
-    </div>
+    {/if}
 
     <div style="margin-top:14px">
       <div style="display:flex;align-items:center;gap:8px">

@@ -66,7 +66,7 @@ export interface NodeProbeTarget {
   nodeId: string;
   /** null = node not directly serveable — instance probes are skipped ("n/a") */
   serveUrl: string | null;
-  /** names (placement ids) of sessions currently desired on this node (docs' inclusion rules) */
+  /** names of sessions currently desired on this node (docs' inclusion rules) — usually a placement id, or an on-demand row's activation_uuid for its current target */
   sessionNames: string[];
 }
 

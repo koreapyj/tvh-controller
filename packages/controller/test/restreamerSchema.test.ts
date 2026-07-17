@@ -1252,6 +1252,123 @@ describe('migration 008_restreamer', () => {
     });
   });
 
+  describe('024_activation_uuid', () => {
+    it('up adds a nullable activation_uuid column; migrating back down drops it', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '023_drop_switcher_state');
+
+        await db
+          .insertInto('restream_profiles')
+          .values({
+            id: 'prof-1',
+            name: 'default-3M',
+            payload: JSON.stringify({ template: 'arib-hls', templateVersion: 1 }),
+            updated_at: NOW,
+          })
+          .execute();
+        await db
+          .insertInto('restream_channels')
+          .values({
+            id: 'chan-1',
+            slug: 'at-x',
+            channel_name: 'AT-X',
+            channel_number: '9.1',
+            profile_id: 'prof-1',
+            enabled: 1,
+            comment: null,
+            updated_at: NOW,
+          })
+          .execute();
+        await db
+          .insertInto('restream_placements')
+          .values({
+            id: 'plc-1',
+            channel_id: 'chan-1',
+            instance_id: 'tyo1',
+            node_id: 'node1',
+            priority: 0,
+            enabled: 1,
+            profile_id: null,
+            program_number: null,
+            updated_at: NOW,
+          })
+          .execute();
+
+        interface FailoverStateRow023 {
+          channel_id: string;
+          from_placement_id: string | null;
+          to_placement_id: string;
+          phase: string;
+          trigger_reason: string;
+          trigger_node_id: string | null;
+          trigger_detail: string | null;
+          suppress_from: number;
+          drain_until: string | null;
+          started_at: string;
+          updated_at: string;
+        }
+        const oldDb = db as unknown as Kysely<{ restream_failover_state: FailoverStateRow023 }>;
+        await oldDb
+          .insertInto('restream_failover_state')
+          .values({
+            channel_id: 'chan-1',
+            from_placement_id: null,
+            to_placement_id: 'plc-1',
+            phase: 'complete',
+            trigger_reason: 'on-demand',
+            trigger_node_id: null,
+            trigger_detail: null,
+            suppress_from: 1,
+            drain_until: null,
+            started_at: NOW,
+            updated_at: NOW,
+          })
+          .execute();
+
+        await migrateToLatest(db);
+
+        const row = await db
+          .selectFrom('restream_failover_state')
+          .selectAll()
+          .where('channel_id', '=', 'chan-1')
+          .executeTakeFirstOrThrow();
+        expect(row.activation_uuid).toBeNull();
+
+        await db
+          .updateTable('restream_failover_state')
+          .set({ activation_uuid: 'aaaaaaaa-0000-0000-0000-000000000000' })
+          .where('channel_id', '=', 'chan-1')
+          .execute();
+        expect(
+          (
+            await db
+              .selectFrom('restream_failover_state')
+              .selectAll()
+              .where('channel_id', '=', 'chan-1')
+              .executeTakeFirstOrThrow()
+          ).activation_uuid,
+        ).toBe('aaaaaaaa-0000-0000-0000-000000000000');
+
+        await migrateTo(db, '023_drop_switcher_state');
+
+        const reverted = await oldDb
+          .selectFrom('restream_failover_state')
+          .selectAll()
+          .where('channel_id', '=', 'chan-1')
+          .executeTakeFirstOrThrow();
+        expect(reverted).not.toHaveProperty('activation_uuid');
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
   it('enforces UNIQUE(channel_id, instance_id, node_id) on placements', async () => {
     await seed();
     await expect(

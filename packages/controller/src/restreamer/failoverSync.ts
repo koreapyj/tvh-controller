@@ -39,6 +39,7 @@
  * (tick / request* wrappers serialize there), mirroring SwitcherSync.
  */
 
+import { randomUUID } from 'node:crypto';
 import type {
   AribHlsParams,
   FailoverPhase,
@@ -71,6 +72,7 @@ import {
   type FailoverCandidate,
 } from './failoverPolicy.js';
 import type { ProbeSnapshot } from './probeEngine.js';
+import { sessionNameFor } from './sessionName.js';
 import { SWITCHER_CACHE_KEY, type SwitcherHubLike } from './switcherHubTypes.js';
 
 export { FAILOVER_TICK_MS } from './failoverPolicy.js';
@@ -426,11 +428,16 @@ export class FailoverSync {
     trigger_node_id: string | null;
     trigger_detail: string | null;
     suppress_from: number;
+    activation_uuid: string | null;
   }): Promise<void> {
+    // activation_uuid is excluded from the conflict update: a row is only
+    // ever re-created for a channel once its prior row is gone, so a
+    // conflict here never legitimately carries a new uuid to apply.
+    const { activation_uuid: _activationUuid, ...updateOnConflict } = values;
     await this.db
       .insertInto('restream_failover_state')
       .values({ ...values, drain_until: null, started_at: dbNow(), updated_at: dbNow() })
-      .onDuplicateKeyUpdate({ ...values, drain_until: null, started_at: dbNow(), updated_at: dbNow() })
+      .onDuplicateKeyUpdate({ ...updateOnConflict, drain_until: null, started_at: dbNow(), updated_at: dbNow() })
       .execute();
   }
 
@@ -735,6 +742,7 @@ export class FailoverSync {
       trigger_node_id: item.triggerNodeId,
       trigger_detail: item.detail || null,
       suppress_from: suppressFrom,
+      activation_uuid: item.reason === 'on-demand' ? randomUUID() : null,
     });
     // refresh the in-memory view so advanceActive sees the new row this tick
     data.rows.set(item.channelId, (await this.loadRow(item.channelId))!);
@@ -873,8 +881,13 @@ export class FailoverSync {
       const status = this.cache.has(from.instance_id)
         ? (this.cache.get(from.instance_id).restreamers.find((r) => r.nodeId === from.node_id) ?? null)
         : null;
+      // from.id never equals row.to_placement_id (retarget candidates
+      // exclude row.from_placement_id), so this always compares against
+      // from.id itself — sessionNameFor is only ever a rename for the TO
+      // placement, which from can never be.
       oldSessionGone =
-        status?.reachable === true && !status.sessions.some((s) => s.name === from.id);
+        status?.reachable === true &&
+        !status.sessions.some((s) => s.name === sessionNameFor(from.id, row));
     }
 
     return {

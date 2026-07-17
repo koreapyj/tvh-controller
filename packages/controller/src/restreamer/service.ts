@@ -56,6 +56,7 @@ import { OnDemandEngine, type OnDemandChannelTick } from './onDemand.js';
 import { ProbeEngine, type ProbeTargets } from './probeEngine.js';
 import { NODE_PROBE_DEFAULTS, probeSettingsToRow, rowToProbeSettings } from './probeSettings.js';
 import type { RestreamerPollerHooks } from './poller.js';
+import { sessionNameFor } from './sessionName.js';
 import { SWITCHER_CACHE_KEY, type DemandEvent, type SwitcherHubLike } from './switcherHubTypes.js';
 import {
   SwitcherSync,
@@ -407,13 +408,30 @@ export class RestreamerService {
   /** brief cache for the per-node session-cap map, keyed by nodeKey() */
   private nodeCapacityCache: { at: number; map: Map<string, number | null> } | null = null;
   /**
-   * brief cache for placementId -> channel slug (session display enrichment,
-   * event messages + web). Populated on demand from a single query shared
-   * across every node's poll tick rather than a per-tick/per-session lookup;
-   * a few seconds of staleness after a channel/placement CRUD is fine — the
-   * next poll tick heals it.
+   * brief cache for session name -> {placementId, slug} (session display
+   * enrichment, event messages + web). Keyed by both a placement's own id
+   * and, when it is an on-demand row's current target, its activation_uuid
+   * — either key resolves to the same placement/slug pair. Populated on
+   * demand from a single query shared across every node's poll tick rather
+   * than a per-tick/per-session lookup; a few seconds of staleness after a
+   * channel/placement CRUD is fine — the next poll tick heals it.
    */
-  private placementSlugCache: { at: number; map: Map<string, string> } | null = null;
+  private placementSlugCache: {
+    at: number;
+    map: Map<string, { placementId: string; slug: string; channelId: string }>;
+  } | null = null;
+  /**
+   * Bounded name -> {slug, channelId} capture, insertion-order-evicted past
+   * NAME_SLUG_CAPTURE_MAX entries. Unlike placementSlugCache (a brief TTL
+   * over a live query), this persists across a placement row's deletion: a
+   * pending removal's session name usually no longer resolves via the live
+   * query by the time the daemon reports it draining, so pendingRemovals
+   * enrichment falls back to whatever this cache last captured for that name
+   * while it was still resolvable. A controller restart loses it — an
+   * in-flight drain's slug shows as unresolved until the row is gone anyway.
+   */
+  private readonly nameSlugCapture = new Map<string, { slug: string; channelId: string }>();
+  private static readonly NAME_SLUG_CAPTURE_MAX = 500;
 
   constructor(
     private readonly db: Db,
@@ -814,7 +832,7 @@ export class RestreamerService {
           ...this.rowToPlacement(p),
           blockedReason: resolution.ok ? null : resolution.reason,
           resolvedVia: resolution.ok ? resolution.via : null,
-          session: nodeStatus?.sessions.find((s) => s.name === p.id) ?? null,
+          session: nodeStatus?.sessions.find((s) => s.name === sessionNameFor(p.id, fo)) ?? null,
           indicator: indicators.get(p.id) ?? ('idle' as const),
           lagProbe: this.probeEngine.lagStatus(p.id),
         };
@@ -829,6 +847,7 @@ export class RestreamerService {
             triggerReason: fo.trigger_reason as FailoverTriggerReason,
             triggerDetail: fo.trigger_detail,
             startedAt: new Date(fo.started_at).toISOString(),
+            activationUuid: fo.activation_uuid,
           }
         : null;
       return {
@@ -842,6 +861,7 @@ export class RestreamerService {
         playbackUrl: this.playbackUrl(
           c.slug,
           chanPlacements.filter((p) => !!p.enabled),
+          fo,
         ),
         onDemandStopAt: stopDeadlineMs == null ? null : new Date(stopDeadlineMs).toISOString(),
       };
@@ -885,6 +905,7 @@ export class RestreamerService {
   private playbackUrl(
     slug: string,
     enabledPlacements: Array<{ id: string; instance_id: string; node_id: string }>,
+    row: { activation_uuid: string | null; to_placement_id: string } | null,
   ): string | null {
     if (enabledPlacements.length === 0) return null;
     const sw = this.config.restreamer?.switcher;
@@ -892,7 +913,7 @@ export class RestreamerService {
     if (enabledPlacements.length === 1) {
       const p = enabledPlacements[0]!;
       const serveUrl = this.nodeConfig(p.instance_id, p.node_id)?.serveUrl;
-      return serveUrl ? `${serveUrl}/${p.id}/playlist.m3u8` : null;
+      return serveUrl ? `${serveUrl}/${sessionNameFor(p.id, row)}/playlist.m3u8` : null;
     }
     return null;
   }
@@ -2448,6 +2469,8 @@ export class RestreamerService {
         'ppr.payload as placement_profile_payload',
         'fsFrom.suppress_from as fs_suppress_from',
         'fsFrom.phase as fs_from_phase',
+        'fs.to_placement_id as fs_to_placement_id',
+        'fs.activation_uuid as fs_activation_uuid',
       ])
       .where('p.instance_id', '=', instanceId)
       .where('p.node_id', '=', nodeId)
@@ -2469,6 +2492,20 @@ export class RestreamerService {
 
     const sessions: DesiredSession[] = [];
     const blocked: BlockedPlacement[] = [];
+    // every row's session name, keyed by placement id — an on-demand row's
+    // target is named for its activation_uuid instead, so the anti-flap and
+    // pushedNames checks below (which compare against a PREVIOUSLY pushed
+    // doc) must resolve names the same way the previous computation did.
+    const nameByPlacementId = new Map<string, string>();
+    for (const row of rows) {
+      nameByPlacementId.set(
+        row.placement_id,
+        sessionNameFor(row.placement_id, {
+          activation_uuid: row.fs_activation_uuid,
+          to_placement_id: row.fs_to_placement_id,
+        }),
+      );
+    }
     for (const row of rows) {
       // stop the outgoing placement's ENCODE only — it stays a switcher
       // upstream for the row's lifetime so the retained window keeps draining
@@ -2479,6 +2516,7 @@ export class RestreamerService {
       ) {
         continue;
       }
+      const name = nameByPlacementId.get(row.placement_id) ?? row.placement_id;
       const resolved = this.resolvePlacement(
         instanceId,
         nodeId,
@@ -2504,7 +2542,7 @@ export class RestreamerService {
       if (!topo && resolved.via === 'catalog') {
         const last = await getLastPushed();
         const prevSession =
-          last === UNKNOWN ? null : (last?.sessions.find((s) => s.name === row.placement_id) ?? null);
+          last === UNKNOWN ? null : (last?.sessions.find((s) => s.name === name) ?? null);
         if (last === UNKNOWN || (prevSession && 'channelUuid' in prevSession.source)) {
           blocked.push({
             placementId: row.placement_id,
@@ -2529,7 +2567,7 @@ export class RestreamerService {
       // the semantic payload or needs arib-hls's requiredCaps (qsv/opencl).
       const pipeline = buildRawArgvParams(semantic);
       sessions.push({
-        name: row.placement_id,
+        name,
         enabled: true,
         source: resolved.source,
         tsreadex:
@@ -2547,7 +2585,13 @@ export class RestreamerService {
         return { doc: null, blocked, deferred: true };
       }
       const pushedNames = new Set((last?.sessions ?? []).map((s) => s.name));
-      if (blocked.some((b) => pushedNames.has(b.placementId))) {
+      if (
+        blocked.some(
+          (b) =>
+            pushedNames.has(b.placementId) ||
+            pushedNames.has(nameByPlacementId.get(b.placementId) ?? b.placementId),
+        )
+      ) {
         return { doc: null, blocked, deferred: true };
       }
     }
@@ -2939,16 +2983,36 @@ export class RestreamerService {
       getMaxSessions: async (instanceId, nodeId) =>
         (await this.allNodeCapacity()).get(nodeKey(instanceId, nodeId)) ?? null,
       enrichSessions: async (_instanceId, _nodeId, sessions) => {
-        // post-rename the session name IS the placement id — feeds both the
-        // probe-engine lookup (no lookup needed there) and the slug map below
+        // the session name is the placement id, unless it is an on-demand
+        // row's current target — then it is the row's activation_uuid
+        // instead, so it must be resolved back to the real placement id
+        // before the (placementId-keyed) lag probe lookup below.
         const slugMap = await this.placementSlugMap();
         return sessions.map((s) => {
-          const lagProbe = this.probeEngine.lagStatus(s.name);
+          const info = slugMap.get(s.name);
+          if (info) this.captureNameSlug(s.name, { slug: info.slug, channelId: info.channelId });
+          const lagProbe = info ? this.probeEngine.lagStatus(info.placementId) : null;
           return {
             ...s,
-            channelSlug: slugMap.get(s.name) ?? null,
+            channelSlug: info?.slug ?? null,
             ...(lagProbe ? { lagProbe } : {}),
           };
+        });
+      },
+      // a pending removal's placement row is usually already deleted by the
+      // time the daemon reports it draining, so the live query only resolves
+      // a slug for one still on its way out; fall back to whatever the
+      // capture cache last saw for that name.
+      enrichPendingRemovals: async (_instanceId, _nodeId, removals) => {
+        const slugMap = await this.placementSlugMap();
+        return removals.map((r) => {
+          const info = slugMap.get(r.name);
+          if (info) {
+            this.captureNameSlug(r.name, { slug: info.slug, channelId: info.channelId });
+            return { ...r, channelSlug: info.slug };
+          }
+          const captured = this.nameSlugCapture.get(r.name);
+          return { ...r, channelSlug: captured?.slug ?? null };
         });
       },
     };
@@ -3009,6 +3073,7 @@ export class RestreamerService {
         'c.id as channel_id',
         'c.slug',
         'fs.to_placement_id as fs_to',
+        'fs.activation_uuid as fs_activation_uuid',
         'fsFrom.from_placement_id as fs_from',
         'fsFrom.suppress_from as fs_suppress_from',
         'fsFrom.phase as fs_from_phase',
@@ -3042,25 +3107,34 @@ export class RestreamerService {
         };
         nodes.set(key, node);
       }
-      node.sessionNames.push(r.placement_id);
+      const name = sessionNameFor(r.placement_id, {
+        activation_uuid: r.fs_activation_uuid,
+        to_placement_id: r.fs_to,
+      });
+      node.sessionNames.push(name);
       placements.push({
         channelId: r.channel_id,
         placementId: r.placement_id,
         instanceId: r.instance_id,
         nodeId: r.node_id,
         slug: r.slug,
-        playlistUrl: node.serveUrl ? `${node.serveUrl}/${r.placement_id}/playlist.m3u8` : null,
+        playlistUrl: node.serveUrl ? `${node.serveUrl}/${name}/playlist.m3u8` : null,
       });
     }
     return { nodes: [...nodes.values()], placements };
   }
 
   /**
-   * placementId -> channel slug, briefly cached. Backs the session
-   * `channelSlug` display enrichment (session-restart event messages + the
-   * web node-card session table) without a per-tick DB query.
+   * session name -> {placementId, slug}, briefly cached. A session's name
+   * is the placement's own id, unless it is an on-demand row's current
+   * target — then it is also reachable by the row's activation_uuid, both
+   * keys resolving to the same placement. Backs the session `channelSlug`
+   * display enrichment (session-restart event messages + the web node-card
+   * session table) without a per-tick DB query.
    */
-  private async placementSlugMap(): Promise<Map<string, string>> {
+  private async placementSlugMap(): Promise<
+    Map<string, { placementId: string; slug: string; channelId: string }>
+  > {
     const nowMs = Date.now();
     if (this.placementSlugCache && nowMs - this.placementSlugCache.at < 4_000) {
       return this.placementSlugCache.map;
@@ -3068,11 +3142,31 @@ export class RestreamerService {
     const rows = await this.db
       .selectFrom('restream_placements as p')
       .innerJoin('restream_channels as c', 'c.id', 'p.channel_id')
-      .select(['p.id', 'c.slug'])
+      .leftJoin('restream_failover_state as fs', 'fs.to_placement_id', 'p.id')
+      .select(['p.id', 'c.slug', 'c.id as channel_id', 'fs.activation_uuid'])
       .execute();
-    const map = new Map(rows.map((r) => [r.id, r.slug]));
+    const map = new Map<string, { placementId: string; slug: string; channelId: string }>();
+    for (const r of rows) {
+      const entry = { placementId: r.id, slug: r.slug, channelId: r.channel_id };
+      map.set(r.id, entry);
+      if (r.activation_uuid) map.set(r.activation_uuid, entry);
+    }
     this.placementSlugCache = { at: nowMs, map };
     return map;
+  }
+
+  /**
+   * Records a resolved name -> {slug, channelId} into the bounded
+   * nameSlugCapture cache, refreshing its insertion-order position so
+   * recently-seen names are evicted last.
+   */
+  private captureNameSlug(name: string, info: { slug: string; channelId: string }): void {
+    this.nameSlugCapture.delete(name);
+    this.nameSlugCapture.set(name, info);
+    if (this.nameSlugCapture.size > RestreamerService.NAME_SLUG_CAPTURE_MAX) {
+      const oldest = this.nameSlugCapture.keys().next().value;
+      if (oldest !== undefined) this.nameSlugCapture.delete(oldest);
+    }
   }
 
   /** all nodes' probe settings (stored overrides over defaults), briefly cached */

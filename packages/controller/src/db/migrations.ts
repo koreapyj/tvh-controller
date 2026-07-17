@@ -961,6 +961,17 @@ migrations['023_drop_switcher_state'] = {
   },
 };
 
+migrations['024_activation_uuid'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // single-use id minted for an on-demand row's target placement; NULL for
+    // every other trigger_reason and for the row's from_placement_id.
+    await db.schema.alterTable('restream_failover_state').addColumn('activation_uuid', 'varchar(36)').execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.alterTable('restream_failover_state').dropColumn('activation_uuid').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

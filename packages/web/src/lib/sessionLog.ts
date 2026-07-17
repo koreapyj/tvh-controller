@@ -40,3 +40,10 @@ export function sessionLogStreamUrl(instanceId: string, nodeId: string, name: st
     `/sessions/${encodeURIComponent(name)}/log/stream`
   );
 }
+
+/** EventSource URL for the daemon's own live log tail (GET .../log/stream), not any one session */
+export function nodeLogStreamUrl(instanceId: string, nodeId: string): string {
+  return (
+    `/api/restreamer/nodes/${encodeURIComponent(instanceId)}/${encodeURIComponent(nodeId)}/log/stream`
+  );
+}

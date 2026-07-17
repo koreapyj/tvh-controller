@@ -18,8 +18,10 @@
 
 import { RESTREAMER_API_VERSION } from '@tvhc/shared';
 import type {
+  EnrichedPendingRemoval,
   EnrichedSessionStatus,
   NodeProbeStatus,
+  PendingRemoval,
   RestreamerNodeStatus,
   SessionStatus,
   SourceCatalogEntry,
@@ -82,6 +84,12 @@ export interface RestreamerPollerHooks {
     nodeId: string,
     sessions: SessionStatus[],
   ) => Promise<EnrichedSessionStatus[]> | EnrichedSessionStatus[];
+  /** resolve a channel slug for each pending removal, where possible */
+  enrichPendingRemovals?: (
+    instanceId: string,
+    nodeId: string,
+    removals: PendingRemoval[],
+  ) => Promise<EnrichedPendingRemoval[]> | EnrichedPendingRemoval[];
 }
 
 /**
@@ -98,6 +106,11 @@ function statusKey(status: RestreamerNodeStatus): string {
 /** no enrichSessions hook (or it threw): pass sessions through with channelSlug unknown */
 function bareEnrich(sessions: SessionStatus[]): EnrichedSessionStatus[] {
   return sessions.map((s) => ({ ...s, channelSlug: null }));
+}
+
+/** no enrichPendingRemovals hook (or it threw): pass removals through with channelSlug unknown */
+function bareEnrichPendingRemovals(removals: PendingRemoval[]): EnrichedPendingRemoval[] {
+  return removals.map((r) => ({ ...r, channelSlug: null }));
 }
 
 /**
@@ -183,6 +196,9 @@ export class RestreamerPoller {
         capabilities: res.capabilities,
         templates: res.templates,
         maxSessions,
+        pendingRemovals: await this.enrichPendingRemovalsSafe(res.pendingRemovals ?? []),
+        lastAppliedAt: res.lastAppliedAt,
+        persistedStateCorrupt: res.persistedStateCorrupt,
       };
       await this.checkRevision(res.desiredRevision);
     } catch (err) {
@@ -208,6 +224,8 @@ export class RestreamerPoller {
         capabilities: null,
         templates: null,
         maxSessions,
+        // no fresh /v1/status to read — same treatment as sessions above
+        pendingRemovals: [],
       };
     }
 
@@ -320,6 +338,19 @@ export class RestreamerPoller {
       );
     } catch {
       return bareEnrich(sessions);
+    }
+  }
+
+  private async enrichPendingRemovalsSafe(
+    removals: PendingRemoval[],
+  ): Promise<EnrichedPendingRemoval[]> {
+    try {
+      return (
+        (await this.hooks.enrichPendingRemovals?.(this.instanceId, this.node.id, removals)) ??
+        bareEnrichPendingRemovals(removals)
+      );
+    } catch {
+      return bareEnrichPendingRemovals(removals);
     }
   }
 

@@ -226,6 +226,96 @@ describe('RestreamerPoller', () => {
     });
   });
 
+  describe('pendingRemovals / lastAppliedAt / persistedStateCorrupt', () => {
+    const REMOVAL = { name: 'orphan-1', outDir: '/data/orphan-1', deadline: '2026-07-06T00:05:00Z' };
+
+    it('absent pendingRemovals (old daemon) -> empty list, both branches', async () => {
+      const { cache, status, poller } = setup();
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.pendingRemovals).toEqual([]);
+
+      status.mockRejectedValue(new Error('down'));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.pendingRemovals).toEqual([]);
+    });
+
+    it('a reachable poll carries pendingRemovals through bareEnrichPendingRemovals when no hook is wired', async () => {
+      const { cache, status, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ pendingRemovals: [REMOVAL] }));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.pendingRemovals).toEqual([
+        { ...REMOVAL, channelSlug: null },
+      ]);
+    });
+
+    it('the enrichPendingRemovals hook resolves a channel slug', async () => {
+      const enrichPendingRemovals = vi.fn(async (_i: string, _n: string, removals: typeof REMOVAL[]) =>
+        removals.map((r) => ({ ...r, channelSlug: 'at-x-slug' })),
+      );
+      const { cache, status, poller } = setup({ enrichPendingRemovals });
+      status.mockResolvedValue(nodeStatus({ pendingRemovals: [REMOVAL] }));
+      await poller.pollOnce();
+      expect(enrichPendingRemovals).toHaveBeenCalledWith('i1', 'n1', [REMOVAL]);
+      expect(cache.get('i1').restreamers[0]?.pendingRemovals).toEqual([
+        { ...REMOVAL, channelSlug: 'at-x-slug' },
+      ]);
+    });
+
+    it('a throwing enrichPendingRemovals hook is swallowed — plain removals pass through', async () => {
+      const enrichPendingRemovals = vi.fn(() => {
+        throw new Error('boom');
+      });
+      const { cache, status, poller } = setup({ enrichPendingRemovals });
+      status.mockResolvedValue(nodeStatus({ pendingRemovals: [REMOVAL] }));
+      await expect(poller.pollOnce()).resolves.toBeUndefined();
+      expect(cache.get('i1').restreamers[0]?.pendingRemovals).toEqual([
+        { ...REMOVAL, channelSlug: null },
+      ]);
+    });
+
+    it('an unreachable poll reports pendingRemovals as empty even if previously populated', async () => {
+      const { cache, status, poller } = setup();
+      status.mockResolvedValue(nodeStatus({ pendingRemovals: [REMOVAL] }));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.pendingRemovals).toHaveLength(1);
+
+      status.mockRejectedValue(new Error('down'));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.pendingRemovals).toEqual([]);
+    });
+
+    it('lastAppliedAt and persistedStateCorrupt pass through on a reachable poll; undefined when absent', async () => {
+      const { cache, status, poller } = setup();
+      status.mockResolvedValue(
+        nodeStatus({ lastAppliedAt: '2026-07-06T00:00:00Z', persistedStateCorrupt: true }),
+      );
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]).toMatchObject({
+        lastAppliedAt: '2026-07-06T00:00:00Z',
+        persistedStateCorrupt: true,
+      });
+
+      status.mockResolvedValue(nodeStatus());
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.lastAppliedAt).toBeUndefined();
+      expect(cache.get('i1').restreamers[0]?.persistedStateCorrupt).toBeUndefined();
+    });
+
+    it('an unreachable poll reports lastAppliedAt/persistedStateCorrupt as undefined', async () => {
+      const { cache, status, poller } = setup();
+      status.mockResolvedValue(
+        nodeStatus({ lastAppliedAt: '2026-07-06T00:00:00Z', persistedStateCorrupt: true }),
+      );
+      await poller.pollOnce();
+
+      status.mockRejectedValue(new Error('down'));
+      await poller.pollOnce();
+      expect(cache.get('i1').restreamers[0]?.lastAppliedAt).toBeUndefined();
+      expect(cache.get('i1').restreamers[0]?.persistedStateCorrupt).toBeUndefined();
+    });
+  });
+
   describe('revision-mismatch trigger', () => {
     it('fires when expected differs from the reported revision', async () => {
       const onRevisionMismatch = vi.fn();
@@ -603,6 +693,7 @@ describe('RestreamerPoller', () => {
           capabilities: null,
           templates: null,
           maxSessions: null,
+          pendingRemovals: [],
         },
       ];
 

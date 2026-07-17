@@ -14,6 +14,7 @@ import {
   type DesiredState,
   type EnrichedSessionStatus,
   type NodeSettings,
+  type PendingRemoval,
   type RawArgvParams,
   type RestreamProfile,
   type SourceCatalogEntry,
@@ -184,6 +185,10 @@ function sessionStatus(name: string): EnrichedSessionStatus {
   return { name, state: 'running', enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0, channelSlug: null };
 }
 
+function pendingRemoval(name: string): PendingRemoval {
+  return { name, outDir: `/data/${name}`, deadline: '2026-01-01T00:05:00Z' };
+}
+
 function seedNodeStatusEntry(cache: InstanceCache, instanceId: string, nodeId: string, sessions: EnrichedSessionStatus[] = []): void {
   cache.get(instanceId).restreamers.push({
     instanceId,
@@ -205,6 +210,7 @@ function seedNodeStatusEntry(cache: InstanceCache, instanceId: string, nodeId: s
     capabilities: null,
     templates: null,
     maxSessions: null,
+    pendingRemovals: [],
   });
 }
 
@@ -1509,6 +1515,40 @@ describe('listChannels status', () => {
     await h.destroy();
   });
 
+  it('playbackUrl without a switcher: an on-demand row targeting the sole placement uses its activation_uuid instead', async () => {
+    const h = await setup({ restreamer: undefined });
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: (await h.service.createProfile('p', profilePayload())).id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', mode: 'cold' }],
+    });
+    const atxPlacementId = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements[0]!.id;
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: chan.id,
+        from_placement_id: null,
+        to_placement_id: atxPlacementId,
+        phase: 'awaiting-lag',
+        trigger_reason: 'on-demand',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: TS,
+        updated_at: TS,
+        activation_uuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+      })
+      .execute();
+
+    const atx = (await h.service.listChannels()).find((c) => c.id === chan.id)!;
+    expect(atx.playbackUrl).toBe(
+      'http://hls.zone1-n1/aaaaaaaa-0000-0000-0000-000000000000/playlist.m3u8',
+    );
+    await h.destroy();
+  });
+
   it('playbackUrl: a redundant channel points at the switcher; null without a switcher', async () => {
     const h = await setup();
     const p = await h.service.createProfile('p', profilePayload());
@@ -1645,6 +1685,7 @@ describe('failover state placements', () => {
       phase?: string;
       suppressFrom?: boolean;
       triggerReason?: string;
+      activationUuid?: string | null;
     },
   ): Promise<void> {
     await h.db
@@ -1661,6 +1702,7 @@ describe('failover state placements', () => {
         drain_until: null,
         started_at: TS,
         updated_at: TS,
+        activation_uuid: fields.activationUuid ?? null,
       })
       .onDuplicateKeyUpdate({
         from_placement_id: fields.fromPlacementId,
@@ -1669,6 +1711,7 @@ describe('failover state placements', () => {
         trigger_reason: fields.triggerReason ?? 'manual',
         suppress_from: fields.suppressFrom ? 1 : 0,
         updated_at: TS,
+        activation_uuid: fields.activationUuid ?? null,
       })
       .execute();
   }
@@ -1692,6 +1735,42 @@ describe('failover state placements', () => {
       // n2 hosts the cold placement — its session is named after cold.id
       expect(doc!.sessions.map((s) => s.name), `phase=${phase}`).toEqual([cold.id]);
     }
+    await h.destroy();
+  });
+
+  it('names the session after activation_uuid for the TO placement of an on-demand row, leaving the FROM placement named by its own id', async () => {
+    const h = await setup();
+    const { chan, hot, cold } = await seedColdChannel(h);
+    await insertFailoverRow(h, {
+      channelId: chan.id,
+      fromPlacementId: hot.id,
+      toPlacementId: cold.id,
+      phase: 'awaiting-lag',
+      triggerReason: 'on-demand',
+      activationUuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+    });
+    const { doc: coldDoc } = await h.service.computeNodeDoc('zone1', 'n2');
+    expect(coldDoc!.sessions.map((s) => s.name)).toEqual(['aaaaaaaa-0000-0000-0000-000000000000']);
+    const { doc: hotDoc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(hotDoc!.sessions.map((s) => s.name)).toEqual([hot.id]);
+    await h.destroy();
+  });
+
+  it('a row with no activation_uuid produces a doc identical in shape and hash to a placement-named session (no `activation` field leaks in)', async () => {
+    const h = await setup();
+    const { chan, hot, cold } = await seedColdChannel(h);
+    await insertFailoverRow(h, {
+      channelId: chan.id,
+      fromPlacementId: hot.id,
+      toPlacementId: cold.id,
+      phase: 'complete',
+      triggerReason: 'lag',
+    });
+    const { doc } = await h.service.computeNodeDoc('zone1', 'n2');
+    expect(doc!.sessions).toEqual([
+      { name: cold.id, enabled: true, source: expect.anything(), tsreadex: expect.anything(), pipeline: expect.anything() },
+    ]);
+    expect(doc!.revision).toBe(sessionsHash(doc!.sessions));
     await h.destroy();
   });
 
@@ -1761,6 +1840,30 @@ describe('failover state placements', () => {
     });
     expect(listed!.placements.find((x) => x.id === cold.id)!.indicator).toBe('active');
     expect(listed!.placements.find((x) => x.id === hot.id)!.indicator).toBe('stopping');
+    await h.destroy();
+  });
+
+  it('listChannels exposes failover.activationUuid and matches the TO placement session by that uuid, not its own id', async () => {
+    const h = await setup();
+    const { chan, hot, cold } = await seedColdChannel(h);
+    await insertFailoverRow(h, {
+      channelId: chan.id,
+      fromPlacementId: hot.id,
+      toPlacementId: cold.id,
+      phase: 'awaiting-lag',
+      triggerReason: 'on-demand',
+      activationUuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+    });
+    seedNodeStatusEntry(h.cache, 'zone1', 'n2', [sessionStatus('aaaaaaaa-0000-0000-0000-000000000000')]);
+
+    const [listed] = await h.service.listChannels();
+    expect(listed!.failover).toMatchObject({
+      toPlacementId: cold.id,
+      activationUuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+    });
+    expect(listed!.placements.find((x) => x.id === cold.id)!.session?.name).toBe(
+      'aaaaaaaa-0000-0000-0000-000000000000',
+    );
     await h.destroy();
   });
 
@@ -2808,6 +2911,94 @@ describe('poller hooks', () => {
     expect(enriched.find((s) => s.name === 'orphan-uuid')?.channelSlug).toBeNull();
     await h.destroy();
   });
+
+  it('enrichSessions resolves an activation-uuid session name to the same channelSlug as its placement id', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const placementId = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements[0]!.id;
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: chan.id,
+        from_placement_id: null,
+        to_placement_id: placementId,
+        phase: 'awaiting-lag',
+        trigger_reason: 'on-demand',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: TS,
+        updated_at: TS,
+        activation_uuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+      })
+      .execute();
+
+    const hooks = h.service.pollerHooks();
+    const enriched = await hooks.enrichSessions!('zone1', 'n1', [
+      sessionStatus('aaaaaaaa-0000-0000-0000-000000000000'),
+    ]);
+    expect(enriched.find((s) => s.name === 'aaaaaaaa-0000-0000-0000-000000000000')?.channelSlug).toBe('at-x');
+    // the placement id itself still resolves too — the map carries both keys
+    expect((await hooks.enrichSessions!('zone1', 'n1', [sessionStatus(placementId)]))[0]!.channelSlug).toBe('at-x');
+    await h.destroy();
+  });
+
+  it('enrichPendingRemovals resolves channelSlug for a still-live placement and null for an unknown name', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const placementId = (await h.service.listChannels())[0]!.placements[0]!.id;
+
+    const hooks = h.service.pollerHooks();
+    const enriched = await hooks.enrichPendingRemovals!('zone1', 'n1', [
+      pendingRemoval(placementId),
+      pendingRemoval('orphan-uuid'),
+    ]);
+    expect(enriched.find((r) => r.name === placementId)?.channelSlug).toBe('at-x');
+    expect(enriched.find((r) => r.name === 'orphan-uuid')?.channelSlug).toBeNull();
+    // the rest of the PendingRemoval fields pass through unchanged
+    expect(enriched.find((r) => r.name === placementId)).toMatchObject({
+      outDir: `/data/${placementId}`,
+      deadline: '2026-01-01T00:05:00Z',
+    });
+    await h.destroy();
+  });
+
+  it('enrichPendingRemovals falls back to the name->slug capture cache once the placement row is gone', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1' }],
+    });
+    const placementId = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements[0]!.id;
+
+    const hooks = h.service.pollerHooks();
+    // seen once while still live, e.g. as a running session — captures the name->slug mapping
+    await hooks.enrichSessions!('zone1', 'n1', [sessionStatus(placementId)]);
+
+    // the channel (and its placement row) is now gone, as it typically is by
+    // the time the daemon reports the session draining
+    await h.service.deleteChannel(chan.id);
+
+    const enriched = await hooks.enrichPendingRemovals!('zone1', 'n1', [pendingRemoval(placementId)]);
+    expect(enriched[0]!.channelSlug).toBe('at-x');
+    await h.destroy();
+  });
 });
 
 // ---------- node settings (per-node session capacity) ----------
@@ -2933,6 +3124,119 @@ describe('probe engine wiring', () => {
       expect(url).toContain(`/${placementId}/playlist.m3u8`);
       expect(url).not.toContain('/at-x/');
     }
+    await h.destroy();
+  });
+
+  it('probes an on-demand target under its activation_uuid, not its placement id', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) => {
+        calls.push(String(url));
+        return new Response('', { status: 500 });
+      }),
+    );
+
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', mode: 'cold' }],
+    });
+    const placementId = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements[0]!.id;
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: chan.id,
+        from_placement_id: null,
+        to_placement_id: placementId,
+        phase: 'awaiting-lag',
+        trigger_reason: 'on-demand',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: TS,
+        updated_at: TS,
+        activation_uuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+      })
+      .execute();
+
+    await h.service.probeEngine.tick();
+
+    expect(calls.length).toBeGreaterThan(0);
+    for (const url of calls) {
+      expect(url).toContain('/aaaaaaaa-0000-0000-0000-000000000000/playlist.m3u8');
+      expect(url).not.toContain(`/${placementId}/`);
+    }
+    await h.destroy();
+  });
+});
+
+// ---------- session naming: computeNodeDoc, computeSwitcherDoc, and probe URLs agree ----------
+
+describe('session naming consistency across computeNodeDoc, switcherSync, and probe URLs', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('names the on-demand target session identically in the node doc, the switcher upstream URL, and the fetched probe URL', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string | URL) => {
+        calls.push(String(url));
+        return new Response('', { status: 500 });
+      }),
+    );
+
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'AT-X',
+      channelNumber: '9.1',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', mode: 'cold' }],
+    });
+    const placementId = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements[0]!.id;
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: chan.id,
+        from_placement_id: null,
+        to_placement_id: placementId,
+        phase: 'awaiting-lag',
+        trigger_reason: 'on-demand',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: TS,
+        updated_at: TS,
+        activation_uuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+      })
+      .execute();
+
+    const { doc: nodeDoc } = await h.service.computeNodeDoc('zone1', 'n1');
+    expect(nodeDoc!.sessions.map((s) => s.name)).toEqual(['aaaaaaaa-0000-0000-0000-000000000000']);
+
+    const { doc: switcherDoc } = await h.service.computeSwitcherDoc();
+    const ch = switcherDoc.channels.find((c) => c.slug === 'at-x')!;
+    const upstream = ch.upstreams.find((u) => u.id === placementId)!;
+    expect(upstream.url).toBe('http://hls.zone1-n1/aaaaaaaa-0000-0000-0000-000000000000');
+
+    await h.service.probeEngine.tick();
+    expect(calls.length).toBeGreaterThan(0);
+    for (const url of calls) {
+      expect(url).toContain('/aaaaaaaa-0000-0000-0000-000000000000/playlist.m3u8');
+    }
+
+    // all three sites agree on the exact same path segment
+    expect(nodeDoc!.sessions[0]!.name).toBe('aaaaaaaa-0000-0000-0000-000000000000');
+    expect(upstream.url.endsWith(`/${nodeDoc!.sessions[0]!.name}`)).toBe(true);
+    expect(calls.every((url) => url.includes(`/${nodeDoc!.sessions[0]!.name}/`))).toBe(true);
     await h.destroy();
   });
 });

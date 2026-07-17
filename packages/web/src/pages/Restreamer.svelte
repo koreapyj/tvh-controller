@@ -31,9 +31,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { errText } from '../lib/fetchGuard.js';
   import { dateTime } from '../lib/format.js';
   import {
-    channelHasFailoverState,
     placementBadgeClass,
-    resetUnavailableReason,
+    resetButtonVisible,
+    resetDisabledReason,
     showActiveCheck,
   } from '../lib/failoverIndicator.js';
   import { configuredHotCount, isOverCapacity } from '../lib/nodeCapacity.js';
@@ -205,6 +205,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
       ? (mergedChannels.find((c) => c.slug === sessionModalSession!.channelSlug) ?? null)
       : null,
   );
+
+  // ---------- daemon log modal (node-level, not any one session) ----------
+
+  let daemonLogModal: { instanceId: string; nodeId: string } | null = $state(null);
 
   // ---------- channels ----------
 
@@ -542,6 +546,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
               title="configured hot placements ({configured}) exceed this node's max sessions ({n.maxSessions}) — encodes are still pushed; reduce placements or raise the cap"
             >over capacity</span>
           {/if}
+          {#if n.persistedStateCorrupt}
+            <span
+              class="badge warn"
+              title="the node's persisted desired-state doc failed schema validation at boot — treated as absent until the next push"
+            >state corrupt</span>
+          {/if}
         </h3>
         {#if failingProbeBadges(n).length}
           <div style="margin:4px 0">
@@ -551,14 +561,18 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           </div>
         {/if}
         <div class="muted small">{nodeMutedLine(n, configured)}</div>
+        {#if n.lastAppliedAt}<div class="muted small">last applied {dateTime(n.lastAppliedAt)}</div>{/if}
         {#if n.error}<div class="small" style="color:var(--bad)">{n.error}</div>{/if}
         <div style="margin:8px 0;display:flex;gap:8px">
           <button disabled={busy} onclick={() => run(() => api.pushRestreamerNode(n.instanceId, n.nodeId))}>
             Push now
           </button>
           <button disabled={busy} onclick={() => openSettingsModal(n)}>Settings…</button>
+          <button onclick={() => (daemonLogModal = { instanceId: n.instanceId, nodeId: n.nodeId })}>
+            Daemon log
+          </button>
         </div>
-        {#if n.sessions.length}
+        {#if n.sessions.length || n.pendingRemovals.length}
           <table>
             <thead>
               <tr><th>Session</th><th>State</th><th>Restarts</th><th>Lag</th></tr>
@@ -599,6 +613,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                   </td>
                   <td class="small">
                     {#if s.playlistLagSec !== undefined}{Math.round(s.playlistLagSec)}s{:else}<span class="muted">—</span>{/if}
+                  </td>
+                </tr>
+              {/each}
+              {#each n.pendingRemovals as r (r.name)}
+                <tr>
+                  <td colspan="4" class="small muted">
+                    awaiting disposal · {r.channelSlug ?? r.name} · until {dateTime(r.deadline)}
+                    {#if r.error}<span class="badge bad" title={r.error}>error</span>{/if}
                   </td>
                 </tr>
               {/each}
@@ -731,8 +753,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {/each}
         </td>
         <td style="white-space:nowrap;text-align:right">
-          {#if channelHasFailoverState(live.failover)}
-            {@const resetBlocked = resetUnavailableReason(live.failover)}
+          {#if resetButtonVisible(live.failover)}
+            {@const resetBlocked = resetDisabledReason(live.failover)}
             <button
               disabled={busy || resetBlocked !== null}
               title={resetBlocked ?? 'fail back to the natural placement (first hot)'}
@@ -926,5 +948,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     channelId={sessionModalChannel?.id ?? null}
     onDemandStopAt={sessionModalChannel?.onDemandStopAt ?? null}
     onclose={() => (sessionModal = null)}
+  />
+{/if}
+
+{#if daemonLogModal}
+  <SessionModal
+    instanceId={daemonLogModal.instanceId}
+    nodeId={daemonLogModal.nodeId}
+    session={null}
+    serveUrl={null}
+    channelId={null}
+    onDemandStopAt={null}
+    onclose={() => (daemonLogModal = null)}
   />
 {/if}

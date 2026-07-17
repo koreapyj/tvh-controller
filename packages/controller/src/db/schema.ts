@@ -162,6 +162,11 @@ export interface RestreamFailoverStateTable {
   drain_until: ColumnType<Date | null, string | null, string | null>;
   started_at: ColumnType<Date, string | undefined, string>;
   updated_at: ColumnType<Date, string | undefined, string>;
+  /** single-use id minted for an on-demand row's target placement; NULL for
+   * every other trigger_reason. The target placement is served, probed, and
+   * named under this id instead of its own placement id for as long as the
+   * row targets it. */
+  activation_uuid: string | null;
 }
 
 /** per-node probe thresholds (UI-editable); absent row ⇒ code defaults */

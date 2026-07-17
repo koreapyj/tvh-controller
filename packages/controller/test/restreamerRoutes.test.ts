@@ -177,6 +177,7 @@ function seedNodeStatus(
       capabilities: null,
       templates: null,
       maxSessions: null,
+      pendingRemovals: [],
     },
   ];
 }
@@ -205,6 +206,7 @@ interface Harness {
   service: RestreamerService;
   restartSession: ReturnType<typeof vi.fn>;
   sessionLog: ReturnType<typeof vi.fn>;
+  nodeLog: ReturnType<typeof vi.fn>;
   resetSessionRestarts: ReturnType<typeof vi.fn>;
   hub: FakeSwitcherHub;
   tvhGetRaw: ReturnType<typeof vi.fn>;
@@ -220,6 +222,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
   const clients = new Map<string, RestreamerNodeClient>();
   const restartSession = vi.fn(async () => {});
   const sessionLog = vi.fn(async () => [{ ts: '2026-01-01T00:00:00Z', src: 'daemon', line: 'hello' }]);
+  const nodeLog = vi.fn(async () => [{ ts: '2026-01-01T00:00:00Z', src: 'daemon', line: 'daemon booted' }]);
   const resetSessionRestarts = vi.fn(async () => {});
   const restreamerClients = new Map<string, RestreamerClient>();
   for (const inst of config.instances) {
@@ -231,6 +234,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
       restreamerClients.set(nodeKey(inst.id, n.id), {
         restartSession,
         sessionLog,
+        log: nodeLog,
         resetSessionRestarts,
       } as unknown as RestreamerClient);
     }
@@ -269,6 +273,7 @@ async function setup(configOverrides: Partial<AppConfig> = {}): Promise<Harness>
     service,
     restartSession,
     sessionLog,
+    nodeLog,
     resetSessionRestarts,
     hub,
     tvhGetRaw,
@@ -1141,6 +1146,46 @@ describe('restreamer session passthrough', () => {
   });
 });
 
+// ---------- daemon (node-level) log passthrough ----------
+
+describe('restreamer daemon log passthrough', () => {
+  it('routes to the node client with a parsed lines query; unknown node -> 404', async () => {
+    const { app, nodeLog } = await harness();
+    const log = await app.inject({
+      method: 'GET',
+      url: '/api/restreamer/nodes/zone1/n1/log?lines=5',
+    });
+    expect(log.statusCode).toBe(200);
+    expect(log.json()).toEqual([{ ts: '2026-01-01T00:00:00Z', src: 'daemon', line: 'daemon booted' }]);
+    expect(nodeLog).toHaveBeenCalledWith(5);
+
+    const unknown = await app.inject({
+      method: 'GET',
+      url: '/api/restreamer/nodes/zone1/ghost/log',
+    });
+    expect(unknown.statusCode).toBe(404);
+  });
+
+  it('rejects a non-positive-integer lines query', async () => {
+    const { app } = await harness();
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/restreamer/nodes/zone1/n1/log?lines=abc',
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('unreachable node surfaces as 502', async () => {
+    const { app, nodeLog } = await harness();
+    nodeLog.mockRejectedValueOnce(new Error('fetch failed: ECONNREFUSED'));
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/restreamer/nodes/zone1/n1/log',
+    });
+    expect(res.statusCode).toBe(502);
+  });
+});
+
 // ---------- playlists + M3U ----------
 
 describe('restreamer playlist routes', () => {
@@ -1334,6 +1379,40 @@ describe('GET /playlists/:slug.m3u', () => {
     // redundant channel: first placement whose node has a serveUrl
     expect(res.body).toContain(`http://hls.zone1-n1/${bbbZone1PlacementId}/playlist.m3u8`);
     expect(res.body).not.toContain('sw.example');
+  });
+
+  it('an on-demand failover row targeting a placement points the .m3u entry at its activation_uuid path segment', async () => {
+    const h = await harness({ restreamer: undefined });
+    const { atxPlacementId } = await seedM3uFixture(h);
+    const withStatus = (
+      await h.app.inject({ method: 'GET', url: '/api/restreamer/channels' })
+    ).json() as RestreamChannelWithStatus[];
+    const atxChannelId = withStatus.find((c) => c.slug === 'at-x')!.id;
+
+    await h.ctx.db!
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: atxChannelId,
+        from_placement_id: null,
+        to_placement_id: atxPlacementId,
+        phase: 'awaiting-lag',
+        trigger_reason: 'on-demand',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: '2026-01-01 00:00:00',
+        updated_at: '2026-01-01 00:00:00',
+        activation_uuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+      })
+      .execute();
+
+    const res = await h.app.inject({ method: 'GET', url: '/playlists/tv.m3u' });
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain(
+      'http://hls.zone1-n1/aaaaaaaa-0000-0000-0000-000000000000/playlist.m3u8',
+    );
+    expect(res.body).not.toContain(`/${atxPlacementId}/playlist.m3u8`);
   });
 
   it('404s for an unknown playlist slug', async () => {

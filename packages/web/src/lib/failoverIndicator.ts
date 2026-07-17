@@ -76,21 +76,29 @@ export function showActiveCheck(
   );
 }
 
-/** true when a channel has a persisted failover procedure/result (the Reset button renders) */
-export function channelHasFailoverState(failover: ChannelFailoverStatus | null | undefined): boolean {
-  return failover != null;
+/**
+ * Whether the Reset button renders at all. Hidden with no persisted failover
+ * procedure/result (nothing to reset), and hidden during the terminal
+ * 'draining' grace — the fail-back already finished, 'draining' is just
+ * bookkeeping for the switcher's retained window, not a live procedure.
+ */
+export function resetButtonVisible(failover: ChannelFailoverStatus | null | undefined): boolean {
+  if (failover == null) return false;
+  if (failover.phase === 'draining') return false;
+  return true;
 }
 
 /**
- * A terminal 'draining' row is only bookkeeping grace for the switcher's
- * retained window — the fail-back already finished, so Reset has nothing
- * left to do and renders disabled until the row expires.
+ * Reset button disable reason/tooltip: disabled while a reset procedure
+ * itself is still running (nothing to reset — one is already in flight).
+ * null everywhere else the button renders (enabled); the caller's own
+ * in-flight-HTTP `busy` disabling is separate from this.
  */
-export function resetUnavailableReason(
+export function resetDisabledReason(
   failover: ChannelFailoverStatus | null | undefined,
 ): string | null {
-  if (failover?.phase === 'draining') {
-    return 'fail-back complete — draining the old upstream from the switcher window';
+  if (failover?.triggerReason === 'reset' && failover.phase !== 'draining') {
+    return 'reset in progress';
   }
   return null;
 }

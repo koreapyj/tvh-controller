@@ -19,9 +19,9 @@
 import { describe, expect, it } from 'vitest';
 import type { ChannelFailoverStatus } from '@tvhc/shared';
 import {
-  channelHasFailoverState,
   placementBadgeClass,
-  resetUnavailableReason,
+  resetButtonVisible,
+  resetDisabledReason,
   showActiveCheck,
 } from './failoverIndicator.js';
 
@@ -81,31 +81,7 @@ describe('showActiveCheck', () => {
   });
 });
 
-describe('channelHasFailoverState', () => {
-  const failover: ChannelFailoverStatus = {
-    fromPlacementId: null,
-    toPlacementId: 'p1',
-    phase: 'bringing-up',
-    triggerReason: 'manual',
-    triggerDetail: null,
-    startedAt: '2026-01-01T00:00:00.000Z',
-  };
-
-  it('is true for a persisted failover status', () => {
-    expect(channelHasFailoverState(failover)).toBe(true);
-  });
-
-  it('is true even while draining — the button renders (disabled via resetUnavailableReason)', () => {
-    expect(channelHasFailoverState({ ...failover, phase: 'draining' })).toBe(true);
-  });
-
-  it('is false for null/undefined', () => {
-    expect(channelHasFailoverState(null)).toBe(false);
-    expect(channelHasFailoverState(undefined)).toBe(false);
-  });
-});
-
-describe('resetUnavailableReason', () => {
+describe('resetButtonVisible', () => {
   const failover: ChannelFailoverStatus = {
     fromPlacementId: null,
     toPlacementId: 'p1',
@@ -113,16 +89,58 @@ describe('resetUnavailableReason', () => {
     triggerReason: 'manual',
     triggerDetail: null,
     startedAt: '2026-01-01T00:00:00.000Z',
+    activationUuid: null,
   };
 
-  it('is null for actionable phases and null/undefined state', () => {
-    expect(resetUnavailableReason(failover)).toBeNull();
-    expect(resetUnavailableReason({ ...failover, phase: 'awaiting-lag' })).toBeNull();
-    expect(resetUnavailableReason(null)).toBeNull();
-    expect(resetUnavailableReason(undefined)).toBeNull();
+  it('is hidden with no persisted failover row', () => {
+    expect(resetButtonVisible(null)).toBe(false);
+    expect(resetButtonVisible(undefined)).toBe(false);
   });
 
-  it('names the drain grace for a draining row (Reset renders disabled)', () => {
-    expect(resetUnavailableReason({ ...failover, phase: 'draining' })).toMatch(/draining/);
+  it('is hidden during the terminal draining grace', () => {
+    expect(resetButtonVisible({ ...failover, phase: 'draining' })).toBe(false);
+    expect(resetButtonVisible({ ...failover, phase: 'draining', triggerReason: 'reset' })).toBe(false);
+  });
+
+  it('is visible for a completed, non-reset failover row', () => {
+    expect(resetButtonVisible(failover)).toBe(true);
+  });
+
+  it('is visible while a reset procedure is running (disabled separately)', () => {
+    expect(resetButtonVisible({ ...failover, phase: 'bringing-up', triggerReason: 'reset' })).toBe(true);
+  });
+});
+
+describe('resetDisabledReason', () => {
+  const failover: ChannelFailoverStatus = {
+    fromPlacementId: null,
+    toPlacementId: 'p1',
+    phase: 'complete',
+    triggerReason: 'manual',
+    triggerDetail: null,
+    startedAt: '2026-01-01T00:00:00.000Z',
+    activationUuid: null,
+  };
+
+  it('is null for null/undefined (no row — button is hidden anyway)', () => {
+    expect(resetDisabledReason(null)).toBeNull();
+    expect(resetDisabledReason(undefined)).toBeNull();
+  });
+
+  it('is null for a completed, non-reset failover (button enabled)', () => {
+    expect(resetDisabledReason(failover)).toBeNull();
+  });
+
+  it('names a running reset procedure as the disable reason', () => {
+    expect(resetDisabledReason({ ...failover, phase: 'bringing-up', triggerReason: 'reset' })).toBe(
+      'reset in progress',
+    );
+    expect(resetDisabledReason({ ...failover, phase: 'awaiting-lag', triggerReason: 'reset' })).toBe(
+      'reset in progress',
+    );
+  });
+
+  it('is null once a reset procedure reaches the draining grace (resetButtonVisible hides the button there instead)', () => {
+    expect(resetDisabledReason({ ...failover, phase: 'draining', triggerReason: 'reset' })).toBeNull();
   });
 });

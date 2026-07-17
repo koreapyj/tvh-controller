@@ -23,6 +23,7 @@
  */
 
 import type {
+  PendingRemoval,
   SessionStatus,
   SourceCatalogEntry,
   SwitchReason,
@@ -156,6 +157,9 @@ export interface ChannelFailoverStatus {
   triggerReason: FailoverTriggerReason;
   triggerDetail: string | null;
   startedAt: string;
+  /** single-use id the TO placement is served/named under instead of its own
+   * id, for as long as this row targets it; null outside an on-demand row */
+  activationUuid: string | null;
 }
 
 /** one encode of a logical channel on one restreamer node */
@@ -247,10 +251,23 @@ export interface RestreamPlaylist {
 export type EnrichedSessionStatus = SessionStatus & {
   lagProbe?: LagProbeStatus;
   /**
-   * Channel slug for display — the session `name` is a placement id (a bare
-   * UUID) post-rename, so this is what the UI shows a human. null = the
+   * Channel slug for display — the session `name` is a bare UUID (a
+   * placement id, or an on-demand row's activation_uuid while it targets
+   * that placement), so this is what the UI shows a human. null = the
    * session name doesn't resolve to a known placement (e.g. an orphan
    * awaiting cleanup, or enrichment ran with no resolver available).
+   */
+  channelSlug: string | null;
+};
+
+/** PendingRemoval enriched with the controller's channel-level resolution */
+export type EnrichedPendingRemoval = PendingRemoval & {
+  /**
+   * Channel slug for display, resolved the same way as a session's
+   * `channelSlug` (live placement lookup, else a bounded name→slug capture
+   * cache since the placement row is usually already deleted by the time a
+   * removal is pending). null = unresolvable (e.g. after a controller
+   * restart, for a drain already in flight).
    */
   channelSlug: string | null;
 };
@@ -292,6 +309,12 @@ export interface RestreamerNodeStatus {
   templates: { id: string; version: number }[] | null;
   /** per-node session cap from DB settings; null = uncapped */
   maxSessions: number | null;
+  /** deferred outDir removals still draining (or retrying after a failed rm); [] = old daemon or none pending */
+  pendingRemovals: EnrichedPendingRemoval[];
+  /** ISO 8601 — when the node last applied a desired doc (PUT or boot-time disk load); undefined = never / old daemon */
+  lastAppliedAt?: string;
+  /** true while the node's persisted doc found at boot fails schema validation; undefined = old daemon */
+  persistedStateCorrupt?: boolean;
 }
 
 /** one switcher's polled status (SSE `restreamer-switcher` events) */

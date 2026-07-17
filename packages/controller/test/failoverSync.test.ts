@@ -112,6 +112,7 @@ function nodeStatusFixture(
     capabilities: null,
     templates: null,
     maxSessions: null,
+    pendingRemovals: [],
     ...opts,
   };
 }
@@ -305,6 +306,7 @@ async function seedFailoverRowDirect(
     triggerNodeId?: string | null;
     suppressFrom?: boolean;
     drainUntil?: string | null;
+    activationUuid?: string | null;
   },
 ): Promise<void> {
   await db
@@ -321,6 +323,7 @@ async function seedFailoverRowDirect(
       drain_until: fields.drainUntil ?? null,
       started_at: TS,
       updated_at: TS,
+      activation_uuid: fields.activationUuid ?? null,
     })
     .execute();
 }
@@ -464,7 +467,13 @@ describe('FailoverSync: full automatic procedure (lag trigger through completion
     let row = await failoverRow(h.db, chanId);
     // bringing-up always auto-advances within the same tick; B has no lag
     // measurement yet, so it stops at awaiting-lag
-    expect(row).toMatchObject({ from_placement_id: aId, to_placement_id: bId, phase: 'awaiting-lag', trigger_reason: 'lag' });
+    expect(row).toMatchObject({
+      from_placement_id: aId,
+      to_placement_id: bId,
+      phase: 'awaiting-lag',
+      trigger_reason: 'lag',
+      activation_uuid: null,
+    });
     expect(h.sync.activeChannelId()).toBe(chanId);
 
     // B's lag becomes discovered (measured, at/below the default 30s threshold)
@@ -1214,6 +1223,40 @@ describe('FailoverSync: event-log emission', () => {
     expect(warnings.some((m) => /BEGIN/.test(m))).toBe(false);
     expect(warnings.some((m) => /RETARGET/.test(m))).toBe(true);
     expect(warnings.some((m) => /ABORTED/.test(m))).toBe(true);
+  });
+
+  it('a retarget keeps the same activation_uuid — only to_placement_id changes', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'allcold' });
+    await insertPlacement(h.db, {
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      priority: 1,
+      mode: 'cold',
+    });
+    await insertPlacement(h.db, {
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n2',
+      priority: 2,
+      mode: 'cold',
+    });
+    seedNode(h.cache, 'zoneA', 'n1');
+    seedNode(h.cache, 'zoneA', 'n2');
+    seedSwitcherStatus(h.cache, [swChan('allcold', null, [])]);
+
+    await h.sync.requestFailover(chanId, { reason: 'on-demand', detail: 'viewer demand' });
+    await h.sync.tick(); // BEGIN -> awaiting-lag (lag never discovered)
+    const beforeRetarget = await failoverRow(h.db, chanId);
+    expect(beforeRetarget!.activation_uuid).toBeTruthy();
+    const originalTarget = beforeRetarget!.to_placement_id;
+
+    h.advanceNow(LAG_DISCOVERY_TIMEOUT_MS + 1_000);
+    await h.sync.tick(); // RETARGET -> the other cold
+    const afterRetarget = await failoverRow(h.db, chanId);
+    expect(afterRetarget!.to_placement_id).not.toBe(originalTarget);
+    expect(afterRetarget!.activation_uuid).toBe(beforeRetarget!.activation_uuid);
   });
 });
 
@@ -2016,12 +2059,37 @@ describe('FailoverSync: idle all-cold channel with a pre-seeded switcher selecti
     // the echoed idle selection is not a running encode: nothing to move away
     // from, every enabled placement a candidate, preferred (lowest priority,
     // id) wins — not the standby that excluding the "from" would leave
-    expect(await failoverRow(h.db, chanId)).toMatchObject({
+    const row = await failoverRow(h.db, chanId);
+    expect(row).toMatchObject({
       trigger_reason: 'on-demand',
       from_placement_id: null,
       to_placement_id: preferred,
       phase: 'awaiting-lag',
     });
+    expect(row!.activation_uuid).toBeTruthy();
+  });
+
+  it('a released row cleared and re-activated on demand mints a fresh, different activation_uuid', async () => {
+    const h = await setup();
+    const { chanId, preferred } = await seedIdleAllCold(h);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: null,
+      toPlacementId: preferred,
+      phase: 'complete',
+      triggerReason: 'on-demand',
+      activationUuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+    });
+
+    await h.sync.releaseOnDemand(chanId);
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+
+    await h.sync.requestFailover(chanId, { reason: 'on-demand', detail: 'viewer demand' });
+    await h.sync.tick();
+    const row = await failoverRow(h.db, chanId);
+    expect(row).toMatchObject({ trigger_reason: 'on-demand', to_placement_id: preferred });
+    expect(row!.activation_uuid).toBeTruthy();
+    expect(row!.activation_uuid).not.toBe('aaaaaaaa-0000-0000-0000-000000000000');
   });
 
   it('scanTriggers never fires for the idle channel, even with failing probes against the echoed placement', async () => {

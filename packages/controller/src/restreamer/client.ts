@@ -161,4 +161,19 @@ export class RestreamerClient {
       signal,
     });
   }
+
+  /** stderr ring-buffer tail of the daemon's own log (src 'daemon'), not any one session */
+  async log(lines?: number): Promise<LogLine[]> {
+    const qs = lines === undefined ? '' : `?lines=${lines}`;
+    const res = await this.req<{ lines: LogLine[] }>('GET', `/v1/log${qs}`);
+    return res.lines;
+  }
+
+  /** the daemon's own live SSE log stream — same relay contract as sessionLogStream */
+  logStream(signal: AbortSignal): Promise<Response> {
+    return this.fetchImpl(`${this.baseUrl}/v1/log/stream`, {
+      method: 'GET',
+      signal,
+    });
+  }
 }

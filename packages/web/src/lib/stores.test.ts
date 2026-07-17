@@ -54,6 +54,7 @@ function node(over: Partial<RestreamerNodeStatus> = {}): RestreamerNodeStatus {
     capabilities: null,
     templates: null,
     maxSessions: null,
+    pendingRemovals: [],
     ...over,
   };
 }

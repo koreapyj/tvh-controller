@@ -356,6 +356,8 @@ describe('computeSwitcherDoc: failover state placements', () => {
       toPlacementId: string;
       phase?: string;
       suppressFrom?: boolean;
+      triggerReason?: string;
+      activationUuid?: string | null;
     },
   ): Promise<void> {
     await h.db
@@ -365,13 +367,14 @@ describe('computeSwitcherDoc: failover state placements', () => {
         from_placement_id: fields.fromPlacementId,
         to_placement_id: fields.toPlacementId,
         phase: fields.phase ?? 'complete',
-        trigger_reason: 'manual',
+        trigger_reason: fields.triggerReason ?? 'manual',
         trigger_node_id: null,
         trigger_detail: null,
         suppress_from: fields.suppressFrom ? 1 : 0,
         drain_until: null,
         started_at: '2026-01-01 00:00:00',
         updated_at: '2026-01-01 00:00:00',
+        activation_uuid: fields.activationUuid ?? null,
       })
       .execute();
   }
@@ -490,6 +493,42 @@ describe('computeSwitcherDoc: failover state placements', () => {
     expect(ch.onDemand).toBe(true);
     expect(ch.onDemandIdle).toBeUndefined();
     expect(ch.activeUpstreamId).toBe(p2.id);
+    await h.destroy();
+  });
+
+  it('an on-demand row upstream keeps `id` as the placement id but points `url` at the activation_uuid path segment', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'BBB',
+      channelNumber: '10',
+      profileId: p.id,
+      placements: [
+        { instanceId: 'zone1', nodeId: 'n1', mode: 'cold', priority: 1 },
+        { instanceId: 'zone2', nodeId: 'n1', mode: 'cold', priority: 2 },
+      ],
+      force: true,
+    });
+    const placements = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements;
+    const p1 = placements.find((pl) => pl.priority === 1)!;
+    const p2 = placements.find((pl) => pl.priority === 2)!;
+    await insertFailoverRow(h, {
+      channelId: chan.id,
+      fromPlacementId: null,
+      toPlacementId: p2.id,
+      phase: 'awaiting-lag',
+      triggerReason: 'on-demand',
+      activationUuid: 'aaaaaaaa-0000-0000-0000-000000000000',
+    });
+
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    const toUpstream = ch.upstreams.find((u) => u.id === p2.id)!;
+    expect(toUpstream.id).toBe(p2.id); // the id contract never changes
+    expect(toUpstream.url).toBe(`http://hls.zone2-n1/aaaaaaaa-0000-0000-0000-000000000000`);
+    // the untargeted sibling still resolves under its own placement id
+    const otherUpstream = ch.upstreams.find((u) => u.id === p1.id)!;
+    expect(otherUpstream.url).toBe(`http://hls.zone1-n1/${p1.id}`);
     await h.destroy();
   });
 
@@ -730,6 +769,7 @@ describe('rebalanceTick', () => {
       capabilities: null,
       templates: null,
       maxSessions: null,
+      pendingRemovals: [],
     });
   }
 

@@ -45,6 +45,7 @@ import {
   type RebalanceChannelInput,
   type RebalanceNodeInput,
 } from './rebalance.js';
+import { sessionNameFor } from './sessionName.js';
 import { SWITCHER_CACHE_KEY, type SwitcherHubLike } from './switcherHubTypes.js';
 import { sessionsHash } from './service.js';
 
@@ -82,6 +83,8 @@ interface ChannelGroup {
   allCold: boolean;
   /** the failover row's to_placement_id, when a row exists (any phase); null = no row */
   rowTarget: string | null;
+  /** the failover row's activation_uuid, when a row exists; null = no row or not on-demand */
+  rowActivationUuid: string | null;
 }
 
 export class SwitcherSync {
@@ -152,7 +155,7 @@ export class SwitcherSync {
         .execute(),
       this.db
         .selectFrom('restream_failover_state')
-        .select(['channel_id', 'from_placement_id', 'to_placement_id'])
+        .select(['channel_id', 'from_placement_id', 'to_placement_id', 'activation_uuid'])
         .execute(),
     ]);
 
@@ -187,6 +190,7 @@ export class SwitcherSync {
         })),
         allCold: !hasHot,
         rowTarget: row?.to_placement_id ?? null,
+        rowActivationUuid: row?.activation_uuid ?? null,
       };
     });
   }
@@ -246,7 +250,7 @@ export class SwitcherSync {
         }
         upstreams.push({
           id: p.placementId,
-          url: `${nodeCfg.serveUrl}/${p.placementId}`,
+          url: `${nodeCfg.serveUrl}/${sessionNameFor(p.placementId, { activation_uuid: g.rowActivationUuid, to_placement_id: g.rowTarget })}`,
           priority: p.priority,
         });
       }

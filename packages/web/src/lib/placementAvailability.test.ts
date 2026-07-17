@@ -57,6 +57,7 @@ function node(
     capabilities: null,
     templates: null,
     maxSessions: null,
+    pendingRemovals: [],
   };
 }
 
