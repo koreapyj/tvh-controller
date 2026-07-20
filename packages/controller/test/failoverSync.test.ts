@@ -22,6 +22,7 @@ import type { Database } from '../src/db/schema.js';
 import type { AppConfig } from '../src/config.js';
 import { InstanceCache } from '../src/state/instanceCache.js';
 import { FailoverSync, type FailoverNodeRef, type ResetOutcome } from '../src/restreamer/failoverSync.js';
+import { EraStore } from '../src/restreamer/eraStore.js';
 import {
   LAG_DISCOVERY_TIMEOUT_MS,
   RETRIGGER_BACKOFF_MIN_MS,
@@ -378,6 +379,7 @@ interface Harness {
   advanceNow: (ms: number) => void;
   nowMs: () => number;
   logs: LoggedEvent[];
+  eraStore: EraStore;
 }
 
 async function setup(): Promise<Harness> {
@@ -401,6 +403,7 @@ async function setup(): Promise<Harness> {
   const markCutoverComplete = vi.fn(async (_placementId: string) => {});
   const deleteCutoverPlacement = vi.fn(async (_placementId: string) => {});
   const logs: LoggedEvent[] = [];
+  const eraStore = new EraStore(db, { log: (e) => logs.push(e) });
 
   let ms = Date.parse('2026-06-01T00:00:00.000Z');
   const sync = new FailoverSync(
@@ -411,6 +414,7 @@ async function setup(): Promise<Harness> {
     () => snapshot as unknown as ProbeSnapshot,
     async () => settingsMap,
     { pushNodes, pushSwitchers, publishChannel, markCutoverComplete, deleteCutoverPlacement },
+    eraStore,
     () => new Date(ms),
     { log: (e) => logs.push(e) },
   );
@@ -434,6 +438,7 @@ async function setup(): Promise<Harness> {
     },
     nowMs: () => ms,
     logs,
+    eraStore,
   };
 }
 
@@ -2104,5 +2109,83 @@ describe('FailoverSync: idle all-cold channel with a pre-seeded switcher selecti
     expect(h.sync.activeChannelId()).toBeNull();
     expect(h.sync.blockedReason(chanId)).toBeNull();
     expect(h.logs).toHaveLength(0);
+  });
+});
+
+// ---------- issueSwitch: era anchor + real trigger reason on the broadcast ----------
+
+describe('FailoverSync: issueSwitch stamps an era anchor and the real trigger reason', () => {
+  it('an automatic (lag) trigger broadcasts reason "failover" with the minted era anchor', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+
+    h.snapshot.lag.set(aId, lagFail(40));
+    await h.sync.tick(); // BEGIN -> awaiting-lag (B not discovered yet)
+    h.snapshot.lag.set(bId, lagOk(5));
+    await h.sync.tick(); // -> awaiting-switch-confirm, switch issued
+
+    expect(h.hub.switches).toHaveLength(1);
+    const sent = h.hub.switches[0]!;
+    expect(sent).toMatchObject({ slug: 'chan1', upstreamId: bId, reason: 'failover' });
+    expect(sent.era).toBeDefined();
+    expect(sent.era!.upstreamId).toBe(bId);
+    // the anchor sent over the wire is exactly what eraStore persisted (not a
+    // hardcoded/stale value) — era 0 was minted by channel setup's implicit
+    // first activation is not modeled here, so this is the channel's first era
+    const persisted = await h.eraStore.recentEras(chanId, 3_600_000, 8, h.nowMs());
+    expect(persisted).toHaveLength(1);
+    expect(sent.era).toEqual(persisted[0]);
+    expect(sent.era!.splicePdtMs).toBe(null); // era 0: always null regardless of trigger timing
+  });
+
+  it('a manual selection broadcasts reason "manual" with the minted era anchor', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    seedSwitcherStatus(h.cache, [
+      swChan('chan1', bId, [
+        { id: aId, healthy: true },
+        { id: bId, healthy: true },
+      ]),
+    ]);
+    await h.sync.requestFailover(chanId, { toPlacementId: aId, reason: 'manual', detail: 'operator' });
+    h.snapshot.lag.set(aId, lagOk(2)); // already discovered — single-tick issue-switch
+
+    await h.sync.tick();
+
+    expect(h.hub.switches).toHaveLength(1);
+    const sent = h.hub.switches[0]!;
+    expect(sent).toMatchObject({ slug: 'chan1', upstreamId: aId, reason: 'manual' });
+    expect(sent.era).toBeDefined();
+    expect(sent.era!.upstreamId).toBe(aId);
+  });
+
+  it('a reset-reason procedure also broadcasts reason "manual" (reset maps to manual)', async () => {
+    const h = await setup();
+    // aId (priority 1) is the natural hot fail-back target; the row is
+    // currently parked on bId (priority 2, non-natural) so requestReset has
+    // somewhere to actually move back to
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'complete',
+      triggerReason: 'manual',
+    });
+    seedSwitcherStatus(h.cache, [
+      swChan('chan1', bId, [
+        { id: aId, healthy: true },
+        { id: bId, healthy: true },
+      ]),
+    ]);
+
+    const outcome = await h.sync.requestReset(chanId);
+    expect(outcome).toEqual<ResetOutcome>({ ok: true, queued: true });
+    h.snapshot.lag.set(aId, lagOk(2)); // the natural HOT fail-back target already discovered
+    await h.sync.tick(); // begin (reset) -> ... -> issue-switch, single tick
+
+    expect(h.hub.switches).toHaveLength(1);
+    const sent = h.hub.switches[0]!;
+    expect(sent).toMatchObject({ slug: 'chan1', upstreamId: aId, reason: 'manual' });
   });
 });

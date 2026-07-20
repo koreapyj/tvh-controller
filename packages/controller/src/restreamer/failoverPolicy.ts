@@ -37,7 +37,7 @@
  * sessions on a node, so at most one bring-up may ever be in flight.
  */
 
-import type { FailoverPhase, PlacementIndicator } from '@tvhc/shared';
+import type { FailoverPhase, FailoverTriggerReason, PlacementIndicator, SwitchReason } from '@tvhc/shared';
 
 /** re-evaluation cadence of the failover orchestrator */
 export const FAILOVER_TICK_MS = 3_000;
@@ -50,6 +50,28 @@ export const SWITCH_REISSUE_MS = 15_000;
 /** re-trigger backoff when no eligible target exists while the trigger persists */
 export const RETRIGGER_BACKOFF_MIN_MS = 30_000;
 export const RETRIGGER_BACKOFF_MAX_MS = 600_000;
+
+/**
+ * Switcher retained-window drain horizon for a profile's segmenting — how
+ * long a viewer's playlist may still hold segment URIs referencing an
+ * outgoing upstream/era. Shared by failoverSync's own drainGraceMs (retained
+ * `from` placement lifetime) and switcherSync's era-retention window, so the
+ * two horizons never drift apart.
+ */
+export function drainHorizonMs(segmentSeconds: number, listSize: number): number {
+  return Math.min(segmentSeconds * listSize, 3600) * 1000;
+}
+
+/**
+ * Wire SwitchReason for a failover row's trigger — collapses the DB's richer
+ * trigger taxonomy to the 3-value wire enum, reusing the same manual/reset
+ * vs. everything-else partition failoverSync already draws elsewhere (the
+ * `automatic` check). 'push' is switcher-autonomous only (active upstream
+ * disappeared from a pushed doc) and is never emitted by the controller.
+ */
+export function switchReasonFor(triggerReason: FailoverTriggerReason): SwitchReason {
+  return triggerReason === 'manual' || triggerReason === 'reset' ? 'manual' : 'failover';
+}
 
 export interface FailoverCandidate {
   placementId: string;

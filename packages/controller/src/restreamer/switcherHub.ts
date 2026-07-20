@@ -33,6 +33,8 @@ import { WebSocketServer, type WebSocket, type RawData } from 'ws';
 import {
   WS_CLOSE_UNSUPPORTED_VERSION,
   WS_PROTOCOL_VERSION,
+  type EraAnchor,
+  type SwitchReason,
   type SwitcherChannelStatus,
   type SwitcherDesiredState,
   type SwitcherNodeStatus,
@@ -54,6 +56,8 @@ export interface SwitcherHubOptions {
   getDoc: () => Promise<SwitcherDesiredState>;
   /** viewer playlist-fetch events, forwarded to the on-demand engine */
   onDemand: (events: DemandEvent[]) => void;
+  /** status frames carrying eraOffsets, forwarded to eraStore.recordOffsets — optional for schema additivity */
+  onEraOffsets?: (channels: SwitcherChannelStatus[]) => void;
   /** revision the replicas are expected to report; null = nothing broadcast yet */
   getExpectedRevision: () => string | null;
   /** viewer-facing base for the aggregate status entry; null = not configured */
@@ -117,8 +121,21 @@ export class SwitcherHub implements SwitcherHubLike {
     for (const conn of this.connections.values()) this.send(conn.socket, frame);
   }
 
-  broadcastSwitch(slug: string, upstreamId: string): number {
-    const frame = JSON.stringify({ v: WS_PROTOCOL_VERSION, type: 'switch', slug, upstreamId });
+  broadcastSwitch(
+    slug: string,
+    upstreamId: string,
+    opts?: { era?: EraAnchor; reason?: SwitchReason },
+  ): number {
+    // JSON.stringify drops undefined-valued keys, so an omitted opts leaves
+    // the frame shape unchanged for callers that don't carry an anchor/reason.
+    const frame = JSON.stringify({
+      v: WS_PROTOCOL_VERSION,
+      type: 'switch',
+      slug,
+      upstreamId,
+      era: opts?.era,
+      reason: opts?.reason,
+    });
     let sent = 0;
     for (const conn of this.connections.values()) {
       if (this.send(conn.socket, frame)) sent++;
@@ -226,6 +243,7 @@ export class SwitcherHub implements SwitcherHubLike {
           : [];
         conn.lastStatus = { desiredRevision, channels, at: new Date().toISOString() };
         this.rebuildAggregate();
+        if (channels.some((c) => c.eraOffsets !== undefined)) this.opts.onEraOffsets?.(channels);
         return;
       }
       case 'demand': {

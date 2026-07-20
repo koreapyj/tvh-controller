@@ -39,6 +39,8 @@ import type { AppConfig, RestreamerNodeConfig } from '../config.js';
 import type { Db } from '../db/db.js';
 import type { EventLog } from '../state/eventLog.js';
 import type { InstanceCache } from '../state/instanceCache.js';
+import type { EraStoreLike } from './eraStore.js';
+import { drainHorizonMs } from './failoverPolicy.js';
 import {
   expectedChannelMbps,
   planRebalance,
@@ -48,6 +50,9 @@ import {
 import { sessionNameFor } from './sessionName.js';
 import { SWITCHER_CACHE_KEY, type SwitcherHubLike } from './switcherHubTypes.js';
 import { sessionsHash } from './service.js';
+
+/** recent-eras emission cap per channel in the switcher doc (newest last) */
+const DOC_ERAS_CAP = 8;
 
 export interface SwitcherBlockedEntry {
   channelId: string;
@@ -107,7 +112,9 @@ export class SwitcherSync {
     private readonly cache: InstanceCache,
     private readonly config: AppConfig,
     private readonly hub: SwitcherHubLike,
+    private readonly eraStore: EraStoreLike,
     private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
+    private readonly now: () => Date = () => new Date(),
   ) {}
 
   private nodeConfig(instanceId: string, nodeId: string): RestreamerNodeConfig | null {
@@ -277,13 +284,36 @@ export class SwitcherSync {
       const onDemand = g.allCold ? true : undefined;
 
       const payload = JSON.parse(g.profilePayload) as AribHlsParams;
+      const segmentSeconds = payload.hls?.segmentSeconds ?? 5;
+
+      // controller-minted era anchor for the switcher's deterministic
+      // multi-replica numbering (eraStore.ts) — idempotent, so an unchanged
+      // activeUpstreamId across successive compute passes returns the
+      // existing era untouched (doc hash stable). Backfills era 0 for every
+      // channel on the first compute after this feature's deploy, and
+      // catches every admin-driven selection change (placement
+      // create/update/reorder/delete, channel enable) the same way a
+      // failover switch does — activeUpstreamId is always defined here
+      // (only unset when there is no emitted upstream at all, which the
+      // `upstreams.length < 1` check above already ruled out).
+      const nowMs = this.now().getTime();
+      await this.eraStore.ensureEra(g.channelId, activeUpstreamId!, nowMs);
+      const listSize = payload.hls?.listSize ?? 120;
+      const eras = await this.eraStore.recentEras(
+        g.channelId,
+        drainHorizonMs(segmentSeconds, listSize),
+        DOC_ERAS_CAP,
+        nowMs,
+      );
+
       channels.push({
         slug: g.slug,
-        segmentSeconds: payload.hls?.segmentSeconds ?? 5,
+        segmentSeconds,
         upstreams,
         ...(activeUpstreamId !== undefined ? { activeUpstreamId } : {}),
         ...(onDemandIdle !== undefined ? { onDemandIdle } : {}),
         ...(onDemand !== undefined ? { onDemand } : {}),
+        eras,
       });
     }
 
@@ -349,6 +379,46 @@ export class SwitcherSync {
   /** revision the replicas are expected to report (the last broadcast doc's) */
   getExpectedRevision(): string | null {
     return this.lastBroadcastRevision;
+  }
+
+  /**
+   * Fold a status frame's per-channel `eraOffsets` (variant -> eraIndex(as
+   * string) -> chain constant) into eraStore, resolving each reported slug
+   * to its channel id first. Channels without `eraOffsets`, or whose slug no
+   * longer resolves to a channel (deleted meanwhile), are skipped silently —
+   * a stale/racing report is not an error. Not part of the op chain: eraStore
+   * serializes its own writes and touches only restream_switcher_eras.
+   */
+  async recordEraOffsetsInner(channels: SwitcherChannelStatus[]): Promise<void> {
+    const withOffsets = channels.filter((c) => c.eraOffsets !== undefined);
+    if (withOffsets.length === 0) return;
+
+    const slugs = withOffsets.map((c) => c.slug);
+    const rows = await this.db
+      .selectFrom('restream_channels')
+      .select(['id', 'slug'])
+      .where('slug', 'in', slugs)
+      .execute();
+    const channelIdBySlug = new Map(rows.map((r) => [r.slug, r.id]));
+
+    for (const c of withOffsets) {
+      const channelId = channelIdBySlug.get(c.slug);
+      if (!channelId) continue;
+      // reshape variant -> eraIndexStr -> value into per-era variant -> value groups
+      const byEra = new Map<number, Record<string, number>>();
+      for (const [variant, perEra] of Object.entries(c.eraOffsets!)) {
+        for (const [eraIndexStr, value] of Object.entries(perEra)) {
+          const eraIndex = Number(eraIndexStr);
+          if (!Number.isInteger(eraIndex)) continue;
+          let group = byEra.get(eraIndex);
+          if (!group) byEra.set(eraIndex, (group = {}));
+          group[variant] = value;
+        }
+      }
+      for (const [eraIndex, offsets] of byEra) {
+        await this.eraStore.recordOffsets(channelId, eraIndex, offsets);
+      }
+    }
   }
 
   // ---------- rebalance driver ----------

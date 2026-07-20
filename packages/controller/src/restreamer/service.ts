@@ -50,6 +50,7 @@ import type { InstancePoller } from '../tvh/poller.js';
 import { httpError } from '../util/httpError.js';
 import { buildRawArgvParams } from './argv/index.js';
 import type { RestreamerClient } from './client.js';
+import { EraStore } from './eraStore.js';
 import { FAILOVER_TICK_MS, FailoverSync, type ResetOutcome } from './failoverSync.js';
 import { midProcedure, placementIndicators } from './failoverPolicy.js';
 import { OnDemandEngine, type OnDemandChannelTick } from './onDemand.js';
@@ -386,6 +387,8 @@ export class RestreamerService {
   private readonly sourcesDebounce = new Map<string, NodeJS.Timeout>();
   /** switcher-side sync (desired doc, pushes, rebalance driver) — shares this op chain */
   private readonly switcherSync: SwitcherSync;
+  /** era anchor history for the switcher's deterministic multi-replica numbering — shared by switcherSync and failoverSync, self-serializing (not part of this op chain) */
+  private readonly eraStore: EraStore;
   /** four-probe engine over the delivery path; probe state is pulled by the pollers */
   readonly probeEngine: ProbeEngine;
   /** serialized failover orchestrator — shares this op chain via failoverTick */
@@ -449,7 +452,9 @@ export class RestreamerService {
     },
     private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {
-    this.switcherSync = new SwitcherSync(db, cache, config, switcherHub, events);
+    const eraStore = new EraStore(db, events);
+    this.eraStore = eraStore;
+    this.switcherSync = new SwitcherSync(db, cache, config, switcherHub, eraStore, events);
     this.probeEngine = new ProbeEngine(
       () => this.probeTargets(),
       () => this.allProbeSettings(),
@@ -476,6 +481,7 @@ export class RestreamerService {
         markCutoverComplete: (placementId) => this.markCutoverCompleteInner(placementId),
         deleteCutoverPlacement: (placementId) => this.deleteCutoverPlacementInner(placementId),
       },
+      eraStore,
       undefined,
       events,
     );
@@ -3041,6 +3047,19 @@ export class RestreamerService {
    */
   noteSwitcherDemand(events: DemandEvent[]): void {
     this.onDemand.noteDemand(events);
+  }
+
+  /**
+   * Replica-reported per-variant chain constants (status frame `eraOffsets`)
+   * folded into eraStore. Fire-and-forget and NOT run through the op chain —
+   * eraStore serializes its own writes and touches only
+   * restream_switcher_eras, so it never needs to interleave with channel/
+   * placement mutations or node pushes.
+   */
+  noteSwitcherEraOffsets(channels: SwitcherChannelStatus[]): void {
+    void this.switcherSync.recordEraOffsetsInner(channels).catch((err) => {
+      console.error('restreamer: recording era offsets failed:', err);
+    });
   }
 
   /** one rebalance evaluation, serialized; moves route through the failover queue */

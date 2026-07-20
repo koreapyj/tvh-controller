@@ -909,3 +909,110 @@ describe('SwitcherSync: switcher push failed/healed event-log emission', () => {
     await h.destroy();
   });
 });
+
+// ---------- eras (switcher deterministic-numbering anchors) ----------
+
+describe('computeSwitcherDoc: eras', () => {
+  async function insertFailoverRow(
+    h: Harness,
+    fields: { channelId: string; fromPlacementId: string | null; toPlacementId: string },
+  ): Promise<void> {
+    await h.db
+      .insertInto('restream_failover_state')
+      .values({
+        channel_id: fields.channelId,
+        from_placement_id: fields.fromPlacementId,
+        to_placement_id: fields.toPlacementId,
+        phase: 'complete',
+        trigger_reason: 'manual',
+        trigger_node_id: null,
+        trigger_detail: null,
+        suppress_from: 0,
+        drain_until: null,
+        started_at: '2026-01-01 00:00:00',
+        updated_at: '2026-01-01 00:00:00',
+        activation_uuid: null,
+      })
+      .execute();
+  }
+
+  it('backfills era 0 (splicePdtMs null) for every channel on the first computeSwitcherDoc call', async () => {
+    const h = await setup();
+    const { placements } = await seedRedundant(h);
+
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(ch.eras).toEqual([
+      { eraIndex: 0, upstreamId: placements[0]!.id, splicePdtMs: null, offsets: {} },
+    ]);
+    await h.destroy();
+  });
+
+  it('an admin-path selection change (a new failover row target) mints a new era with a non-null splicePdtMs; eras are newest-last', async () => {
+    const h = await setup();
+    const { channel, placements } = await seedRedundant(h);
+    // era 0 already backfilled by the create-channel push above
+    await h.service.computeSwitcherDoc();
+
+    vi.useFakeTimers();
+    try {
+      const fixedNow = new Date('2026-06-01T00:00:00.000Z');
+      vi.setSystemTime(fixedNow);
+
+      // simulate an admin/failover-driven selection change onto the other placement
+      await insertFailoverRow(h, {
+        channelId: channel.id,
+        fromPlacementId: placements[0]!.id,
+        toPlacementId: placements[1]!.id,
+      });
+
+      const { doc } = await h.service.computeSwitcherDoc();
+      const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+      expect(ch.eras).toHaveLength(2);
+      expect(ch.eras[0]).toMatchObject({ eraIndex: 0, upstreamId: placements[0]!.id, splicePdtMs: null });
+      expect(ch.eras[1]).toMatchObject({
+        eraIndex: 1,
+        upstreamId: placements[1]!.id,
+        splicePdtMs: fixedNow.getTime(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+    await h.destroy();
+  });
+
+  it('repeat computeSwitcherDoc passes targeting the SAME placement never mint a new era (idempotent)', async () => {
+    const h = await setup();
+    await seedRedundant(h);
+    const first = await h.service.computeSwitcherDoc();
+    const second = await h.service.computeSwitcherDoc();
+    const chFirst = first.doc.channels.find((c) => c.slug === 'bbb')!;
+    const chSecond = second.doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(chSecond.eras).toEqual(chFirst.eras);
+    expect(chFirst.eras).toHaveLength(1);
+    await h.destroy();
+  });
+
+  it('replica-reported eraOffsets (via recordEraOffsetsInner / noteSwitcherEraOffsets) show up in the doc eras', async () => {
+    const h = await setup();
+    await seedRedundant(h);
+    await h.service.computeSwitcherDoc(); // era 0 exists
+
+    h.service.noteSwitcherEraOffsets([
+      {
+        slug: 'bbb',
+        activeUpstreamId: null,
+        upstreams: [],
+        lastSwitch: null,
+        eraOffsets: { v0: { '0': 42 } },
+      },
+    ]);
+    // flush the fire-and-forget internal promise chain
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'bbb')!;
+    expect(ch.eras[0]!.offsets).toEqual({ v0: 42 });
+    await h.destroy();
+  });
+});

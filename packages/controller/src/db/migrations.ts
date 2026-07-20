@@ -972,6 +972,34 @@ migrations['024_activation_uuid'] = {
   },
 };
 
+migrations['025_switcher_eras'] = {
+  async up(db: Kysely<unknown>): Promise<void> {
+    // controller-minted era anchors for the deterministic multi-replica
+    // switcher numbering scheme: one row per (channel, era) — a failover
+    // switch or admin selection change mints a new era via eraStore.ensureEra
+    // (idempotent — repeat stamps of an unchanged selection are no-ops).
+    // offsets accumulates replica-reported per-variant chain constants
+    // (JSON string, app-managed — first-write-wins, see eraStore.ts).
+    await db.schema
+      .createTable('restream_switcher_eras')
+      .addColumn('id', 'varchar(36)', (c) => c.primaryKey())
+      .addColumn('channel_id', 'varchar(36)', (c) =>
+        c.notNull().references('restream_channels.id').onDelete('cascade'),
+      )
+      .addColumn('era_index', 'integer', (c) => c.notNull())
+      .addColumn('placement_id', 'varchar(36)', (c) => c.notNull())
+      // null only for era 0 (no prior era to splice from)
+      .addColumn('splice_pdt_ms', 'bigint')
+      .addColumn('offsets', 'json', (c) => c.notNull())
+      .addColumn('created_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))
+      .addUniqueConstraint('uq_switcher_eras_channel_index', ['channel_id', 'era_index'])
+      .execute();
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    await db.schema.dropTable('restream_switcher_eras').execute();
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

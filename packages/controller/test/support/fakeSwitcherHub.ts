@@ -6,22 +6,32 @@
  * at SWITCHER_CACHE_KEY, standing in for the real hub's status merge.
  */
 
-import type { SwitcherChannelStatus, SwitcherDesiredState, SwitcherNodeStatus } from '@tvhc/shared';
+import type {
+  EraAnchor,
+  SwitchReason,
+  SwitcherChannelStatus,
+  SwitcherDesiredState,
+  SwitcherNodeStatus,
+} from '@tvhc/shared';
 import { SWITCHER_CACHE_KEY, type SwitcherHubLike } from '../../src/restreamer/switcherHubTypes.js';
 import type { InstanceCache } from '../../src/state/instanceCache.js';
 
 export class FakeSwitcherHub implements SwitcherHubLike {
   docs: SwitcherDesiredState[] = [];
-  switches: Array<{ slug: string; upstreamId: string }> = [];
+  switches: Array<{ slug: string; upstreamId: string; era?: EraAnchor; reason?: SwitchReason }> = [];
   connected = 1;
 
   broadcastDoc(doc: SwitcherDesiredState): void {
     this.docs.push(structuredClone(doc));
   }
 
-  broadcastSwitch(slug: string, upstreamId: string): number {
+  broadcastSwitch(
+    slug: string,
+    upstreamId: string,
+    opts?: { era?: EraAnchor; reason?: SwitchReason },
+  ): number {
     if (this.connected === 0) return 0;
-    this.switches.push({ slug, upstreamId });
+    this.switches.push({ slug, upstreamId, era: opts?.era, reason: opts?.reason });
     return this.connected;
   }
 

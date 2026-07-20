@@ -36,7 +36,7 @@
  */
 
 import { type Static, Type } from '@sinclair/typebox';
-import { SessionName, SwitcherChannelStatus, SwitcherDesiredState } from './restreamer-contract.js';
+import { EraAnchor, SessionName, SwitchReason, SwitcherChannelStatus, SwitcherDesiredState } from './restreamer-contract.js';
 
 export const WS_PROTOCOL_VERSION = 1;
 
@@ -72,6 +72,9 @@ export const WsSwitch = Type.Object({
   type: Type.Literal('switch'),
   slug: SessionName,
   upstreamId: Type.String(),
+  /** controller-minted anchor for the era this switch begins */
+  era: Type.Optional(EraAnchor),
+  reason: Type.Optional(SwitchReason),
 });
 export type WsSwitch = Static<typeof WsSwitch>;
 

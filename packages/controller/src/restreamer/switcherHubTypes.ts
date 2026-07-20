@@ -20,7 +20,7 @@
 // it (doc broadcast, switch commands) — consumers depend on this, not on the
 // hub class, so the hub and its callers can evolve independently.
 
-import type { SwitcherDesiredState } from '@tvhc/shared';
+import type { EraAnchor, SwitchReason, SwitcherDesiredState } from '@tvhc/shared';
 
 /** Synthetic cache.switchers key for the single aggregate replica-merged status entry. */
 export const SWITCHER_CACHE_KEY = 'switcher';
@@ -36,7 +36,12 @@ export interface DemandEvent {
 export interface SwitcherHubLike {
   /** Send the desired doc to every connected replica. */
   broadcastDoc(doc: SwitcherDesiredState): void;
-  /** Send a switch command to every connected replica; returns how many received it. */
-  broadcastSwitch(slug: string, upstreamId: string): number;
+  /**
+   * Send a switch command to every connected replica; returns how many
+   * received it. `era` is the controller-minted anchor this switch begins
+   * (see eraStore.ts); `reason` is the real trigger reason, both carried in
+   * the WsSwitch frame.
+   */
+  broadcastSwitch(slug: string, upstreamId: string, opts?: { era?: EraAnchor; reason?: SwitchReason }): number;
   connectedCount(): number;
 }

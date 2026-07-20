@@ -219,6 +219,23 @@ export interface RestreamPlaylistMembersTable {
   channel_id: string;
 }
 
+/**
+ * controller-minted era anchor history for the switcher's deterministic
+ * multi-replica numbering scheme — one row per (channel, era_index), unique
+ * on that pair. era_index 0's splice_pdt_ms is always null (no prior era to
+ * splice from); offsets is a JSON string, variant -> chain constant C_v,
+ * first-write-wins (see restreamer/eraStore.ts).
+ */
+export interface RestreamSwitcherErasTable {
+  id: string;
+  channel_id: string;
+  era_index: number;
+  placement_id: string;
+  splice_pdt_ms: number | null;
+  offsets: string;
+  created_at: ColumnType<Date, string, never>;
+}
+
 /** persisted history row: failovers, outages, drift, failed pushes etc */
 export interface EventLogTable {
   id: Generated<number>;
@@ -244,5 +261,6 @@ export interface Database {
   restream_node_state: RestreamNodeStateTable;
   restream_playlists: RestreamPlaylistsTable;
   restream_playlist_members: RestreamPlaylistMembersTable;
+  restream_switcher_eras: RestreamSwitcherErasTable;
   event_log: EventLogTable;
 }

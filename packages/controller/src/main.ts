@@ -116,6 +116,7 @@ async function main(): Promise<void> {
           events: eventLog,
           getDoc: async () => (await restreamer!.computeSwitcherDoc()).doc,
           onDemand: (events) => restreamer?.noteSwitcherDemand(events),
+          onEraOffsets: (channels) => restreamer?.noteSwitcherEraOffsets(channels),
           getExpectedRevision: () => restreamer?.switcherExpectedRevision() ?? null,
           publicUrl: config.restreamer.switcher.publicUrl,
           serverVersion: process.env.npm_package_version ?? 'unknown',

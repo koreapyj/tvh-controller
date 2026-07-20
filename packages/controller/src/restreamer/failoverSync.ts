@@ -45,6 +45,7 @@ import type {
   FailoverPhase,
   FailoverTriggerReason,
   NodeProbeSettings,
+  SwitchReason,
 } from '@tvhc/shared';
 import type { AppConfig } from '../config.js';
 import type { Db } from '../db/db.js';
@@ -58,17 +59,20 @@ import {
   recordSnapshot,
   type AdmissionHistory,
 } from './admission.js';
+import type { EraStoreLike } from './eraStore.js';
 import {
   LAG_DISCOVERY_TIMEOUT_MS,
   RETRIGGER_BACKOFF_MAX_MS,
   RETRIGGER_BACKOFF_MIN_MS,
   SWITCH_REISSUE_MS,
   STOP_CONFIRM_TIMEOUT_MS,
+  drainHorizonMs,
   midProcedure,
   pastCommitPoint,
   planFailoverStep,
   rejectionSummary,
   selectTarget,
+  switchReasonFor,
   type FailoverCandidate,
 } from './failoverPolicy.js';
 import type { ProbeSnapshot } from './probeEngine.js';
@@ -195,6 +199,7 @@ export class FailoverSync {
     private readonly probes: () => ProbeSnapshot,
     private readonly settings: () => Promise<Map<string, NodeProbeSettings>>,
     private readonly hooks: FailoverSyncHooks,
+    private readonly eraStore: EraStoreLike,
     private readonly now: () => Date = () => new Date(),
     private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
   ) {}
@@ -497,7 +502,7 @@ export class FailoverSync {
         /* defaults */
       }
     }
-    return Math.min(seg * list, 3600) * 1000;
+    return drainHorizonMs(seg, list);
   }
 
   // -------------------------------------------------------------------------
@@ -805,7 +810,7 @@ export class FailoverSync {
           row!.phase === 'awaiting-switch-confirm' &&
           this.now().getTime() - this.lastSwitchIssueMs >= SWITCH_REISSUE_MS
         ) {
-          await this.issueSwitch(channel.slug, row!.to_placement_id);
+          await this.issueSwitch(channelId, channel.slug, row!.to_placement_id, switchReasonFor(row!.trigger_reason as FailoverTriggerReason));
         }
         return;
       }
@@ -816,7 +821,7 @@ export class FailoverSync {
         continue;
       }
       if (step.action === 'issue-switch') {
-        const issued = await this.issueSwitch(channel.slug, row!.to_placement_id);
+        const issued = await this.issueSwitch(channelId, channel.slug, row!.to_placement_id, switchReasonFor(row!.trigger_reason as FailoverTriggerReason));
         if (!issued) return; // retry next tick
         await this.setPhase(channelId, 'awaiting-switch-confirm');
         row!.phase = 'awaiting-switch-confirm';
@@ -903,13 +908,22 @@ export class FailoverSync {
   }
 
   /**
-   * Broadcast the switch to every connected replica. Zero connections =
-   * not issued — the caller retries next tick, and once confirmation is
-   * awaited the SWITCH_REISSUE_MS loop re-broadcasts (a replica that
-   * reconnects meanwhile also converges via the doc it receives on connect).
+   * Stamp the era this switch begins (idempotent — a re-issue of an
+   * unconfirmed switch or a retry targeting the same placement is a no-op)
+   * and broadcast the switch + anchor to every connected replica. Zero
+   * connections = not issued — the caller retries next tick, and once
+   * confirmation is awaited the SWITCH_REISSUE_MS loop re-broadcasts (a
+   * replica that reconnects meanwhile also converges via the doc it
+   * receives on connect).
    */
-  private async issueSwitch(slug: string, toPlacementId: string): Promise<boolean> {
-    const sent = this.hub.broadcastSwitch(slug, toPlacementId);
+  private async issueSwitch(
+    channelId: string,
+    slug: string,
+    toPlacementId: string,
+    reason: SwitchReason,
+  ): Promise<boolean> {
+    const era = await this.eraStore.ensureEra(channelId, toPlacementId, this.now().getTime());
+    const sent = this.hub.broadcastSwitch(slug, toPlacementId, { era, reason });
     if (sent === 0) {
       console.error(`restreamer: failover switch for "${slug}" failed: no switcher replicas connected`);
       return false;
