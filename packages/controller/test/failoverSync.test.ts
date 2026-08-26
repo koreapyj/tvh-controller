@@ -1262,6 +1262,18 @@ describe('FailoverSync: event-log emission', () => {
     const afterRetarget = await failoverRow(h.db, chanId);
     expect(afterRetarget!.to_placement_id).not.toBe(originalTarget);
     expect(afterRetarget!.activation_uuid).toBe(beforeRetarget!.activation_uuid);
+
+    h.snapshot.lag.set(afterRetarget!.to_placement_id, lagOk(2));
+    await h.sync.tick(); // retargeted target reaches issue-switch
+    const era = await h.db
+      .selectFrom('restream_switcher_eras')
+      .select(['placement_id', 'session_key'])
+      .where('channel_id', '=', chanId)
+      .executeTakeFirstOrThrow();
+    expect(era).toEqual({
+      placement_id: afterRetarget!.to_placement_id,
+      session_key: beforeRetarget!.activation_uuid,
+    });
   });
 });
 
@@ -1928,7 +1940,7 @@ describe('FailoverSync: switch broadcast with no connected replicas', () => {
 
   it('an unconfirmed switch re-broadcasts after SWITCH_REISSUE_MS', async () => {
     const h = await setup();
-    const { aId, bId } = await seedTwoPlacementChannel(h);
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
     h.snapshot.lag.set(aId, lagFail(40));
     h.snapshot.lag.set(bId, lagOk(2));
 
@@ -1944,6 +1956,10 @@ describe('FailoverSync: switch broadcast with no connected replicas', () => {
     await h.sync.tick();
     expect(h.hub.switches).toHaveLength(2);
     expect(h.hub.switches[1]).toMatchObject({ slug: 'chan1', upstreamId: bId });
+    expect(h.hub.switches[1]!.era).toEqual(h.hub.switches[0]!.era);
+    expect(
+      await h.db.selectFrom('restream_switcher_eras').selectAll().where('channel_id', '=', chanId).execute(),
+    ).toHaveLength(1);
   });
 });
 
@@ -2137,6 +2153,40 @@ describe('FailoverSync: issueSwitch stamps an era anchor and the real trigger re
     expect(sent.era).toEqual(persisted[0]);
     // era 0 is stamped with the activation wall-clock time like any other era
     expect(sent.era!.splicePdtMs).toBe(h.nowMs());
+    const persistedRow = await h.db
+      .selectFrom('restream_switcher_eras')
+      .select(['session_key', 'placement_id'])
+      .where('channel_id', '=', chanId)
+      .executeTakeFirstOrThrow();
+    expect(persistedRow).toEqual({ session_key: bId, placement_id: bId });
+  });
+
+  it('an on-demand switch persists the activation UUID as its session key', async () => {
+    const h = await setup();
+    const chanId = await insertChannel(h.db, { slug: 'allcold-era' });
+    const placementId = await insertPlacement(h.db, {
+      channelId: chanId,
+      instanceId: 'zoneA',
+      nodeId: 'n1',
+      mode: 'cold',
+    });
+    seedNode(h.cache, 'zoneA', 'n1');
+    seedSwitcherStatus(h.cache, [swChan('allcold-era', null, [{ id: placementId, healthy: true }])]);
+    h.snapshot.lag.set(placementId, lagOk(2));
+
+    await h.sync.requestFailover(chanId, { reason: 'on-demand', detail: 'viewer demand' });
+    await h.sync.tick();
+
+    const row = await failoverRow(h.db, chanId);
+    expect(row!.activation_uuid).toBeTruthy();
+    const persisted = await h.db
+      .selectFrom('restream_switcher_eras')
+      .select(['placement_id', 'session_key'])
+      .where('channel_id', '=', chanId)
+      .executeTakeFirstOrThrow();
+    expect(persisted).toEqual({ placement_id: placementId, session_key: row!.activation_uuid });
+    expect(h.hub.switches[0]!.era).toEqual((await h.eraStore.recentEras(chanId, 3_600_000, 8, h.nowMs()))[0]);
+    await h.destroy();
   });
 
   it('a manual selection broadcasts reason "manual" with the minted era anchor', async () => {

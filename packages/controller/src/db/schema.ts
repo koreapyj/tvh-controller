@@ -232,6 +232,8 @@ export interface RestreamSwitcherErasTable {
   channel_id: string;
   era_index: number;
   placement_id: string;
+  /** controller-internal upstream session identity; null only on pre-026 legacy rows */
+  session_key: string | null;
   splice_pdt_ms: number | null;
   offsets: string;
   created_at: ColumnType<Date, string, never>;

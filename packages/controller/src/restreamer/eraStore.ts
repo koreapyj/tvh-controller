@@ -23,7 +23,8 @@
  * (failover switch, admin placement change, first activation) and switcher
  * replicas derive per-variant segment numbering from it — fire-and-forget
  * stamping, no controller→node fetches involved. `ensureEra` is idempotent
- * (repeat calls targeting the same placement are no-ops); `recordOffsets`
+ * (repeat calls targeting the same placement and session identity are no-ops);
+ * `recordOffsets`
  * folds in replica-reported chain constants, first-write-wins per variant
  * key, never overwriting a disagreeing later report (logged instead).
  */
@@ -40,6 +41,7 @@ interface EraRow {
   channel_id: string;
   era_index: number;
   placement_id: string;
+  session_key: string | null;
   splice_pdt_ms: number | null;
   offsets: string;
 }
@@ -83,7 +85,7 @@ export class EraStore {
   private async latest(channelId: string): Promise<EraRow | null> {
     const row = await this.db
       .selectFrom('restream_switcher_eras')
-      .select(['channel_id', 'era_index', 'placement_id', 'splice_pdt_ms', 'offsets'])
+      .select(['channel_id', 'era_index', 'placement_id', 'session_key', 'splice_pdt_ms', 'offsets'])
       .where('channel_id', '=', channelId)
       .orderBy('era_index', 'desc')
       .executeTakeFirst();
@@ -92,20 +94,26 @@ export class EraStore {
 
   /**
    * Idempotent: if the latest era for this channel already targets
-   * `placementId`, it is returned unchanged — the passed `splicePdtMs` is
-   * ignored, so repeat stamps of an unchanged selection (e.g. a re-issued
-   * unconfirmed switch, or successive computeDoc passes) never perturb the
-   * anchor or churn the switcher doc hash. Otherwise a new era is inserted
-   * at latest.eraIndex + 1 (or 0 for the channel's first era), stamped with
-   * the passed `splicePdtMs` — era 0 included (callers pass the activation
-   * wall-clock time). A null `splicePdtMs` is merely tolerated for legacy
-   * era-0 rows minted before activation-time stamping; new rows always
-   * carry the activation/splice time.
+   * `placementId` and `sessionKey`, it is returned unchanged — the passed
+   * `splicePdtMs` is ignored, so repeat stamps of an unchanged selection and
+   * session (e.g. a re-issued unconfirmed switch, or successive computeDoc
+   * passes) never perturb the anchor or churn the switcher doc hash. A null
+   * legacy session key deliberately does not match any live session. Otherwise
+   * a new era is inserted at latest.eraIndex + 1 (or 0 for the channel's first
+   * era), stamped with the passed `splicePdtMs` — era 0 included (callers pass
+   * the activation wall-clock time). A null `splicePdtMs` is merely tolerated
+   * for legacy era-0 rows minted before activation-time stamping; new rows
+   * always carry the activation/splice time.
    */
-  async ensureEra(channelId: string, placementId: string, splicePdtMs: number | null): Promise<EraAnchor> {
+  async ensureEra(
+    channelId: string,
+    placementId: string,
+    sessionKey: string,
+    splicePdtMs: number | null,
+  ): Promise<EraAnchor> {
     return this.serialize(async () => {
       const latest = await this.latest(channelId);
-      if (latest && latest.placement_id === placementId) {
+      if (latest && latest.placement_id === placementId && latest.session_key === sessionKey) {
         return toAnchor(latest);
       }
       const eraIndex = latest ? latest.era_index + 1 : 0;
@@ -116,6 +124,7 @@ export class EraStore {
           channel_id: channelId,
           era_index: eraIndex,
           placement_id: placementId,
+          session_key: sessionKey,
           splice_pdt_ms: splicePdtMs,
           offsets: '{}',
           created_at: now(),
@@ -155,7 +164,7 @@ export class EraStore {
   async recentEras(channelId: string, drainGraceMs: number, cap: number, nowMs: number): Promise<EraAnchor[]> {
     const rows = await this.db
       .selectFrom('restream_switcher_eras')
-      .select(['channel_id', 'era_index', 'placement_id', 'splice_pdt_ms', 'offsets'])
+      .select(['channel_id', 'era_index', 'placement_id', 'session_key', 'splice_pdt_ms', 'offsets'])
       .where('channel_id', '=', channelId)
       .orderBy('era_index', 'asc')
       .execute();
@@ -176,20 +185,20 @@ export class EraStore {
   /**
    * Fold replica-reported chain constants into the era's persisted offsets,
    * first-write-wins per variant key:
-   * - unknown variant key: sanity-checked against the PRECEDING era's
-   *   persisted value for the same variant (when known) — the chained
-   *   numbering design means labels are globally consecutive across eras, so
-   *   a lower value than the preceding era's would mean numbering went
-   *   backwards; rejected and logged rather than persisted.
+   * - unknown variant key: persist it.
    * - already-persisted key, identical value: no-op.
    * - already-persisted key, different value: a later disagreeing replica
    *   report — the persisted value is authoritative and is never
    *   overwritten; logs a warning (system-detected anomaly).
    * Unknown era (pruned, or a stale report for a not-yet-visible era): the
    * whole call is a silent no-op, nothing to record against.
+   *
+   * Resolves true only when at least one previously unknown variant key was
+   * persisted. A newer session may legitimately have a lower raw chain
+   * constant than the preceding era, so no cross-era regression check occurs.
    */
-  async recordOffsets(channelId: string, eraIndex: number, offsets: Record<string, number>): Promise<void> {
-    if (Object.keys(offsets).length === 0) return;
+  async recordOffsets(channelId: string, eraIndex: number, offsets: Record<string, number>): Promise<boolean> {
+    if (Object.keys(offsets).length === 0) return false;
     return this.serialize(async () => {
       const row = await this.db
         .selectFrom('restream_switcher_eras')
@@ -197,18 +206,7 @@ export class EraStore {
         .where('channel_id', '=', channelId)
         .where('era_index', '=', eraIndex)
         .executeTakeFirst();
-      if (!row) return;
-
-      let prevOffsets: Record<string, number> | null = null;
-      if (eraIndex > 0) {
-        const prevRow = await this.db
-          .selectFrom('restream_switcher_eras')
-          .select('offsets')
-          .where('channel_id', '=', channelId)
-          .where('era_index', '=', eraIndex - 1)
-          .executeTakeFirst();
-        if (prevRow) prevOffsets = JSON.parse(prevRow.offsets) as Record<string, number>;
-      }
+      if (!row) return false;
 
       const persisted = JSON.parse(row.offsets) as Record<string, number>;
       let changed = false;
@@ -216,16 +214,6 @@ export class EraStore {
       for (const [variant, value] of Object.entries(offsets)) {
         const existing = persisted[variant];
         if (existing === undefined) {
-          const prevValue = prevOffsets?.[variant];
-          if (prevValue !== undefined && value < prevValue) {
-            this.events.log({
-              type: 'warning',
-              service: 'restreamer',
-              source: 'switcher',
-              message: `era offsets regression rejected: channel ${channelId} era ${eraIndex} variant "${variant}" reported ${value} < previous era's ${prevValue}`,
-            });
-            continue;
-          }
           persisted[variant] = value;
           changed = true;
         } else if (existing !== value) {
@@ -248,6 +236,7 @@ export class EraStore {
           message: `era offsets conflict: channel ${channelId} era ${eraIndex}: ${conflicts.join('; ')} — keeping persisted value`,
         });
       }
+      return changed;
     });
   }
 }

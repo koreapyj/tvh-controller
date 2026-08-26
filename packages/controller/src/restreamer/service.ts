@@ -3051,15 +3051,20 @@ export class RestreamerService {
 
   /**
    * Replica-reported per-variant chain constants (status frame `eraOffsets`)
-   * folded into eraStore. Fire-and-forget and NOT run through the op chain —
-   * eraStore serializes its own writes and touches only
-   * restream_switcher_eras, so it never needs to interleave with channel/
-   * placement mutations or node pushes.
+   * folded into eraStore. Fire-and-forget persistence is outside the op chain
+   * because eraStore serializes its own writes; when new keys land, a
+   * serialized switcher push promptly converges replica docs on the canonical
+   * offsets.
    */
   noteSwitcherEraOffsets(channels: SwitcherChannelStatus[]): void {
-    void this.switcherSync.recordEraOffsetsInner(channels).catch((err) => {
-      console.error('restreamer: recording era offsets failed:', err);
-    });
+    void this.switcherSync
+      .recordEraOffsetsInner(channels)
+      .then((changed) => {
+        if (changed) return this.pushAllSwitchers();
+      })
+      .catch((err) => {
+        console.error('restreamer: recording era offsets failed:', err);
+      });
   }
 
   /** one rebalance evaluation, serialized; moves route through the failover queue */

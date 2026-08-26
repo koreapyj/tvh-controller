@@ -5,6 +5,7 @@
  * boundary. No network.
  */
 
+import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { Kysely } from 'kysely';
 import type { SseEvent, SwitcherChannelStatus } from '@tvhc/shared';
@@ -465,6 +466,7 @@ describe('computeSwitcherDoc: failover state placements', () => {
     expect(ch.onDemand).toBe(true);
     expect(ch.onDemandIdle).toBe(true);
     expect(ch.activeUpstreamId).toBe(p1.id);
+    expect(ch.eras).toEqual([]);
     await h.destroy();
   });
 
@@ -526,9 +528,50 @@ describe('computeSwitcherDoc: failover state placements', () => {
     const toUpstream = ch.upstreams.find((u) => u.id === p2.id)!;
     expect(toUpstream.id).toBe(p2.id); // the id contract never changes
     expect(toUpstream.url).toBe(`http://hls.zone2-n1/aaaaaaaa-0000-0000-0000-000000000000`);
+    expect(ch.eras.at(-1)).toMatchObject({ eraIndex: 0, upstreamId: p2.id });
+    const persisted = await h.db
+      .selectFrom('restream_switcher_eras')
+      .select('session_key')
+      .where('channel_id', '=', chan.id)
+      .orderBy('era_index', 'desc')
+      .executeTakeFirstOrThrow();
+    expect(persisted.session_key).toBe('aaaaaaaa-0000-0000-0000-000000000000');
     // the untargeted sibling still resolves under its own placement id
     const otherUpstream = ch.upstreams.find((u) => u.id === p1.id)!;
     expect(otherUpstream.url).toBe(`http://hls.zone1-n1/${p1.id}`);
+    const repeat = await h.service.computeSwitcherDoc();
+    expect(repeat.doc.channels.find((c) => c.slug === 'bbb')!.eras).toEqual(ch.eras);
+    await h.destroy();
+  });
+
+  it('the first on-demand bring-up broadcast contains both the activation URL and its new era', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p-bring-up', profilePayload());
+    const chan = await h.service.createChannel({
+      channelName: 'Bring Up',
+      channelNumber: '92',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', mode: 'cold' }],
+      force: true,
+    });
+    const placement = (await h.service.listChannels()).find((c) => c.id === chan.id)!.placements[0]!;
+    await insertFailoverRow(h, {
+      channelId: chan.id,
+      fromPlacementId: null,
+      toPlacementId: placement.id,
+      triggerReason: 'on-demand',
+      activationUuid: 'cccccccc-0000-0000-0000-000000000000',
+    });
+    h.hub.docs = [];
+
+    await h.service.pushAllSwitchers();
+
+    expect(h.hub.docs).toHaveLength(1);
+    const first = h.hub.docs[0]!.channels.find((channel) => channel.slug === 'bring-up')!;
+    expect(first.upstreams[0]!.url).toBe('http://hls.zone1-n1/cccccccc-0000-0000-0000-000000000000');
+    expect(first.eras).toEqual([
+      { eraIndex: 0, upstreamId: placement.id, splicePdtMs: expect.any(Number), offsets: {} },
+    ]);
     await h.destroy();
   });
 
@@ -915,7 +958,13 @@ describe('SwitcherSync: switcher push failed/healed event-log emission', () => {
 describe('computeSwitcherDoc: eras', () => {
   async function insertFailoverRow(
     h: Harness,
-    fields: { channelId: string; fromPlacementId: string | null; toPlacementId: string },
+    fields: {
+      channelId: string;
+      fromPlacementId: string | null;
+      toPlacementId: string;
+      triggerReason?: string;
+      activationUuid?: string | null;
+    },
   ): Promise<void> {
     await h.db
       .insertInto('restream_failover_state')
@@ -924,14 +973,14 @@ describe('computeSwitcherDoc: eras', () => {
         from_placement_id: fields.fromPlacementId,
         to_placement_id: fields.toPlacementId,
         phase: 'complete',
-        trigger_reason: 'manual',
+        trigger_reason: fields.triggerReason ?? 'manual',
         trigger_node_id: null,
         trigger_detail: null,
         suppress_from: 0,
         drain_until: null,
         started_at: '2026-01-01 00:00:00',
         updated_at: '2026-01-01 00:00:00',
-        activation_uuid: null,
+        activation_uuid: fields.activationUuid ?? null,
       })
       .execute();
   }
@@ -951,6 +1000,12 @@ describe('computeSwitcherDoc: eras', () => {
     ]);
     expect(ch.eras[0]!.splicePdtMs).toBeGreaterThanOrEqual(before);
     expect(ch.eras[0]!.splicePdtMs).toBeLessThanOrEqual(after);
+    const persisted = await h.db
+      .selectFrom('restream_switcher_eras')
+      .select('session_key')
+      .where('channel_id', '=', (await h.service.listChannels()).find((channel) => channel.slug === 'bbb')!.id)
+      .executeTakeFirstOrThrow();
+    expect(persisted.session_key).toBe(placements[0]!.id);
     await h.destroy();
   });
 
@@ -1003,10 +1058,112 @@ describe('computeSwitcherDoc: eras', () => {
     await h.destroy();
   });
 
+  it('mints exactly one era per on-demand activation and none while stopped idle', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p-cycle', profilePayload());
+    const channel = await h.service.createChannel({
+      channelName: 'Cycle', channelNumber: '93', profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', mode: 'cold' }], force: true,
+    });
+    const placement = (await h.service.listChannels()).find((c) => c.id === channel.id)!.placements[0]!;
+    const activate = async (uuid: string) => {
+      await insertFailoverRow(h, {
+        channelId: channel.id, fromPlacementId: null, toPlacementId: placement.id,
+        triggerReason: 'on-demand', activationUuid: uuid,
+      });
+      return h.service.computeSwitcherDoc();
+    };
+
+    expect((await activate('dddddddd-0000-0000-0000-000000000000')).doc.channels.find((c) => c.slug === 'cycle')!.eras).toHaveLength(1);
+    await h.db.deleteFrom('restream_failover_state').where('channel_id', '=', channel.id).execute();
+    expect((await h.service.computeSwitcherDoc()).doc.channels.find((c) => c.slug === 'cycle')!.eras).toHaveLength(1);
+    expect((await activate('eeeeeeee-0000-0000-0000-000000000000')).doc.channels.find((c) => c.slug === 'cycle')!.eras).toHaveLength(2);
+    await h.destroy();
+  });
+
+  it('emits at most 20 recent eras, matching retained history', async () => {
+    const h = await setup();
+    const { channel, placements } = await seedRedundant(h);
+    await h.db.deleteFrom('restream_switcher_eras').where('channel_id', '=', channel.id).execute();
+    await h.db
+      .insertInto('restream_switcher_eras')
+      .values(
+        Array.from({ length: 20 }, (_, eraIndex) => ({
+          id: randomUUID(),
+          channel_id: channel.id,
+          era_index: eraIndex,
+          placement_id: placements[0]!.id,
+          session_key: placements[0]!.id,
+          splice_pdt_ms: Date.now() + eraIndex,
+          offsets: '{}',
+          created_at: '2026-01-01 00:00:00',
+        })),
+      )
+      .execute();
+    const { doc } = await h.service.computeSwitcherDoc();
+    expect(doc.channels.find((c) => c.slug === 'bbb')!.eras).toHaveLength(20);
+    await h.destroy();
+  });
+
+  it('mints one corrective era when an active on-demand session follows a placement-keyed migrated row', async () => {
+    const h = await setup();
+    const p = await h.service.createProfile('p-on-demand', profilePayload());
+    const channel = await h.service.createChannel({
+      channelName: 'OD',
+      channelNumber: '91',
+      profileId: p.id,
+      placements: [{ instanceId: 'zone1', nodeId: 'n1', mode: 'cold' }],
+      force: true,
+    });
+    const placement = (await h.service.listChannels()).find((c) => c.id === channel.id)!.placements[0]!;
+    await h.db
+      .insertInto('restream_switcher_eras')
+      .values({
+        id: randomUUID(), channel_id: channel.id, era_index: 0, placement_id: placement.id,
+        session_key: placement.id, splice_pdt_ms: 1, offsets: '{}', created_at: '2026-01-01 00:00:00',
+      })
+      .execute();
+    await insertFailoverRow(h, {
+      channelId: channel.id,
+      fromPlacementId: null,
+      toPlacementId: placement.id,
+      triggerReason: 'on-demand',
+      activationUuid: 'bbbbbbbb-0000-0000-0000-000000000000',
+    });
+
+    const { doc } = await h.service.computeSwitcherDoc();
+    const ch = doc.channels.find((c) => c.slug === 'od')!;
+    expect(ch.upstreams[0]!.url).toBe('http://hls.zone1-n1/bbbbbbbb-0000-0000-0000-000000000000');
+    expect(ch.eras.map((era) => era.eraIndex)).toEqual([0, 1]);
+    expect(
+      await h.db
+        .selectFrom('restream_switcher_eras')
+        .select('session_key')
+        .where('channel_id', '=', channel.id)
+        .where('era_index', '=', 1)
+        .executeTakeFirstOrThrow(),
+    ).toEqual({ session_key: 'bbbbbbbb-0000-0000-0000-000000000000' });
+    await h.destroy();
+  });
+
   it('replica-reported eraOffsets (via recordEraOffsetsInner / noteSwitcherEraOffsets) show up in the doc eras', async () => {
     const h = await setup();
     await seedRedundant(h);
     await h.service.computeSwitcherDoc(); // era 0 exists
+
+    const broadcastsBefore = h.hub.docs.length;
+    h.service.noteSwitcherEraOffsets([
+      {
+        slug: 'bbb',
+        activeUpstreamId: null,
+        upstreams: [],
+        lastSwitch: null,
+        eraOffsets: { v0: { '0': 42 } },
+      },
+    ]);
+    // flush persistence and the serialized feedback push
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.hub.docs).toHaveLength(broadcastsBefore + 1);
 
     h.service.noteSwitcherEraOffsets([
       {
@@ -1017,8 +1174,8 @@ describe('computeSwitcherDoc: eras', () => {
         eraOffsets: { v0: { '0': 42 } },
       },
     ]);
-    // flush the fire-and-forget internal promise chain
     await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.hub.docs).toHaveLength(broadcastsBefore + 1);
 
     const { doc } = await h.service.computeSwitcherDoc();
     const ch = doc.channels.find((c) => c.slug === 'bbb')!;

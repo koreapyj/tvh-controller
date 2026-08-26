@@ -1,7 +1,6 @@
 /*
- * EraStore tests over the hermetic in-memory SQLite harness: ensureEra
- * idempotency/increment/era-0-stamping/prune, and recordOffsets
- * first-write-wins/conflict/regression semantics.
+ * EraStore tests over the hermetic in-memory SQLite harness: session-aware
+ * era minting, retention, and first-write-wins offset persistence.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -22,12 +21,7 @@ async function seedChannel(db: Kysely<Database>): Promise<string> {
   const profileId = randomUUID();
   await db
     .insertInto('restream_profiles')
-    .values({
-      id: profileId,
-      name: `p-${profileId}`,
-      payload: '{}',
-      updated_at: '2026-01-01 00:00:00',
-    })
+    .values({ id: profileId, name: `p-${profileId}`, payload: '{}', updated_at: '2026-01-01 00:00:00' })
     .execute();
   const channelId = randomUUID();
   await db
@@ -55,50 +49,78 @@ async function makeHarness() {
 }
 
 describe('EraStore.ensureEra', () => {
-  it('returns the existing era unchanged when the latest era already targets the placement', async () => {
-    const { store, channelId, destroy } = await makeHarness();
-    const first = await store.ensureEra(channelId, 'placement-a', 100_000);
-    expect(first).toEqual({ eraIndex: 0, upstreamId: 'placement-a', splicePdtMs: 100_000, offsets: {} });
-
-    // repeat stamp with a DIFFERENT splicePdtMs — must be ignored since the
-    // placement is unchanged (idempotent, no churn)
-    const again = await store.ensureEra(channelId, 'placement-a', 999_000);
+  it('is idempotent only for the same latest placement and session identity', async () => {
+    const { db, store, channelId, destroy } = await makeHarness();
+    const first = await store.ensureEra(channelId, 'placement-a', 'session-a', 100_000);
+    const again = await store.ensureEra(channelId, 'placement-a', 'session-a', 999_000);
     expect(again).toEqual(first);
 
-    const rows = await store.recentEras(channelId, 3600_000, 8, Date.now());
-    expect(rows).toHaveLength(1);
+    const rows = await db
+      .selectFrom('restream_switcher_eras')
+      .select(['placement_id', 'session_key'])
+      .where('channel_id', '=', channelId)
+      .execute();
+    expect(rows).toEqual([{ placement_id: 'placement-a', session_key: 'session-a' }]);
     await destroy();
   });
 
-  it('mints a new era (index + 1) when the placement changes', async () => {
+  it('mints a new era for a session change on the same placement', async () => {
     const { store, channelId, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null);
-    const second = await store.ensureEra(channelId, 'placement-b', 1_000);
-    expect(second).toEqual({ eraIndex: 1, upstreamId: 'placement-b', splicePdtMs: 1_000, offsets: {} });
-
-    const third = await store.ensureEra(channelId, 'placement-c', 2_000);
-    expect(third.eraIndex).toBe(2);
-    expect(third.splicePdtMs).toBe(2_000);
+    await store.ensureEra(channelId, 'placement-a', 'session-a', 100);
+    const second = await store.ensureEra(channelId, 'placement-a', 'session-b', 200);
+    expect(second).toMatchObject({ eraIndex: 1, upstreamId: 'placement-a', splicePdtMs: 200 });
     await destroy();
   });
 
-  it('stamps era 0 with the passed splicePdtMs like any other era', async () => {
+  it('mints a new era for a placement change even when the session key is reused', async () => {
     const { store, channelId, destroy } = await makeHarness();
-    const first = await store.ensureEra(channelId, 'placement-a', 12345);
-    expect(first.eraIndex).toBe(0);
-    expect(first.splicePdtMs).toBe(12345);
+    await store.ensureEra(channelId, 'placement-a', 'shared-session', 100);
+    const second = await store.ensureEra(channelId, 'placement-b', 'shared-session', 200);
+    expect(second).toMatchObject({ eraIndex: 1, upstreamId: 'placement-b', splicePdtMs: 200 });
     await destroy();
   });
 
-  it('tolerates a null splicePdtMs on era 0 (legacy rows minted before activation-time stamping)', async () => {
-    const { store, channelId, destroy } = await makeHarness();
-    const first = await store.ensureEra(channelId, 'placement-a', null);
-    expect(first).toEqual({ eraIndex: 0, upstreamId: 'placement-a', splicePdtMs: null, offsets: {} });
+  it('does not treat a seeded null legacy session key as a wildcard match', async () => {
+    const { db, store, channelId, destroy } = await makeHarness();
+    await db
+      .insertInto('restream_switcher_eras')
+      .values({
+        id: randomUUID(),
+        channel_id: channelId,
+        era_index: 0,
+        placement_id: 'placement-a',
+        session_key: null,
+        splice_pdt_ms: null,
+        offsets: '{}',
+        created_at: '2026-01-01 00:00:00',
+      })
+      .execute();
 
-    // idempotent re-stamp of a legacy null-stamped era 0 must NOT retrofit a
-    // timestamp — the existing anchor is returned unchanged
-    const again = await store.ensureEra(channelId, 'placement-a', 555_000);
-    expect(again).toEqual(first);
+    const corrective = await store.ensureEra(channelId, 'placement-a', 'placement-a', 200);
+    expect(corrective.eraIndex).toBe(1);
+    const rows = await db
+      .selectFrom('restream_switcher_eras')
+      .select(['era_index', 'session_key'])
+      .where('channel_id', '=', channelId)
+      .orderBy('era_index')
+      .execute();
+    expect(rows).toEqual([
+      { era_index: 0, session_key: null },
+      { era_index: 1, session_key: 'placement-a' },
+    ]);
+    await destroy();
+  });
+
+  it('stamps era 0 and persists its session key', async () => {
+    const { db, store, channelId, destroy } = await makeHarness();
+    const first = await store.ensureEra(channelId, 'placement-a', 'activation-uuid', 12345);
+    expect(first).toEqual({ eraIndex: 0, upstreamId: 'placement-a', splicePdtMs: 12345, offsets: {} });
+    const row = await db
+      .selectFrom('restream_switcher_eras')
+      .select(['session_key', 'splice_pdt_ms'])
+      .where('channel_id', '=', channelId)
+      .executeTakeFirstOrThrow();
+    expect(row).toEqual({ session_key: 'activation-uuid', splice_pdt_ms: 12345 });
     await destroy();
   });
 
@@ -106,115 +128,64 @@ describe('EraStore.ensureEra', () => {
     const { store, channelId, destroy } = await makeHarness();
     const base = Date.now();
     for (let i = 0; i < 25; i++) {
-      await store.ensureEra(channelId, `placement-${i}`, base + i * 1000);
+      await store.ensureEra(channelId, `placement-${i}`, `session-${i}`, base + i * 1000);
     }
-    // huge drainGraceMs + a nowMs right after the last splice: every
-    // surviving row's successor splice is well within the horizon
     const kept = await store.recentEras(channelId, 3_600_000_000, 100, base + 25_000);
     expect(kept).toHaveLength(20);
-    // oldest 5 eras (index 0..4) pruned; newest kept, in ascending order
     expect(kept[0]!.eraIndex).toBe(5);
-    expect(kept[kept.length - 1]!.eraIndex).toBe(24);
+    expect(kept.at(-1)!.eraIndex).toBe(24);
     await destroy();
   });
 });
 
 describe('EraStore.recordOffsets', () => {
-  it('first-write-wins: a fresh variant key persists on first report', async () => {
+  it('returns true only when at least one previously unknown key is persisted', async () => {
     const { store, channelId, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null);
-    await store.recordOffsets(channelId, 0, { v0: 100 });
+    await store.ensureEra(channelId, 'placement-a', 'placement-a', null);
+    expect(await store.recordOffsets(channelId, 0, {})).toBe(false);
+    expect(await store.recordOffsets(channelId, 99, { v0: 1 })).toBe(false);
+    expect(await store.recordOffsets(channelId, 0, { v0: 100 })).toBe(true);
+    expect(await store.recordOffsets(channelId, 0, { v0: 100 })).toBe(false);
+    expect(await store.recordOffsets(channelId, 0, { v0: 100, v1: 200 })).toBe(true);
+    await destroy();
+  });
+
+  it('accepts lower chain constants in a newer era', async () => {
+    const { store, channelId, logs, destroy } = await makeHarness();
+    await store.ensureEra(channelId, 'placement-a', 'session-a', null);
+    await store.recordOffsets(channelId, 0, { v0: 500 });
+    await store.ensureEra(channelId, 'placement-b', 'session-b', 1_000);
+
+    expect(await store.recordOffsets(channelId, 1, { v0: 100 })).toBe(true);
+    const eras = await store.recentEras(channelId, 3600_000, 8, Date.now());
+    expect(eras.find((era) => era.eraIndex === 1)!.offsets).toEqual({ v0: 100 });
+    expect(logs).toHaveLength(0);
+    await destroy();
+  });
+
+  it('keeps the first conflicting report, returns false, and logs a warning', async () => {
+    const { store, channelId, logs, destroy } = await makeHarness();
+    await store.ensureEra(channelId, 'placement-a', 'placement-a', null);
+    expect(await store.recordOffsets(channelId, 0, { v0: 100 })).toBe(true);
+    expect(await store.recordOffsets(channelId, 0, { v0: 200 })).toBe(false);
+
     const [era] = await store.recentEras(channelId, 3600_000, 8, Date.now());
     expect(era!.offsets).toEqual({ v0: 100 });
+    expect(logs.filter((event) => event.type === 'warning' && event.message.includes('conflict'))).toHaveLength(1);
     await destroy();
   });
 
-  it('a later conflicting report for an already-persisted key does not overwrite, and logs a warning', async () => {
-    const { store, channelId, logs, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null);
-    await store.recordOffsets(channelId, 0, { v0: 100 });
-    await store.recordOffsets(channelId, 0, { v0: 200 }); // disagreeing later report
-
-    const [era] = await store.recentEras(channelId, 3600_000, 8, Date.now());
-    expect(era!.offsets).toEqual({ v0: 100 }); // unchanged — first write is authoritative
-
-    const warnings = logs.filter((l) => l.type === 'warning' && l.message.includes('conflict'));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatchObject({ service: 'restreamer', source: 'switcher' });
-    expect(warnings[0]!.message).toContain('v0');
-    await destroy();
-  });
-
-  it('an identical repeat report for an already-persisted key is a silent no-op (no log)', async () => {
-    const { store, channelId, logs, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null);
-    await store.recordOffsets(channelId, 0, { v0: 100 });
-    await store.recordOffsets(channelId, 0, { v0: 100 });
-    expect(logs).toHaveLength(0);
-    await destroy();
-  });
-
-  it('rejects and logs a regression: a new variant value lower than the preceding era value is not persisted', async () => {
-    const { store, channelId, logs, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null); // era 0
-    await store.recordOffsets(channelId, 0, { v0: 500 });
-    await store.ensureEra(channelId, 'placement-b', 1_000); // era 1
-
-    await store.recordOffsets(channelId, 1, { v0: 100 }); // regression vs era 0's 500
-    const eras = await store.recentEras(channelId, 3600_000, 8, Date.now());
-    const era1 = eras.find((e) => e.eraIndex === 1)!;
-    expect(era1.offsets).toEqual({}); // rejected, not persisted
-
-    const warnings = logs.filter((l) => l.type === 'warning' && l.message.includes('regression'));
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]!.message).toContain('v0');
-    await destroy();
-  });
-
-  it('accepts a new variant value that is >= the preceding era value', async () => {
-    const { store, channelId, logs, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null); // era 0
-    await store.recordOffsets(channelId, 0, { v0: 500 });
-    await store.ensureEra(channelId, 'placement-b', 1_000); // era 1
-
-    await store.recordOffsets(channelId, 1, { v0: 600 });
-    const eras = await store.recentEras(channelId, 3600_000, 8, Date.now());
-    const era1 = eras.find((e) => e.eraIndex === 1)!;
-    expect(era1.offsets).toEqual({ v0: 600 });
-    expect(logs).toHaveLength(0);
-    await destroy();
-  });
-
-  it('a report for a non-existent era is a silent no-op', async () => {
-    const { store, channelId, logs, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null);
-    await store.recordOffsets(channelId, 99, { v0: 1 }); // era 99 does not exist
-    expect(logs).toHaveLength(0);
-    const eras = await store.recentEras(channelId, 3600_000, 8, Date.now());
-    expect(eras).toHaveLength(1);
-    await destroy();
-  });
-
-  it('an empty offsets object is a no-op', async () => {
-    const { store, channelId, logs, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null);
-    await store.recordOffsets(channelId, 0, {});
-    expect(logs).toHaveLength(0);
-    await destroy();
-  });
-
-  it('is race-safe under concurrent (interleaved) calls for the same channel', async () => {
+  it('is race-safe under concurrent reports for the same channel', async () => {
     const { store, channelId, destroy } = await makeHarness();
-    await store.ensureEra(channelId, 'placement-a', null);
-    // fire concurrently — the in-process serialize() chain must linearize them
-    await Promise.all([
+    await store.ensureEra(channelId, 'placement-a', 'placement-a', null);
+    const results = await Promise.all([
       store.recordOffsets(channelId, 0, { v0: 100 }),
       store.recordOffsets(channelId, 0, { v1: 200 }),
-      store.recordOffsets(channelId, 0, { v0: 999 }), // conflicting, should lose to whichever v0 write landed first
+      store.recordOffsets(channelId, 0, { v0: 999 }),
     ]);
+    expect(results).toEqual([true, true, false]);
     const [era] = await store.recentEras(channelId, 3600_000, 8, Date.now());
-    expect(era!.offsets.v0).toBe(100); // first-write-wins, deterministic under serialization
-    expect(era!.offsets.v1).toBe(200);
+    expect(era!.offsets).toEqual({ v0: 100, v1: 200 });
     await destroy();
   });
 });

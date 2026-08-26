@@ -1369,6 +1369,105 @@ describe('migration 008_restreamer', () => {
     });
   });
 
+  describe('026_switcher_era_sessions', () => {
+    it('backfills legacy session keys and era-0 stamps idempotently; down drops only the column', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '025_switcher_eras');
+        await db
+          .insertInto('restream_profiles')
+          .values({ id: 'prof-1', name: 'default', payload: '{}', updated_at: NOW })
+          .execute();
+        await db
+          .insertInto('restream_channels')
+          .values({
+            id: 'chan-1', slug: 'at-x', channel_name: 'AT-X', channel_number: '9.1',
+            profile_id: 'prof-1', enabled: 1, comment: null, updated_at: NOW,
+          })
+          .execute();
+
+        interface EraRow025 {
+          id: string;
+          channel_id: string;
+          era_index: number;
+          placement_id: string;
+          splice_pdt_ms: number | null;
+          offsets: string;
+          created_at: string;
+        }
+        const oldDb = db as unknown as Kysely<{ restream_switcher_eras: EraRow025 }>;
+        await oldDb
+          .insertInto('restream_switcher_eras')
+          .values([
+            {
+              id: 'era-0', channel_id: 'chan-1', era_index: 0, placement_id: 'placement-a',
+              splice_pdt_ms: null, offsets: '{}', created_at: '2026-01-02 03:04:05',
+            },
+            {
+              id: 'era-1', channel_id: 'chan-1', era_index: 1, placement_id: 'placement-b',
+              splice_pdt_ms: 123_456_789, offsets: '{}', created_at: '2026-01-03 03:04:05',
+            },
+          ])
+          .execute();
+
+        await migrateToLatest(db);
+        const rows = await db
+          .selectFrom('restream_switcher_eras')
+          .select(['era_index', 'placement_id', 'session_key', 'splice_pdt_ms'])
+          .orderBy('era_index')
+          .execute();
+        expect(rows).toEqual([
+          {
+            era_index: 0,
+            placement_id: 'placement-a',
+            session_key: 'placement-a',
+            splice_pdt_ms: Date.parse('2026-01-02T03:04:05Z'),
+          },
+          {
+            era_index: 1,
+            placement_id: 'placement-b',
+            session_key: 'placement-b',
+            splice_pdt_ms: 123_456_789,
+          },
+        ]);
+
+        await expect(runMigrationUp(db, '026_switcher_era_sessions')).resolves.toBeUndefined();
+        expect(
+          await db
+            .selectFrom('restream_switcher_eras')
+            .select(['session_key', 'splice_pdt_ms'])
+            .orderBy('era_index')
+            .execute(),
+        ).toEqual([
+          { session_key: 'placement-a', splice_pdt_ms: Date.parse('2026-01-02T03:04:05Z') },
+          { session_key: 'placement-b', splice_pdt_ms: 123_456_789 },
+        ]);
+
+        await migrateTo(db, '025_switcher_eras');
+        const reverted = await oldDb.selectFrom('restream_switcher_eras').selectAll().orderBy('era_index').execute();
+        expect(reverted).toEqual([
+          {
+            id: 'era-0', channel_id: 'chan-1', era_index: 0, placement_id: 'placement-a',
+            splice_pdt_ms: Date.parse('2026-01-02T03:04:05Z'), offsets: '{}',
+            created_at: expect.any(Date),
+          },
+          {
+            id: 'era-1', channel_id: 'chan-1', era_index: 1, placement_id: 'placement-b',
+            splice_pdt_ms: 123_456_789, offsets: '{}', created_at: expect.any(Date),
+          },
+        ]);
+        expect(reverted[0]).not.toHaveProperty('session_key');
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
   it('enforces UNIQUE(channel_id, instance_id, node_id) on placements', async () => {
     await seed();
     await expect(

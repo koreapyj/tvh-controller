@@ -1002,6 +1002,40 @@ migrations['025_switcher_eras'] = {
   },
 };
 
+migrations['026_switcher_era_sessions'] = {
+  // Resumable because MariaDB commits each ALTER TABLE statement: a process
+  // dying after ADD COLUMN but before migration bookkeeping must be able to
+  // replay this migration without a duplicate-column failure.
+  async up(db: Kysely<unknown>): Promise<void> {
+    if (!(await columnExists(db, 'restream_switcher_eras', 'session_key'))) {
+      await db.schema.alterTable('restream_switcher_eras').addColumn('session_key', 'varchar(64)').execute();
+    }
+    await sql`
+      update restream_switcher_eras
+      set session_key = placement_id
+      where session_key is null
+    `.execute(db);
+    if (isSqliteDb(db)) {
+      await sql`
+        update restream_switcher_eras
+        set splice_pdt_ms = cast(strftime('%s', created_at) as integer) * 1000
+        where era_index = 0 and splice_pdt_ms is null
+      `.execute(db);
+    } else {
+      await sql`
+        update restream_switcher_eras
+        set splice_pdt_ms = unix_timestamp(created_at) * 1000
+        where era_index = 0 and splice_pdt_ms is null
+      `.execute(db);
+    }
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    if (await columnExists(db, 'restream_switcher_eras', 'session_key')) {
+      await db.schema.alterTable('restream_switcher_eras').dropColumn('session_key').execute();
+    }
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

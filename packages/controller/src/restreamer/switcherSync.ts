@@ -52,7 +52,7 @@ import { SWITCHER_CACHE_KEY, type SwitcherHubLike } from './switcherHubTypes.js'
 import { sessionsHash } from './service.js';
 
 /** recent-eras emission cap per channel in the switcher doc (newest last) */
-const DOC_ERAS_CAP = 8;
+const DOC_ERAS_CAP = 20;
 
 export interface SwitcherBlockedEntry {
   channelId: string;
@@ -235,7 +235,13 @@ export class SwitcherSync {
 
     for (const g of groups) {
       const upstreams: SwitcherUpstream[] = [];
+      const sessionKeyByPlacementId = new Map<string, string>();
       for (const p of g.placements) {
+        const sessionKey = sessionNameFor(p.placementId, {
+          activation_uuid: g.rowActivationUuid,
+          to_placement_id: g.rowTarget,
+        });
+        sessionKeyByPlacementId.set(p.placementId, sessionKey);
         const nodeCfg = this.nodeConfig(p.instanceId, p.nodeId);
         if (!nodeCfg) {
           blocked.push({
@@ -257,7 +263,7 @@ export class SwitcherSync {
         }
         upstreams.push({
           id: p.placementId,
-          url: `${nodeCfg.serveUrl}/${sessionNameFor(p.placementId, { activation_uuid: g.rowActivationUuid, to_placement_id: g.rowTarget })}`,
+          url: `${nodeCfg.serveUrl}/${sessionKey}`,
           priority: p.priority,
         });
       }
@@ -287,17 +293,17 @@ export class SwitcherSync {
       const segmentSeconds = payload.hls?.segmentSeconds ?? 5;
 
       // controller-minted era anchor for the switcher's deterministic
-      // multi-replica numbering (eraStore.ts) — idempotent, so an unchanged
-      // activeUpstreamId across successive compute passes returns the
-      // existing era untouched (doc hash stable). Backfills era 0 for every
-      // channel on the first compute after this feature's deploy, and
-      // catches every admin-driven selection change (placement
-      // create/update/reorder/delete, channel enable) the same way a
-      // failover switch does — activeUpstreamId is always defined here
-      // (only unset when there is no emitted upstream at all, which the
-      // `upstreams.length < 1` check above already ruled out).
+      // multi-replica numbering (eraStore.ts). Idle on-demand channels retain
+      // their history but do not mint an era for the reverted placement-id URL.
       const nowMs = this.now().getTime();
-      await this.eraStore.ensureEra(g.channelId, activeUpstreamId!, nowMs);
+      if (onDemandIdle === undefined) {
+        await this.eraStore.ensureEra(
+          g.channelId,
+          activeUpstreamId!,
+          sessionKeyByPlacementId.get(activeUpstreamId!)!,
+          nowMs,
+        );
+      }
       const listSize = payload.hls?.listSize ?? 120;
       const eras = await this.eraStore.recentEras(
         g.channelId,
@@ -389,9 +395,9 @@ export class SwitcherSync {
    * a stale/racing report is not an error. Not part of the op chain: eraStore
    * serializes its own writes and touches only restream_switcher_eras.
    */
-  async recordEraOffsetsInner(channels: SwitcherChannelStatus[]): Promise<void> {
+  async recordEraOffsetsInner(channels: SwitcherChannelStatus[]): Promise<boolean> {
     const withOffsets = channels.filter((c) => c.eraOffsets !== undefined);
-    if (withOffsets.length === 0) return;
+    if (withOffsets.length === 0) return false;
 
     const slugs = withOffsets.map((c) => c.slug);
     const rows = await this.db
@@ -401,6 +407,7 @@ export class SwitcherSync {
       .execute();
     const channelIdBySlug = new Map(rows.map((r) => [r.slug, r.id]));
 
+    let changed = false;
     for (const c of withOffsets) {
       const channelId = channelIdBySlug.get(c.slug);
       if (!channelId) continue;
@@ -416,9 +423,10 @@ export class SwitcherSync {
         }
       }
       for (const [eraIndex, offsets] of byEra) {
-        await this.eraStore.recordOffsets(channelId, eraIndex, offsets);
+        changed = (await this.eraStore.recordOffsets(channelId, eraIndex, offsets)) || changed;
       }
     }
+    return changed;
   }
 
   // ---------- rebalance driver ----------

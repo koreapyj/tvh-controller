@@ -810,7 +810,7 @@ export class FailoverSync {
           row!.phase === 'awaiting-switch-confirm' &&
           this.now().getTime() - this.lastSwitchIssueMs >= SWITCH_REISSUE_MS
         ) {
-          await this.issueSwitch(channelId, channel.slug, row!.to_placement_id, switchReasonFor(row!.trigger_reason as FailoverTriggerReason));
+          await this.issueSwitch(channelId, channel.slug, row!, switchReasonFor(row!.trigger_reason as FailoverTriggerReason));
         }
         return;
       }
@@ -821,7 +821,7 @@ export class FailoverSync {
         continue;
       }
       if (step.action === 'issue-switch') {
-        const issued = await this.issueSwitch(channelId, channel.slug, row!.to_placement_id, switchReasonFor(row!.trigger_reason as FailoverTriggerReason));
+        const issued = await this.issueSwitch(channelId, channel.slug, row!, switchReasonFor(row!.trigger_reason as FailoverTriggerReason));
         if (!issued) return; // retry next tick
         await this.setPhase(channelId, 'awaiting-switch-confirm');
         row!.phase = 'awaiting-switch-confirm';
@@ -919,11 +919,16 @@ export class FailoverSync {
   private async issueSwitch(
     channelId: string,
     slug: string,
-    toPlacementId: string,
+    row: Pick<FailoverRow, 'to_placement_id' | 'activation_uuid'>,
     reason: SwitchReason,
   ): Promise<boolean> {
-    const era = await this.eraStore.ensureEra(channelId, toPlacementId, this.now().getTime());
-    const sent = this.hub.broadcastSwitch(slug, toPlacementId, { era, reason });
+    const era = await this.eraStore.ensureEra(
+      channelId,
+      row.to_placement_id,
+      sessionNameFor(row.to_placement_id, row),
+      this.now().getTime(),
+    );
+    const sent = this.hub.broadcastSwitch(slug, row.to_placement_id, { era, reason });
     if (sent === 0) {
       console.error(`restreamer: failover switch for "${slug}" failed: no switcher replicas connected`);
       return false;
