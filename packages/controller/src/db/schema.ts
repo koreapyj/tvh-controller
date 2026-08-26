@@ -222,8 +222,9 @@ export interface RestreamPlaylistMembersTable {
 /**
  * controller-minted era anchor history for the switcher's deterministic
  * multi-replica numbering scheme — one row per (channel, era_index), unique
- * on that pair. era_index 0's splice_pdt_ms is always null (no prior era to
- * splice from); offsets is a JSON string, variant -> chain constant C_v,
+ * on that pair. splice_pdt_ms is the era's activation/splice wall-clock
+ * time; null appears only on legacy era-0 rows minted before
+ * activation-time stamping. offsets is a JSON string, variant -> chain constant C_v,
  * first-write-wins (see restreamer/eraStore.ts).
  */
 export interface RestreamSwitcherErasTable {

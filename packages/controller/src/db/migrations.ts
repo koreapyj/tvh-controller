@@ -988,7 +988,9 @@ migrations['025_switcher_eras'] = {
       )
       .addColumn('era_index', 'integer', (c) => c.notNull())
       .addColumn('placement_id', 'varchar(36)', (c) => c.notNull())
-      // null only for era 0 (no prior era to splice from)
+      // nullable: null appears only on legacy era-0 rows minted before
+      // activation-time stamping; current rows always carry the
+      // activation/splice time
       .addColumn('splice_pdt_ms', 'bigint')
       .addColumn('offsets', 'json', (c) => c.notNull())
       .addColumn('created_at', 'timestamp', (c) => c.notNull().defaultTo(sql`CURRENT_TIMESTAMP`))

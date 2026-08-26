@@ -2135,7 +2135,8 @@ describe('FailoverSync: issueSwitch stamps an era anchor and the real trigger re
     const persisted = await h.eraStore.recentEras(chanId, 3_600_000, 8, h.nowMs());
     expect(persisted).toHaveLength(1);
     expect(sent.era).toEqual(persisted[0]);
-    expect(sent.era!.splicePdtMs).toBe(null); // era 0: always null regardless of trigger timing
+    // era 0 is stamped with the activation wall-clock time like any other era
+    expect(sent.era!.splicePdtMs).toBe(h.nowMs());
   });
 
   it('a manual selection broadcasts reason "manual" with the minted era anchor', async () => {

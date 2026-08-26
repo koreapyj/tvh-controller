@@ -1,6 +1,6 @@
 /*
  * EraStore tests over the hermetic in-memory SQLite harness: ensureEra
- * idempotency/increment/era-0-null-splice/prune, and recordOffsets
+ * idempotency/increment/era-0-stamping/prune, and recordOffsets
  * first-write-wins/conflict/regression semantics.
  */
 
@@ -57,8 +57,8 @@ async function makeHarness() {
 describe('EraStore.ensureEra', () => {
   it('returns the existing era unchanged when the latest era already targets the placement', async () => {
     const { store, channelId, destroy } = await makeHarness();
-    const first = await store.ensureEra(channelId, 'placement-a', null);
-    expect(first).toEqual({ eraIndex: 0, upstreamId: 'placement-a', splicePdtMs: null, offsets: {} });
+    const first = await store.ensureEra(channelId, 'placement-a', 100_000);
+    expect(first).toEqual({ eraIndex: 0, upstreamId: 'placement-a', splicePdtMs: 100_000, offsets: {} });
 
     // repeat stamp with a DIFFERENT splicePdtMs — must be ignored since the
     // placement is unchanged (idempotent, no churn)
@@ -82,11 +82,23 @@ describe('EraStore.ensureEra', () => {
     await destroy();
   });
 
-  it('forces splicePdtMs to null for era 0 regardless of what the caller passes', async () => {
+  it('stamps era 0 with the passed splicePdtMs like any other era', async () => {
     const { store, channelId, destroy } = await makeHarness();
     const first = await store.ensureEra(channelId, 'placement-a', 12345);
     expect(first.eraIndex).toBe(0);
-    expect(first.splicePdtMs).toBeNull();
+    expect(first.splicePdtMs).toBe(12345);
+    await destroy();
+  });
+
+  it('tolerates a null splicePdtMs on era 0 (legacy rows minted before activation-time stamping)', async () => {
+    const { store, channelId, destroy } = await makeHarness();
+    const first = await store.ensureEra(channelId, 'placement-a', null);
+    expect(first).toEqual({ eraIndex: 0, upstreamId: 'placement-a', splicePdtMs: null, offsets: {} });
+
+    // idempotent re-stamp of a legacy null-stamped era 0 must NOT retrofit a
+    // timestamp — the existing anchor is returned unchanged
+    const again = await store.ensureEra(channelId, 'placement-a', 555_000);
+    expect(again).toEqual(first);
     await destroy();
   });
 
@@ -94,7 +106,7 @@ describe('EraStore.ensureEra', () => {
     const { store, channelId, destroy } = await makeHarness();
     const base = Date.now();
     for (let i = 0; i < 25; i++) {
-      await store.ensureEra(channelId, `placement-${i}`, i === 0 ? null : base + i * 1000);
+      await store.ensureEra(channelId, `placement-${i}`, base + i * 1000);
     }
     // huge drainGraceMs + a nowMs right after the last splice: every
     // surviving row's successor splice is well within the horizon

@@ -96,9 +96,11 @@ export class EraStore {
    * ignored, so repeat stamps of an unchanged selection (e.g. a re-issued
    * unconfirmed switch, or successive computeDoc passes) never perturb the
    * anchor or churn the switcher doc hash. Otherwise a new era is inserted
-   * at latest.eraIndex + 1 (or 0 for the channel's first era). Era 0's
-   * `splicePdtMs` is always forced null regardless of what the caller
-   * passes — the wire contract reserves null exclusively for era 0.
+   * at latest.eraIndex + 1 (or 0 for the channel's first era), stamped with
+   * the passed `splicePdtMs` — era 0 included (callers pass the activation
+   * wall-clock time). A null `splicePdtMs` is merely tolerated for legacy
+   * era-0 rows minted before activation-time stamping; new rows always
+   * carry the activation/splice time.
    */
   async ensureEra(channelId: string, placementId: string, splicePdtMs: number | null): Promise<EraAnchor> {
     return this.serialize(async () => {
@@ -107,7 +109,6 @@ export class EraStore {
         return toAnchor(latest);
       }
       const eraIndex = latest ? latest.era_index + 1 : 0;
-      const effectiveSplice = eraIndex === 0 ? null : splicePdtMs;
       await this.db
         .insertInto('restream_switcher_eras')
         .values({
@@ -115,13 +116,13 @@ export class EraStore {
           channel_id: channelId,
           era_index: eraIndex,
           placement_id: placementId,
-          splice_pdt_ms: effectiveSplice,
+          splice_pdt_ms: splicePdtMs,
           offsets: '{}',
           created_at: now(),
         })
         .execute();
       await this.prune(channelId);
-      return { eraIndex, upstreamId: placementId, splicePdtMs: effectiveSplice, offsets: {} };
+      return { eraIndex, upstreamId: placementId, splicePdtMs, offsets: {} };
     });
   }
 

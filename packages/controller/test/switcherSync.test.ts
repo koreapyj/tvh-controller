@@ -936,15 +936,21 @@ describe('computeSwitcherDoc: eras', () => {
       .execute();
   }
 
-  it('backfills era 0 (splicePdtMs null) for every channel on the first computeSwitcherDoc call', async () => {
+  it('backfills era 0 (stamped with the activation wall-clock time) for every channel on the first computeSwitcherDoc call', async () => {
     const h = await setup();
+    // era 0 may already be backfilled by the create-channel push inside
+    // seedRedundant, so bracket the whole window from before seeding
+    const before = Date.now();
     const { placements } = await seedRedundant(h);
 
     const { doc } = await h.service.computeSwitcherDoc();
+    const after = Date.now();
     const ch = doc.channels.find((c) => c.slug === 'bbb')!;
     expect(ch.eras).toEqual([
-      { eraIndex: 0, upstreamId: placements[0]!.id, splicePdtMs: null, offsets: {} },
+      { eraIndex: 0, upstreamId: placements[0]!.id, splicePdtMs: expect.any(Number), offsets: {} },
     ]);
+    expect(ch.eras[0]!.splicePdtMs).toBeGreaterThanOrEqual(before);
+    expect(ch.eras[0]!.splicePdtMs).toBeLessThanOrEqual(after);
     await h.destroy();
   });
 
@@ -969,7 +975,11 @@ describe('computeSwitcherDoc: eras', () => {
       const { doc } = await h.service.computeSwitcherDoc();
       const ch = doc.channels.find((c) => c.slug === 'bbb')!;
       expect(ch.eras).toHaveLength(2);
-      expect(ch.eras[0]).toMatchObject({ eraIndex: 0, upstreamId: placements[0]!.id, splicePdtMs: null });
+      expect(ch.eras[0]).toMatchObject({
+        eraIndex: 0,
+        upstreamId: placements[0]!.id,
+        splicePdtMs: expect.any(Number),
+      });
       expect(ch.eras[1]).toMatchObject({
         eraIndex: 1,
         upstreamId: placements[1]!.id,
