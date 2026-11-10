@@ -22,7 +22,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
   import { errText } from '../lib/fetchGuard.js';
   import { dateTime } from '../lib/format.js';
   import { notify } from '../lib/notifications.js';
-  import { sessionStateBadge } from '../lib/restreamFields.js';
+  import { sessionStateBadge, tsErrorSummary } from '../lib/restreamFields.js';
   import { appendLogLine, nodeLogStreamUrl, sessionLogStreamUrl } from '../lib/sessionLog.js';
 
   // One session's detail: live info (lag/memory/restarts), restart /
@@ -175,6 +175,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
           {:else}—{/if}
         </div>
         <div>Lag: {session.playlistLagSec !== undefined ? `${Math.round(session.playlistLagSec)}s` : '—'}</div>
+        {#each [tsErrorSummary(session)] as ts}
+          <div title={ts.title}>
+            TS errors: {ts.total ?? '—'}{#if ts.lastDelta !== null}
+              <span class={ts.warn ? 'badge warn' : ''}> (last period +{ts.lastDelta})</span>{/if}
+          </div>
+        {/each}
         <div>
           Memory: {session.memoryRssMb !== undefined ? `${Math.round(session.memoryRssMb)} MB` : '—'}
         </div>

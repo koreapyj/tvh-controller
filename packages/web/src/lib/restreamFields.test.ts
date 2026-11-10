@@ -50,9 +50,29 @@ import {
   sessionStateBadge,
   setByPath,
   SLUG_PATTERN,
+  tsErrorSummary,
   VIDEO_MODE_OPTIONS,
   type ProfileFieldSpec,
 } from './restreamFields.js';
+
+describe('tsErrorSummary', () => {
+  it('reports null total for a daemon without the field and no delta before the first evaluation', () => {
+    const r = tsErrorSummary({});
+    expect(r).toMatchObject({ total: null, lastDelta: null, warn: false });
+    expect(r.title).toContain('does not report');
+  });
+
+  it('shows the cumulative total and the last period increase, warning only when it grew', () => {
+    const grew = tsErrorSummary({ tsErrors: 12, tsErrorProbe: { lastDelta: 3, detail: '3 TS errors in 60s (allowed 0)' } });
+    expect(grew).toMatchObject({ total: 12, lastDelta: 3, warn: true });
+    expect(grew.title).toContain('last probe: 3 TS errors in 60s (allowed 0)');
+    expect(tsErrorSummary({ tsErrors: 12, tsErrorProbe: { lastDelta: 0, detail: null } })).toMatchObject({
+      total: 12,
+      lastDelta: 0,
+      warn: false,
+    });
+  });
+});
 
 function spec(path: string): ProfileFieldSpec {
   const s =

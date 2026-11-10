@@ -44,6 +44,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
     failingProbeBadges,
     probeMeasurementLabel,
     sessionStateBadge,
+    tsErrorSummary,
     uptimeLabel,
   } from '../lib/restreamFields.js';
   import {
@@ -575,7 +576,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
         {#if n.sessions.length || n.pendingRemovals.length}
           <table>
             <thead>
-              <tr><th>Session</th><th>State</th><th>Restarts</th><th>Lag</th></tr>
+              <tr><th>Session</th><th>State</th><th>Restarts</th><th>Lag</th><th>TS err</th></tr>
             </thead>
             <tbody>
               {#each n.sessions as s (s.name)}
@@ -617,11 +618,21 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
                   <td class="small">
                     {#if s.playlistLagSec !== undefined}{Math.round(s.playlistLagSec)}s{:else}<span class="muted">—</span>{/if}
                   </td>
+                  <td class="small">
+                    {#each [tsErrorSummary(s)] as ts}
+                      <span title={ts.title}>
+                        {#if ts.total !== null}{ts.total}{:else}<span class="muted">—</span>{/if}
+                        {#if ts.lastDelta !== null}
+                          <span class={ts.warn ? 'badge warn' : 'muted'}>+{ts.lastDelta}</span>
+                        {/if}
+                      </span>
+                    {/each}
+                  </td>
                 </tr>
               {/each}
               {#each n.pendingRemovals as r (r.name)}
                 <tr>
-                  <td colspan="4" class="small muted">
+                  <td colspan="5" class="small muted">
                     awaiting disposal · {r.channelSlug ?? r.name} · until {dateTime(r.deadline)}
                     {#if r.error}<span class="badge bad" title={r.error}>error</span>{/if}
                   </td>

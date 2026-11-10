@@ -625,6 +625,19 @@ describe('RestreamerPoller', () => {
       await poller.pollOnce(); // only the nested probes.liveness.lastCheckedAt changed
       expect(events).toHaveLength(1);
     });
+
+    it('a session tsErrors change alone re-publishes, so the UI count stays live', async () => {
+      const { events, status, poller } = setup();
+      const session = { name: 'at-x', state: 'running' as const, enabled: true, configHash: 'h', restarts: 0, consecutiveFailures: 0 };
+      status.mockResolvedValueOnce(nodeStatus({ sessions: [{ ...session, tsErrors: 3 }] }));
+      status.mockResolvedValueOnce(nodeStatus({ sessions: [{ ...session, tsErrors: 3 }] }));
+      status.mockResolvedValueOnce(nodeStatus({ sessions: [{ ...session, tsErrors: 5 }] }));
+      await poller.pollOnce();
+      await poller.pollOnce(); // unchanged
+      expect(events).toHaveLength(1);
+      await poller.pollOnce(); // only tsErrors grew
+      expect(events).toHaveLength(2);
+    });
   });
 
   it('start() polls on the interval and stop() halts rescheduling', async () => {

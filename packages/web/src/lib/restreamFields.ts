@@ -413,6 +413,24 @@ export function probeMeasurementLabel(n: RestreamerNodeStatus): string | null {
 }
 
 /**
+ * TS error display for one session: the daemon's cumulative `tsErrors`
+ * (null when the daemon predates the field), the tsError probe's last
+ * per-period increase, and whether that increase should be highlighted.
+ */
+export function tsErrorSummary(s: {
+  tsErrors?: number;
+  tsErrorProbe?: { lastDelta: number | null; detail: string | null };
+}): { total: number | null; lastDelta: number | null; warn: boolean; title: string } {
+  const total = s.tsErrors ?? null;
+  const lastDelta = s.tsErrorProbe?.lastDelta ?? null;
+  const parts: string[] = [];
+  if (total === null) parts.push('daemon does not report TS errors');
+  else parts.push(`${total} corrupt TS packets since the session started`);
+  if (s.tsErrorProbe?.detail) parts.push(`last probe: ${s.tsErrorProbe.detail}`);
+  return { total, lastDelta, warn: (lastDelta ?? 0) > 0, title: parts.join('\n') };
+}
+
+/**
  * User-Agent prefix the restreamer daemon sends on its tvheadend stream
  * requests: `tvhc-restreamer/<version> (<session name>)` (restreamer
  * supervise/session.ts). tvheadend surfaces the UA as the subscription's
