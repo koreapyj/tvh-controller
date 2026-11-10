@@ -99,7 +99,9 @@ export interface RestreamerPollerHooks {
 function statusKey(status: RestreamerNodeStatus): string {
   const { lastPollAt: _lastPollAt, ...meaningful } = status;
   return JSON.stringify(meaningful, (key, value: unknown) =>
-    key === 'lastCheckedAt' ? undefined : value,
+    // tsErrors = per-session cumulative counter that grows on every error; the
+    // tsError probe state (kept in the key) is what the UI shows
+    key === 'lastCheckedAt' || key === 'tsErrors' ? undefined : value,
   );
 }
 

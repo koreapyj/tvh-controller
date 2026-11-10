@@ -184,10 +184,11 @@ interface MutableSnapshot {
   liveness: Map<string, CounterLike>;
   underspeed: Map<string, CounterLike>;
   lag: Map<string, CounterLike>;
+  tsError: Map<string, CounterLike>;
 }
 
 function emptySnapshot(): MutableSnapshot {
-  return { liveness: new Map(), underspeed: new Map(), lag: new Map() };
+  return { liveness: new Map(), underspeed: new Map(), lag: new Map(), tsError: new Map() };
 }
 
 function failing(detail = 'failing'): CounterLike {
@@ -1910,6 +1911,78 @@ describe('FailoverSync: reset-all recovery flow after a fleet-wide probe-failure
     row = await failoverRow(h.db, chanId);
     expect(row).toBeUndefined();
     expect(h.sync.activeChannelId()).toBeNull();
+  });
+});
+
+// ---------- tsError probe trigger ----------
+
+describe('FailoverSync: tsError probe', () => {
+  it('a failed tsError probe on the ACTIVE placement triggers a failover with reason tsError', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    h.snapshot.tsError.set(aId, failing('7 TS errors in 60s (allowed 0)'));
+
+    await h.sync.tick();
+    expect(await failoverRow(h.db, chanId)).toMatchObject({
+      from_placement_id: aId,
+      to_placement_id: bId,
+      trigger_reason: 'tsError',
+      trigger_detail: '7 TS errors in 60s (allowed 0)',
+    });
+  });
+
+  it('a tsError failure on a non-active placement does not trigger', async () => {
+    const h = await setup();
+    const { chanId, bId } = await seedTwoPlacementChannel(h);
+    h.snapshot.tsError.set(bId, failing());
+
+    await h.sync.tick();
+    expect(await failoverRow(h.db, chanId)).toBeUndefined();
+  });
+
+  it('reset: requires-confirm while the original tsError trigger still fails, plain reset OK once it clears', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'complete',
+      triggerReason: 'tsError',
+      triggerNodeId: null,
+      suppressFrom: true,
+    });
+    h.snapshot.tsError.set(aId, failing());
+    expect(await h.sync.requestReset(chanId)).toMatchObject({ rejected: 'requires-confirm' });
+
+    h.snapshot.tsError.delete(aId);
+    expect(await h.sync.requestReset(chanId)).toEqual<ResetOutcome>({ ok: true, queued: true });
+  });
+
+  it('reset stops a hot outgoing placement whose tsError probe is failing (suppress_from=1)', async () => {
+    const h = await setup();
+    const { chanId, aId, bId } = await seedTwoPlacementChannel(h);
+    // currently failed over to B; reset fails back to A, and B (hot) is tsError-failing
+    await seedFailoverRowDirect(h.db, {
+      channelId: chanId,
+      fromPlacementId: aId,
+      toPlacementId: bId,
+      phase: 'complete',
+      triggerReason: 'manual',
+      triggerNodeId: null,
+      suppressFrom: false,
+    });
+    h.cache.switchers.get(SWITCHER_CACHE_KEY)!.channels[0]!.activeUpstreamId = bId;
+    h.snapshot.tsError.set(bId, failing());
+
+    expect(await h.sync.requestReset(chanId)).toEqual<ResetOutcome>({ ok: true, queued: true });
+    await h.sync.tick();
+    expect(await failoverRow(h.db, chanId)).toMatchObject({
+      from_placement_id: bId,
+      to_placement_id: aId,
+      trigger_reason: 'reset',
+      suppress_from: 1,
+    });
   });
 });
 

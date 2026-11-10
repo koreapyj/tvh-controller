@@ -14,6 +14,7 @@ import type { NodeProbeSettings } from '@tvhc/shared';
 import {
   ProbeEngine,
   type NodeProbeTarget,
+  type NodeSessionsView,
   type PlacementProbeTarget,
   type ProbeTargets,
 } from '../src/restreamer/probeEngine.js';
@@ -49,6 +50,7 @@ function cfg(overrides: Partial<NodeProbeSettings> = {}): NodeProbeSettings {
     liveness: { timeoutSeconds: 5, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 },
     underspeed: { timeoutSeconds: 5, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 },
     lag: { timeoutSeconds: 30, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 },
+    tsError: { maxErrors: 0, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1 },
     ...overrides,
   };
 }
@@ -69,8 +71,9 @@ function placementTarget(
   nodeId: string,
   slug: string,
   playlistUrl: string | null,
+  sessionName: string = placementId,
 ): PlacementProbeTarget {
-  return { channelId, placementId, instanceId, nodeId, slug, playlistUrl };
+  return { channelId, placementId, instanceId, nodeId, slug, playlistUrl, sessionName };
 }
 
 /** media playlist; segments optionally carrying a PDT tag (lag tests) */
@@ -118,6 +121,8 @@ interface Setup {
   setTargets: (t: ProbeTargets) => void;
   setSettings: (m: Map<string, NodeProbeSettings>) => void;
   setNow: (d: Date) => void;
+  /** polled daemon status seen by the tsError probe (null = unknown node) */
+  setNodeSessions: (v: NodeSessionsView | null) => void;
   /** one engine round, then advance the injected clock 10s so the next round is due */
   tick: () => Promise<void>;
   changes: string[];
@@ -129,6 +134,7 @@ function setup(): Setup {
   let targets: ProbeTargets = { nodes: [], placements: [] };
   let settings = new Map<string, NodeProbeSettings>();
   let now = new Date('2026-01-01T00:00:00.000Z');
+  let nodeSessions: NodeSessionsView | null = null;
   const changes: string[] = [];
   const logs: LoggedEvent[] = [];
   const engine = new ProbeEngine(
@@ -138,6 +144,7 @@ function setup(): Setup {
     fetchImpl,
     () => now,
     { log: (e) => logs.push(e) },
+    () => nodeSessions,
   );
   return {
     engine,
@@ -151,6 +158,9 @@ function setup(): Setup {
     },
     setNow: (d) => {
       now = d;
+    },
+    setNodeSessions: (v) => {
+      nodeSessions = v;
     },
     tick: async () => {
       await engine.tick();
@@ -400,6 +410,170 @@ describe('ProbeEngine: lag', () => {
   });
 });
 
+// ---------- tsError ----------
+
+describe('ProbeEngine: tsError', () => {
+  let poll = 0;
+  function view(tsErrors: number | undefined, over: Partial<NodeSessionsView> = {}): NodeSessionsView {
+    poll += 1;
+    return {
+      lastPollAt: new Date(Date.UTC(2026, 0, 1, 0, 0, poll)).toISOString(),
+      reachable: true,
+      sessions: [{ name: 'plc1', ...(tsErrors !== undefined ? { tsErrors } : {}) }],
+      ...over,
+    };
+  }
+  function seed(s: Setup, ts: Partial<NodeProbeSettings['tsError']> = {}): void {
+    s.setTargets({
+      nodes: [],
+      placements: [placementTarget('chan1', 'plc1', 'z1', 'n1', 'ch1', null)],
+    });
+    s.setSettings(
+      new Map([
+        [
+          nk('z1', 'n1'),
+          cfg({
+            tsError: { maxErrors: 0, periodSeconds: 0.001, successThreshold: 1, failureThreshold: 1, ...ts },
+          }),
+        ],
+      ]),
+    );
+  }
+  async function feed(s: Setup, ...values: Array<number | undefined>): Promise<void> {
+    for (const v of values) {
+      s.setNodeSessions(view(v));
+      await s.tick();
+    }
+  }
+
+  it('first sample only sets the baseline (no state)', async () => {
+    const s = setup();
+    seed(s);
+    await feed(s, 5);
+    expect(s.engine.tsErrorStatus('plc1')).toBeNull();
+  });
+
+  it('delta within the allowance is ok', async () => {
+    const s = setup();
+    seed(s, { maxErrors: 3 });
+    await feed(s, 10, 13);
+    const st = s.engine.tsErrorStatus('plc1')!;
+    expect(st.failed).toBe(false);
+    expect(st.lastResult).toBe('ok');
+    expect(st.lastDelta).toBe(3);
+  });
+
+  it('delta over the allowance fails and trips; baseline advances each check', async () => {
+    const s = setup();
+    seed(s, { maxErrors: 3 });
+    await feed(s, 10, 14);
+    const st = s.engine.tsErrorStatus('plc1')!;
+    expect(st.failed).toBe(true);
+    expect(st.lastDelta).toBe(4);
+    expect(st.detail).toBe('4 TS errors in 0.001s (allowed 3)');
+    expect(s.changes).toContain('chan1');
+    // no further errors -> delta 0 -> ok -> clears (successThreshold 1)
+    await feed(s, 14);
+    const after = s.engine.tsErrorStatus('plc1')!;
+    expect(after.lastDelta).toBe(0);
+    expect(after.failed).toBe(false);
+  });
+
+  it('a counter reset (cur < baseline) is a SKIP that only re-baselines', async () => {
+    const s = setup();
+    seed(s);
+    await feed(s, 10, 10);
+    const before = s.engine.tsErrorStatus('plc1');
+    await feed(s, 2);
+    expect(s.engine.tsErrorStatus('plc1')).toEqual(before);
+    await feed(s, 3); // delta 1 against the NEW baseline 2
+    expect(s.engine.tsErrorStatus('plc1')!.lastDelta).toBe(1);
+  });
+
+  it('no new poll since the last check is a SKIP', async () => {
+    const s = setup();
+    seed(s);
+    const v = view(0);
+    s.setNodeSessions(v);
+    await s.tick(); // baseline
+    s.setNodeSessions({ ...v, sessions: [{ name: 'plc1', tsErrors: 50 }] }); // same lastPollAt
+    await s.tick();
+    expect(s.engine.tsErrorStatus('plc1')).toBeNull();
+  });
+
+  it('missing tsErrors field (old daemon), absent session, unreachable node and unknown node are SKIPs', async () => {
+    const s = setup();
+    seed(s);
+    await feed(s, 0, 1); // real state exists
+    const before = s.engine.tsErrorStatus('plc1');
+    await feed(s, undefined);
+    s.setNodeSessions(view(9, { sessions: [] }));
+    await s.tick();
+    s.setNodeSessions(view(9, { reachable: false }));
+    await s.tick();
+    s.setNodeSessions(null);
+    await s.tick();
+    expect(s.engine.tsErrorStatus('plc1')).toEqual(before);
+  });
+
+  it('failureThreshold 0 measures but never trips', async () => {
+    const s = setup();
+    seed(s, { failureThreshold: 0 });
+    await feed(s, 0, 5, 10);
+    const st = s.engine.tsErrorStatus('plc1')!;
+    expect(st.failed).toBe(false);
+    expect(st.consecutiveFailures).toBe(2);
+    expect(st.lastDelta).toBe(5);
+  });
+
+  it('periodSeconds 0 clears state and baseline', async () => {
+    const s = setup();
+    seed(s);
+    await feed(s, 0, 5);
+    expect(s.engine.tsErrorStatus('plc1')).not.toBeNull();
+    seed(s, { periodSeconds: 0 });
+    await feed(s, 6);
+    expect(s.engine.tsErrorStatus('plc1')).toBeNull();
+    // re-enabling starts over from a fresh baseline (no stale delta)
+    seed(s);
+    await feed(s, 100);
+    expect(s.engine.tsErrorStatus('plc1')).toBeNull();
+  });
+
+  it('a different session name (on-demand activation) re-baselines instead of diffing', async () => {
+    const s = setup();
+    seed(s);
+    await feed(s, 0, 0);
+    s.setTargets({
+      nodes: [],
+      placements: [placementTarget('chan1', 'plc1', 'z1', 'n1', 'ch1', null, 'act-uuid')],
+    });
+    s.setNodeSessions(view(0, { sessions: [{ name: 'act-uuid', tsErrors: 40 }] }));
+    await s.tick();
+    expect(s.engine.tsErrorStatus('plc1')!.lastDelta).toBe(0);
+  });
+
+  it('trip/clear log names the slug', async () => {
+    const s = setup();
+    seed(s);
+    await feed(s, 0, 2);
+    expect(s.logs).toHaveLength(1);
+    expect(s.logs[0]!.type).toBe('warning');
+    expect(s.logs[0]!.message).toContain('tsError probe tripped for "ch1" on node.z1.n1');
+    await feed(s, 2);
+    expect(s.logs[1]!.type).toBe('normal');
+  });
+
+  it('prune drops state for a placement that left the target set', async () => {
+    const s = setup();
+    seed(s);
+    await feed(s, 0, 2);
+    s.setTargets({ nodes: [], placements: [] });
+    await s.tick();
+    expect(s.engine.snapshot().tsError.size).toBe(0);
+  });
+});
+
 // ---------- period gating / pruning ----------
 
 describe('ProbeEngine: per-target period gating and pruning', () => {
@@ -460,6 +634,7 @@ describe('ProbeEngine: per-target period gating and pruning', () => {
             liveness: { timeoutSeconds: 5, periodSeconds: 0, successThreshold: 1, failureThreshold: 1 },
             underspeed: { timeoutSeconds: 5, periodSeconds: 0, successThreshold: 1, failureThreshold: 1 },
             lag: { timeoutSeconds: 30, periodSeconds: 0, successThreshold: 1, failureThreshold: 1 },
+            tsError: { maxErrors: 0, periodSeconds: 0, successThreshold: 1, failureThreshold: 1 },
           },
         ],
       ]),

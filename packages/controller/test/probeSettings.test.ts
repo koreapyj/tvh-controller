@@ -16,6 +16,7 @@ const SETTINGS: NodeProbeSettings = {
   liveness: { timeoutSeconds: 5, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
   underspeed: { timeoutSeconds: 20, periodSeconds: 45, successThreshold: 2, failureThreshold: 3 },
   lag: { timeoutSeconds: 30, periodSeconds: 10, successThreshold: 3, failureThreshold: 3 },
+  tsError: { maxErrors: 2, periodSeconds: 60, successThreshold: 3, failureThreshold: 1 },
 };
 
 describe('row <-> NodeProbeSettings round-trip', () => {
@@ -30,6 +31,7 @@ describe('row <-> NodeProbeSettings round-trip', () => {
       liveness: { timeoutSeconds: 3, periodSeconds: 7, successThreshold: 1, failureThreshold: 5 },
       underspeed: { timeoutSeconds: 15, periodSeconds: 30, successThreshold: 4, failureThreshold: 2 },
       lag: { timeoutSeconds: 60, periodSeconds: 20, successThreshold: 2, failureThreshold: 4 },
+      tsError: { maxErrors: 5, periodSeconds: 30, successThreshold: 1, failureThreshold: 2 },
     };
     const row = probeSettingsToRow('zone2', 'n2', custom);
     expect(rowToProbeSettings(row)).toEqual(custom);
@@ -44,6 +46,7 @@ describe('NODE_PROBE_DEFAULTS', () => {
       liveness: { timeoutSeconds: 5, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
       underspeed: { timeoutSeconds: 20, periodSeconds: 45, successThreshold: 2, failureThreshold: 3 },
       lag: { timeoutSeconds: 30, periodSeconds: 10, successThreshold: 3, failureThreshold: 3 },
+      tsError: { maxErrors: 0, periodSeconds: 60, successThreshold: 3, failureThreshold: 0 },
     });
   });
 });
@@ -94,6 +97,20 @@ describe('parseProbeSettings', () => {
   it('an underrun key in the body is ignored (no error)', () => {
     const withUnderrun = { ...SETTINGS, underrun: { minSpeed: 0.98, periodSeconds: 15, successThreshold: 2, failureThreshold: 3 } };
     expect(parseProbeSettings(withUnderrun)).toEqual(SETTINGS);
+  });
+
+  it('a missing tsError group falls back to the defaults (older web/MCP clients)', () => {
+    const { tsError: _omit, ...legacy } = SETTINGS;
+    expect(parseProbeSettings(legacy)).toEqual({ ...legacy, tsError: NODE_PROBE_DEFAULTS.tsError });
+  });
+
+  it('validates tsError.maxErrors as a non-negative integer, naming the field', () => {
+    const bad = (maxErrors: unknown) => ({ ...SETTINGS, tsError: { ...SETTINGS.tsError, maxErrors } });
+    expect(parseProbeSettings(bad(0)).tsError.maxErrors).toBe(0);
+    expect(() => parseProbeSettings(bad(-1))).toThrow(/tsError\.maxErrors must be a non-negative integer/);
+    expect(() => parseProbeSettings(bad(1.5))).toThrow(/tsError\.maxErrors must be a non-negative integer/);
+    expect(() => parseProbeSettings(bad(undefined))).toThrow(/tsError\.maxErrors/);
+    expect(() => parseProbeSettings({ ...SETTINGS, tsError: 'x' })).toThrow(/tsError must be an object/);
   });
 
   it('rejects NaN/non-numeric values the same as missing ones', () => {

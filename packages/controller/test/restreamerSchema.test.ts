@@ -302,6 +302,10 @@ describe('migration 008_restreamer', () => {
         lag_period_seconds: 10,
         lag_success_threshold: 3,
         lag_failure_threshold: 3,
+        ts_error_max_errors: 0,
+        ts_error_period_seconds: 60,
+        ts_error_success_threshold: 3,
+        ts_error_failure_threshold: 0,
         updated_at: NOW,
         ...overrides,
       };
@@ -1462,6 +1466,53 @@ describe('migration 008_restreamer', () => {
           },
         ]);
         expect(reverted[0]).not.toHaveProperty('session_key');
+      } finally {
+        await db.destroy();
+      }
+    });
+  });
+
+  describe('027_ts_error_probe', () => {
+    it('adds the ts_error_* columns with measure-only defaults to existing rows; up is replayable; down drops them', async () => {
+      const sqlite = new BetterSqlite3(':memory:');
+      sqlite.pragma('foreign_keys = ON');
+      const db = new Kysely<Database>({
+        dialect: new SqliteDialect({ database: sqlite }),
+        plugins: [new SqliteCompatPlugin()],
+      });
+      try {
+        await migrateTo(db, '026_switcher_era_sessions');
+        const oldDb = db as unknown as Kysely<{ restream_node_probes: Record<string, unknown> }>;
+        await oldDb
+          .insertInto('restream_node_probes')
+          .values({
+            instance_id: 'tyo1', node_id: 'node1',
+            liveness_timeout_seconds: 5, liveness_period_seconds: 10,
+            liveness_success_threshold: 2, liveness_failure_threshold: 3,
+            underspeed_timeout_seconds: 20, underspeed_period_seconds: 45,
+            underspeed_success_threshold: 2, underspeed_failure_threshold: 3,
+            lag_timeout_seconds: 30, lag_period_seconds: 10,
+            lag_success_threshold: 3, lag_failure_threshold: 3,
+            updated_at: NOW,
+          })
+          .execute();
+
+        await migrateToLatest(db);
+        const row = await db.selectFrom('restream_node_probes').selectAll().executeTakeFirstOrThrow();
+        expect(row).toMatchObject({
+          ts_error_max_errors: 0,
+          ts_error_period_seconds: 60,
+          ts_error_success_threshold: 3,
+          ts_error_failure_threshold: 0,
+        });
+
+        await expect(runMigrationUp(db, '027_ts_error_probe')).resolves.toBeUndefined();
+
+        await migrateTo(db, '026_switcher_era_sessions');
+        const reverted = await oldDb.selectFrom('restream_node_probes').selectAll().executeTakeFirstOrThrow();
+        expect(reverted).not.toHaveProperty('ts_error_max_errors');
+        expect(reverted).not.toHaveProperty('ts_error_failure_threshold');
+        expect(reverted).toMatchObject({ lag_failure_threshold: 3 });
       } finally {
         await db.destroy();
       }

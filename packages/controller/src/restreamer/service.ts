@@ -464,6 +464,16 @@ export class RestreamerService {
       undefined,
       undefined,
       events,
+      (instanceId, nodeId) => {
+        if (!this.cache.has(instanceId)) return null;
+        const st = this.cache.get(instanceId).restreamers.find((r) => r.nodeId === nodeId);
+        if (!st || st.lastPollAt == null) return null; // never polled
+        return {
+          lastPollAt: st.lastPollAt,
+          reachable: st.reachable,
+          sessions: st.sessions.map((s) => ({ name: s.name, tsErrors: s.tsErrors })),
+        };
+      },
     );
     this.failoverSync = new FailoverSync(
       db,
@@ -841,6 +851,7 @@ export class RestreamerService {
           session: nodeStatus?.sessions.find((s) => s.name === sessionNameFor(p.id, fo)) ?? null,
           indicator: indicators.get(p.id) ?? ('idle' as const),
           lagProbe: this.probeEngine.lagStatus(p.id),
+          tsErrorProbe: this.probeEngine.tsErrorStatus(p.id),
         };
       });
       const { activePlacementId, lastSwitch } = this.switcherView(c.slug);
@@ -2998,10 +3009,12 @@ export class RestreamerService {
           const info = slugMap.get(s.name);
           if (info) this.captureNameSlug(s.name, { slug: info.slug, channelId: info.channelId });
           const lagProbe = info ? this.probeEngine.lagStatus(info.placementId) : null;
+          const tsErrorProbe = info ? this.probeEngine.tsErrorStatus(info.placementId) : null;
           return {
             ...s,
             channelSlug: info?.slug ?? null,
             ...(lagProbe ? { lagProbe } : {}),
+            ...(tsErrorProbe ? { tsErrorProbe } : {}),
           };
         });
       },
@@ -3143,6 +3156,7 @@ export class RestreamerService {
         nodeId: r.node_id,
         slug: r.slug,
         playlistUrl: node.serveUrl ? `${node.serveUrl}/${name}/playlist.m3u8` : null,
+        sessionName: name,
       });
     }
     return { nodes: [...nodes.values()], placements };
@@ -3546,6 +3560,7 @@ export class RestreamerService {
         blockedReason: p.blockedReason,
         state: p.session?.state ?? null,
         lag: [p.lagProbe?.failed ?? false, p.lagProbe?.consecutiveFailures ?? 0],
+        tsError: [p.tsErrorProbe?.failed ?? false, p.tsErrorProbe?.consecutiveFailures ?? 0],
       })),
     });
     if (this.lastChannelPublishKey.get(channelId) === key) return;

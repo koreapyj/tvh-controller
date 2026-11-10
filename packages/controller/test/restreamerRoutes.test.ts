@@ -2170,6 +2170,7 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/probes', () => {
       liveness: { timeoutSeconds: 3, periodSeconds: 8, successThreshold: 1, failureThreshold: 2 },
       underspeed: { timeoutSeconds: 15, periodSeconds: 30, successThreshold: 2, failureThreshold: 4 },
       lag: { timeoutSeconds: 20, periodSeconds: 12, successThreshold: 2, failureThreshold: 2 },
+      tsError: { maxErrors: 1, periodSeconds: 30, successThreshold: 2, failureThreshold: 2 },
     };
     const put = await app.inject({
       method: 'PUT',
@@ -2192,6 +2193,7 @@ describe('GET/PUT /api/restreamer/nodes/:instanceId/:nodeId/probes', () => {
       liveness: { timeoutSeconds: 3, periodSeconds: 8, successThreshold: 1, failureThreshold: 2 },
       underspeed: { timeoutSeconds: 15, periodSeconds: 30, successThreshold: 2, failureThreshold: 4 },
       lag: { timeoutSeconds: 20, periodSeconds: 12, successThreshold: 2, failureThreshold: 2 },
+      tsError: { maxErrors: 1, periodSeconds: 30, successThreshold: 2, failureThreshold: 2 },
     };
     const put = await app.inject({
       method: 'PUT',

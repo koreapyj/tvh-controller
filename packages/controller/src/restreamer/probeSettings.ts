@@ -30,6 +30,8 @@ export const NODE_PROBE_DEFAULTS: NodeProbeSettings = {
   liveness: { timeoutSeconds: 5, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
   underspeed: { timeoutSeconds: 20, periodSeconds: 45, successThreshold: 2, failureThreshold: 3 },
   lag: { timeoutSeconds: 30, periodSeconds: 10, successThreshold: 3, failureThreshold: 3 },
+  // measure-only by default (failureThreshold 0): badge, never a failover
+  tsError: { maxErrors: 0, periodSeconds: 60, successThreshold: 3, failureThreshold: 0 },
 };
 
 type ProbeRow = Omit<RestreamNodeProbesTable, 'updated_at'>;
@@ -54,6 +56,12 @@ export function rowToProbeSettings(r: ProbeRow): NodeProbeSettings {
       successThreshold: r.lag_success_threshold,
       failureThreshold: r.lag_failure_threshold,
     },
+    tsError: {
+      maxErrors: r.ts_error_max_errors,
+      periodSeconds: r.ts_error_period_seconds,
+      successThreshold: r.ts_error_success_threshold,
+      failureThreshold: r.ts_error_failure_threshold,
+    },
   };
 }
 
@@ -77,6 +85,10 @@ export function probeSettingsToRow(
     lag_period_seconds: s.lag.periodSeconds,
     lag_success_threshold: s.lag.successThreshold,
     lag_failure_threshold: s.lag.failureThreshold,
+    ts_error_max_errors: s.tsError.maxErrors,
+    ts_error_period_seconds: s.tsError.periodSeconds,
+    ts_error_success_threshold: s.tsError.successThreshold,
+    ts_error_failure_threshold: s.tsError.failureThreshold,
   };
 }
 
@@ -134,10 +146,30 @@ export function parseProbeSettings(raw: unknown): NodeProbeSettings {
       }),
     };
   };
+  // tsError group is optional on input (older web/MCP clients) — missing = defaults
+  let tsError = NODE_PROBE_DEFAULTS.tsError;
+  if (body.tsError !== undefined) {
+    const g = body.tsError;
+    if (typeof g !== 'object' || g === null) throw httpError(400, 'tsError must be an object');
+    const o = g as Record<string, unknown>;
+    tsError = {
+      maxErrors: assertNumber(o.maxErrors, 'tsError.maxErrors', { integer: true, allowZero: true }),
+      periodSeconds: assertNumber(o.periodSeconds, 'tsError.periodSeconds', { integer: false, allowZero: true }),
+      successThreshold: assertNumber(o.successThreshold, 'tsError.successThreshold', {
+        integer: true,
+        allowZero: true,
+      }),
+      failureThreshold: assertNumber(o.failureThreshold, 'tsError.failureThreshold', {
+        integer: true,
+        allowZero: true,
+      }),
+    };
+  }
   return {
     liveness: thresholds('liveness'),
     underspeed: thresholds('underspeed'),
     lag: thresholds('lag'),
+    tsError: { ...tsError },
   };
 }
 

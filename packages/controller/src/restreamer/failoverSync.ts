@@ -616,6 +616,7 @@ export class FailoverSync {
       const live = snap.liveness.get(key);
       const speed = snap.underspeed.get(key);
       const lag = snap.lag.get(active.id);
+      const tsErr = snap.tsError.get(active.id);
       if (live?.failed) {
         reason = 'liveness';
         detail = live.detail;
@@ -627,6 +628,9 @@ export class FailoverSync {
       } else if (lag?.failed) {
         reason = 'lag';
         detail = lag.detail;
+      } else if (tsErr?.failed) {
+        reason = 'tsError';
+        detail = tsErr.detail;
       }
       if (!reason) {
         // trigger cleared (or never existed) — nothing failing now, so any
@@ -732,6 +736,7 @@ export class FailoverSync {
       const fromFailing =
         !!from &&
         (snap.lag.get(from.id)?.failed === true ||
+          snap.tsError.get(from.id)?.failed === true ||
           snap.liveness.get(nk(from.instance_id, from.node_id))?.failed === true ||
           snap.underspeed.get(nk(from.instance_id, from.node_id))?.failed === true);
       suppressFrom = from && (from.mode === 'cold' || fromFailing) ? 1 : 0;
@@ -1282,6 +1287,10 @@ export class FailoverSync {
       }
       case 'lag': {
         const s = row.from_placement_id ? snap.lag.get(row.from_placement_id) : undefined;
+        return s?.failed ? s.detail : null;
+      }
+      case 'tsError': {
+        const s = row.from_placement_id ? snap.tsError.get(row.from_placement_id) : undefined;
         return s?.failed ? s.detail : null;
       }
       default:

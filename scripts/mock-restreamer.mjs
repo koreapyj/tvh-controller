@@ -132,6 +132,8 @@ function sessionStatuses() {
       name: s.name,
       state: enabled ? 'running' : 'disabled',
       enabled,
+      // cumulative mock "Packet corrupt" count: +1 every ~20s (every other session stays clean)
+      tsErrors: s.name.length % 2 === 0 ? Math.floor((Date.now() - startedMs) / 20000) : 0,
       configHash: configHash(s),
       ...(enabled
         ? {

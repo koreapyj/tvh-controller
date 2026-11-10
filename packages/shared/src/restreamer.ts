@@ -58,12 +58,22 @@ export interface ProbeThresholds {
   failureThreshold: number;
 }
 
-export type ProbeName = 'liveness' | 'underspeed' | 'lag';
+/** TS-error probe: cumulative ffmpeg "Packet corrupt" count compared per period */
+export interface TsErrorProbeThresholds {
+  /** max new TS errors allowed per period before a check fails */
+  maxErrors: number;
+  periodSeconds: number;
+  successThreshold: number;
+  failureThreshold: number;
+}
+
+export type ProbeName = 'liveness' | 'underspeed' | 'lag' | 'tsError';
 
 export interface NodeProbeSettings {
   liveness: ProbeThresholds;
   underspeed: ProbeThresholds;
   lag: ProbeThresholds;
+  tsError: TsErrorProbeThresholds;
 }
 
 export interface NodeSettings {
@@ -105,6 +115,11 @@ export interface LagProbeStatus extends ProbeStatus {
   firstMeasuredAt: string | null;
 }
 
+export interface TsErrorProbeStatus extends ProbeStatus {
+  /** TS errors counted in the last evaluated period; null = never evaluated */
+  lastDelta: number | null;
+}
+
 /** instance-level probe state carried on RestreamerNodeStatus */
 export interface NodeProbeStatus {
   liveness: ProbeStatus;
@@ -130,6 +145,7 @@ export type FailoverTriggerReason =
   | 'liveness'
   | 'underspeed'
   | 'lag'
+  | 'tsError'
   | 'manual'
   | 'reset'
   | 'rebalance'
@@ -223,6 +239,8 @@ export interface RestreamChannelWithStatus extends RestreamChannel {
       indicator: PlacementIndicator;
       /** channel-level lag probe state for this placement; null = not probed */
       lagProbe: LagProbeStatus | null;
+      /** channel-level TS error probe state for this placement; null = not probed */
+      tsErrorProbe: TsErrorProbeStatus | null;
     }
   >;
   /** persisted failover procedure/result for this channel; null = none (Reset hidden) */
@@ -250,6 +268,7 @@ export interface RestreamPlaylist {
 /** SessionStatus enriched with the controller's channel-level probe state */
 export type EnrichedSessionStatus = SessionStatus & {
   lagProbe?: LagProbeStatus;
+  tsErrorProbe?: TsErrorProbeStatus;
   /**
    * Channel slug for display — the session `name` is a bare UUID (a
    * placement id, or an on-demand row's activation_uuid while it targets

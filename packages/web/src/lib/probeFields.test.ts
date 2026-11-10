@@ -25,12 +25,13 @@ function settings(): NodeProbeSettings {
     liveness: { timeoutSeconds: 5, periodSeconds: 10, successThreshold: 2, failureThreshold: 3 },
     underspeed: { timeoutSeconds: 8, periodSeconds: 15, successThreshold: 2, failureThreshold: 3 },
     lag: { timeoutSeconds: 4.5, periodSeconds: 20, successThreshold: 2, failureThreshold: 5 },
+    tsError: { maxErrors: 2, periodSeconds: 60, successThreshold: 3, failureThreshold: 0 },
   };
 }
 
 describe('PROBE_GROUPS / PROBE_FIELDS', () => {
   it('has one group per NodeProbeSettings key, in a stable display order', () => {
-    expect(PROBE_GROUPS.map((g) => g.key)).toEqual(['liveness', 'underspeed', 'lag']);
+    expect(PROBE_GROUPS.map((g) => g.key)).toEqual(['liveness', 'underspeed', 'lag', 'tsError']);
   });
 
   it('liveness/underspeed/lag share the same field shape (timeout/period/success/failure)', () => {
@@ -42,6 +43,15 @@ describe('PROBE_GROUPS / PROBE_FIELDS', () => {
         'failureThreshold',
       ]);
     }
+  });
+
+  it('tsError has its own shape: maxErrors replaces timeoutSeconds', () => {
+    expect(PROBE_FIELDS.tsError.map((f) => f.key)).toEqual([
+      'maxErrors',
+      'periodSeconds',
+      'successThreshold',
+      'failureThreshold',
+    ]);
   });
 });
 
@@ -108,6 +118,18 @@ describe('buildProbesPayload validation', () => {
     const built = buildProbesPayload(vals);
     expect(built.ok).toBe(true);
     if (built.ok) expect(built.payload.lag.timeoutSeconds).toBe(1.25);
+  });
+
+  it('tsError.maxErrors accepts 0 and rejects negatives/decimals', () => {
+    const vals = probesToVals(settings());
+    vals['tsError.maxErrors'] = '0';
+    const built = buildProbesPayload(vals);
+    expect(built.ok).toBe(true);
+    if (built.ok) expect(built.payload.tsError.maxErrors).toBe(0);
+    vals['tsError.maxErrors'] = '-1';
+    expect(buildProbesPayload(vals).ok).toBe(false);
+    vals['tsError.maxErrors'] = '1.5';
+    expect(buildProbesPayload(vals).ok).toBe(false);
   });
 
   it('rejects a non-numeric value', () => {

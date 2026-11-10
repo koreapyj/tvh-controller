@@ -36,6 +36,12 @@
  *             up placement has no playlist yet, while a crashed session is
  *             still caught because its retained playlist goes stale.
  *
+ * - tsError:  per-period delta of the session's cumulative ffmpeg "Packet
+ *             corrupt" count (polled daemon status, no HTTP) > maxErrors =
+ *             fail. SKIPs: node unreachable / session absent / old daemon
+ *             without the field / no new poll since the last check / first
+ *             sample or counter reset (baseline only).
+ *
  * (A fourth probe, underrun, passively read the polled daemon
  * `progress.speed` sample per session. It was retired: ffmpeg's -progress
  * speed/out_time freezes whenever the sparse ARIB subtitle stream stops
@@ -51,7 +57,7 @@
  * nextDueAt, so per-node cadences vary without N timers.
  */
 
-import type { LagProbeStatus, NodeProbeSettings, NodeProbeStatus } from '@tvhc/shared';
+import type { LagProbeStatus, NodeProbeSettings, NodeProbeStatus, TsErrorProbeStatus } from '@tvhc/shared';
 import type { EventLog } from '../state/eventLog.js';
 import { parseLastPdtEndMs, parseMasterVariant, parseNewestSegment } from './hlsParse.js';
 import { applyProbeResult, toProbeStatus, type ProbeCounterState } from './probeState.js';
@@ -80,6 +86,16 @@ export interface PlacementProbeTarget {
   slug: string;
   /** master playlist URL through the node's serveUrl; null = not probeable */
   playlistUrl: string | null;
+  /** daemon session name for this placement (placement id, or the on-demand activation uuid) — keys the polled status lookup */
+  sessionName: string;
+}
+
+/** a node's last polled daemon status, as seen by the ts-error probe */
+export interface NodeSessionsView {
+  /** ISO — when this status was polled; unchanged value = no new sample */
+  lastPollAt: string;
+  reachable: boolean;
+  sessions: Array<{ name: string; tsErrors?: number }>;
 }
 
 export interface ProbeTargets {
@@ -89,6 +105,9 @@ export interface ProbeTargets {
 
 interface UnderspeedCounter extends ProbeCounterState {
   lastSpeedRatio: number | null;
+}
+interface TsErrorCounter extends ProbeCounterState {
+  lastDelta: number | null;
 }
 interface LagCounter extends ProbeCounterState {
   lastLagSec: number | null;
@@ -101,6 +120,8 @@ export interface ProbeSnapshot {
   underspeed: ReadonlyMap<string, UnderspeedCounter>;
   /** keyed by placementId */
   lag: ReadonlyMap<string, LagCounter>;
+  /** keyed by placementId */
+  tsError: ReadonlyMap<string, TsErrorCounter>;
 }
 
 function nk(instanceId: string, nodeId: string): string {
@@ -111,6 +132,9 @@ export class ProbeEngine {
   private readonly liveness = new Map<string, ProbeCounterState>();
   private readonly underspeed = new Map<string, UnderspeedCounter>();
   private readonly lag = new Map<string, LagCounter>();
+  private readonly tsError = new Map<string, TsErrorCounter>();
+  /** per placement: last seen cumulative count + the poll it came from */
+  private readonly tsBaseline = new Map<string, { value: number; pollAt: string; sessionName: string }>();
   /** nextDueAt (ms) per probe kind+target key */
   private readonly due = new Map<string, number>();
   /** round-robin session cursor per node */
@@ -126,6 +150,8 @@ export class ProbeEngine {
     private readonly fetchImpl: typeof fetch = fetch,
     private readonly now: () => Date = () => new Date(),
     private readonly events: Pick<EventLog, 'log'> = { log: () => {} },
+    /** polled daemon status per node (from the InstanceCache); null = unknown node */
+    private readonly getNodeSessions: (instanceId: string, nodeId: string) => NodeSessionsView | null = () => null,
   ) {}
 
   start(): void {
@@ -147,6 +173,7 @@ export class ProbeEngine {
       liveness: this.liveness,
       underspeed: this.underspeed,
       lag: this.lag,
+      tsError: this.tsError,
     };
   }
 
@@ -166,6 +193,12 @@ export class ProbeEngine {
     const s = this.lag.get(placementId);
     if (!s) return null;
     return { ...toProbeStatus(s), lastLagSec: s.lastLagSec, firstMeasuredAt: s.firstMeasuredAt };
+  }
+
+  tsErrorStatus(placementId: string): TsErrorProbeStatus | null {
+    const s = this.tsError.get(placementId);
+    if (!s) return null;
+    return { ...toProbeStatus(s), lastDelta: s.lastDelta };
   }
 
   /** one round; runs only the targets whose period elapsed. Exported for tests. */
@@ -206,6 +239,13 @@ export class ProbeEngine {
         } else if (this.isDue(`lag:${p.placementId}`, cfg.lag.periodSeconds, nowMs)) {
           work.push(this.runLag(p, cfg));
         }
+        if (cfg.tsError.periodSeconds <= 0) {
+          this.tsError.delete(p.placementId);
+          this.tsBaseline.delete(p.placementId);
+          this.due.delete(`tserr:${p.placementId}`);
+        } else if (this.isDue(`tserr:${p.placementId}`, cfg.tsError.periodSeconds, nowMs)) {
+          work.push(this.runTsError(p, cfg));
+        }
       }
       await Promise.all(work.map((w) => w.catch(() => {})));
     } finally {
@@ -227,6 +267,8 @@ export class ProbeEngine {
     for (const key of [...this.liveness.keys()]) if (!nodeKeys.has(key)) this.liveness.delete(key);
     for (const key of [...this.underspeed.keys()]) if (!nodeKeys.has(key)) this.underspeed.delete(key);
     for (const key of [...this.lag.keys()]) if (!placementIds.has(key)) this.lag.delete(key);
+    for (const key of [...this.tsError.keys()]) if (!placementIds.has(key)) this.tsError.delete(key);
+    for (const key of [...this.tsBaseline.keys()]) if (!placementIds.has(key)) this.tsBaseline.delete(key);
     for (const key of [...this.rr.keys()]) if (!nodeKeys.has(key)) this.rr.delete(key);
   }
 
@@ -438,6 +480,37 @@ export class ProbeEngine {
     this.logProbeTransition('lag', p.instanceId, p.nodeId, prev?.failed, merged.failed, merged.detail, p.slug);
   }
 
+  // ---------- tsError (channel-level, polled daemon counter) ----------
+
+  private async runTsError(p: PlacementProbeTarget, cfg: NodeProbeSettings): Promise<void> {
+    const view = this.getNodeSessions(p.instanceId, p.nodeId);
+    if (!view || !view.reachable) return; // SKIP — no trustworthy sample
+    const cur = view.sessions.find((s) => s.name === p.sessionName)?.tsErrors;
+    if (cur === undefined) return; // SKIP — session absent / old daemon without the field
+    const base = this.tsBaseline.get(p.placementId);
+    if (base && base.pollAt === view.lastPollAt) return; // SKIP — no new poll since the last check
+    this.tsBaseline.set(p.placementId, { value: cur, pollAt: view.lastPollAt, sessionName: p.sessionName });
+    // first sample, a different Session object (on-demand name change), or the
+    // counter went backwards (session/daemon restart): baseline only
+    if (!base || base.sessionName !== p.sessionName || cur < base.value) return;
+
+    const delta = cur - base.value;
+    const allowed = cfg.tsError.maxErrors;
+    const result: 'ok' | 'fail' = delta > allowed ? 'fail' : 'ok';
+    const prev = this.tsError.get(p.placementId);
+    const next = applyProbeResult(
+      prev,
+      result,
+      cfg.tsError,
+      this.now(),
+      `${delta} TS errors in ${cfg.tsError.periodSeconds}s (allowed ${allowed})`,
+    );
+    const merged: TsErrorCounter = { ...next, lastDelta: delta };
+    this.tsError.set(p.placementId, merged);
+    if (this.meaningfulChange(prev, merged)) this.onPlacementChange(p.channelId);
+    this.logProbeTransition('tsError', p.instanceId, p.nodeId, prev?.failed, merged.failed, merged.detail, p.slug);
+  }
+
   /** counts/failed changed — not just lastCheckedAt/measurement noise */
   private meaningfulChange(prev: ProbeCounterState | undefined, next: ProbeCounterState): boolean {
     return (
@@ -455,7 +528,7 @@ export class ProbeEngine {
    * so no first-poll baseline guard is needed here.
    */
   private logProbeTransition(
-    kind: 'liveness' | 'underspeed' | 'lag',
+    kind: 'liveness' | 'underspeed' | 'lag' | 'tsError',
     instanceId: string,
     nodeId: string,
     prevFailed: boolean | undefined,

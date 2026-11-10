@@ -34,6 +34,7 @@ export const PROBE_GROUPS: ProbeGroupSpec[] = [
   { key: 'liveness', label: 'Liveness', help: 'delivery-path reachability' },
   { key: 'underspeed', label: 'Underspeed', help: 'segment download vs realtime' },
   { key: 'lag', label: 'Lag', help: 'playlist wall-clock lag' },
+  { key: 'tsError', label: 'TS errors', help: 'ffmpeg "Packet corrupt" count per period' },
 ];
 
 export interface ProbeFieldSpec {
@@ -61,6 +62,8 @@ export const PROBE_FIELDS: Record<ProbeName, ProbeFieldSpec[]> = {
   liveness: [{ key: 'timeoutSeconds', label: 'Timeout (s)', kind: 'float' }, ...COMMON_TAIL],
   underspeed: [{ key: 'timeoutSeconds', label: 'Timeout (s)', kind: 'float' }, ...COMMON_TAIL],
   lag: [{ key: 'timeoutSeconds', label: 'Timeout (s)', kind: 'float' }, ...COMMON_TAIL],
+  // TsErrorProbeThresholds: maxErrors replaces timeoutSeconds
+  tsError: [{ key: 'maxErrors', label: 'Max errors per period', kind: 'int', allowZero: true }, ...COMMON_TAIL],
 };
 
 /** form value key for one group+field pair (group keys collide otherwise: periodSeconds etc.) */

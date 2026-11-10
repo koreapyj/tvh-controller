@@ -227,6 +227,8 @@ export const SessionStatus = Type.Object({
   lastSegmentAt: Type.Optional(Type.String()),
   /** wall-clock lag of the media playlist — the truthful per-session health signal */
   playlistLagSec: Type.Optional(Type.Number()),
+  /** cumulative ffmpeg "Packet corrupt" count over the Session's lifetime (absent on old daemons) */
+  tsErrors: Type.Optional(Type.Integer()),
   /**
    * PAT-probed program number for the current source. Absent when an explicit
    * `programNumber` was supplied or the probe hasn't succeeded yet.

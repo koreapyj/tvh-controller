@@ -1036,6 +1036,35 @@ migrations['026_switcher_era_sessions'] = {
   },
 };
 
+const TS_ERROR_PROBE_COLUMNS: Array<[string, number]> = [
+  ['ts_error_max_errors', 0],
+  ['ts_error_period_seconds', 60],
+  ['ts_error_success_threshold', 3],
+  // 0 = measure-only (badge, never a failover trigger)
+  ['ts_error_failure_threshold', 0],
+];
+
+migrations['027_ts_error_probe'] = {
+  // columnExists-guarded per column: MariaDB commits each ALTER on its own, so
+  // a partially-applied run must be replayable.
+  async up(db: Kysely<unknown>): Promise<void> {
+    for (const [col, def] of TS_ERROR_PROBE_COLUMNS) {
+      if (await columnExists(db, 'restream_node_probes', col)) continue;
+      await db.schema
+        .alterTable('restream_node_probes')
+        .addColumn(col, 'integer', (c) => c.notNull().defaultTo(def))
+        .execute();
+    }
+  },
+  async down(db: Kysely<unknown>): Promise<void> {
+    for (const [col] of TS_ERROR_PROBE_COLUMNS) {
+      if (await columnExists(db, 'restream_node_probes', col)) {
+        await db.schema.alterTable('restream_node_probes').dropColumn(col).execute();
+      }
+    }
+  },
+};
+
 const provider: MigrationProvider = {
   async getMigrations() {
     return migrations;

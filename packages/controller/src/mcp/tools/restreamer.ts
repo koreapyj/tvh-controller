@@ -82,6 +82,13 @@ const probeThresholds = z.object({
   failureThreshold: z.number().int(),
 });
 
+const tsErrorThresholds = z.object({
+  maxErrors: z.number().int().min(0),
+  periodSeconds: z.number(),
+  successThreshold: z.number().int(),
+  failureThreshold: z.number().int(),
+});
+
 export const restreamerTools: ToolDef[] = [
   // ---------- nodes ----------
   tool({
@@ -148,7 +155,7 @@ export const restreamerTools: ToolDef[] = [
   }),
   tool({
     name: 'get_node_probe_settings',
-    description: 'Liveness / underspeed / lag probe thresholds of one node.',
+    description: 'Liveness / underspeed / lag / tsError probe thresholds of one node.',
     input: node,
     annotations: READ,
     run: (a, api) =>
@@ -156,8 +163,15 @@ export const restreamerTools: ToolDef[] = [
   }),
   tool({
     name: 'set_node_probe_settings',
-    description: 'Replace the probe thresholds of one node (all three groups required).',
-    input: { ...node, liveness: probeThresholds, underspeed: probeThresholds, lag: probeThresholds },
+    description:
+      'Replace the probe thresholds of one node (liveness, underspeed, lag required; tsError optional — omitted = defaults: maxErrors 0, period 60s, success 3, failure 0 = measure-only). tsError.maxErrors = allowed ffmpeg "Packet corrupt" count per period.',
+    input: {
+      ...node,
+      liveness: probeThresholds,
+      underspeed: probeThresholds,
+      lag: probeThresholds,
+      tsError: tsErrorThresholds.optional(),
+    },
     annotations: WRITE_IDEMPOTENT,
     run: ({ instanceId: i, nodeId: n, ...body }, api) =>
       api({ method: 'PUT', url: `/api/restreamer/nodes/${p(i)}/${p(n)}/probes`, body }),
