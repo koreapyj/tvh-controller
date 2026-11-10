@@ -37,6 +37,7 @@ import { RestreamerPoller } from './restreamer/poller.js';
 import { RestreamerService, nodeKey } from './restreamer/service.js';
 import { SwitcherHub } from './restreamer/switcherHub.js';
 import { registerEventLogRoutes } from './routes/eventLog.js';
+import { registerMcpRoutes } from './mcp/route.js';
 import type { AppContext } from './routes/context.js';
 import { EventLog } from './state/eventLog.js';
 import { EventBus } from './state/events.js';
@@ -231,6 +232,8 @@ async function main(): Promise<void> {
   registerRestreamerRoutes(app, ctx);
   registerEventRoutes(app, ctx);
   registerEventLogRoutes(app, ctx);
+  // MCP tools call the routes above in-process (app.inject)
+  registerMcpRoutes(app);
   app.get('/healthz', async () => ({ ok: true }));
 
   // serve the built SPA when present (single container, no CORS)

@@ -5,3 +5,5 @@ dist/
 coverage/
 config.yaml
 package-lock.json
+.ref
+.tmp

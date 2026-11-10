@@ -177,6 +177,38 @@ relying on cluster network isolation alone.
    filled-in [`secrets.example.yaml`](deploy/k8s/secrets.example.yaml).
    Keep `replicas: 1` (singleton pollers, in-process serialization).
 
+## MCP endpoint
+
+The controller serves a [Model Context Protocol](https://modelcontextprotocol.io)
+server at **`POST /mcp`** on the same port as the dashboard (Streamable HTTP,
+stateless, JSON responses — no long-lived SSE stream). It is meant for an
+operator bot or agent server to diagnose and operate the controller.
+
+- **Tools wrap the existing HTTP API** in-process (`app.inject`), so
+  validation, errors and side effects are exactly those of the dashboard. A
+  route error comes back as an `isError` result with its HTTP status and error
+  body. Tools cover instances, unified recordings and EPG, master rules, sync,
+  drift and integrity, uploads, the event log, and restreamer nodes, profiles,
+  channels, placements, playlists and failover. SSE streams and the public
+  M3U, XMLTV and logo URLs are not exposed. The definitions live in
+  [`packages/controller/src/mcp/tools/`](packages/controller/src/mcp/tools/).
+- **Write tools are always registered.** They carry MCP annotations
+  (`readOnlyHint` / `destructiveHint` / `idempotentHint`) so the client can
+  ask for confirmation. Destructive examples: delete recordings, delete or
+  purge rules, push all rules, reconcile drift, restreamer deletes, manual
+  switch or reset, and session restart.
+- **Channel identity is name + number.** Tools that filter or target
+  channels take both, and numbers are exact strings (`"9.1"` ≠ `"9.10"`).
+- **Authentication is the same as the dashboard: none in the controller.**
+  Serve `/mcp` only behind Cloudflare Access, or an equivalent layer.
+  - A bot passes Access with a **service token**: send the
+    `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers on every
+    request.
+  - The Access application needs a policy that allows **Service Auth** for
+    that token.
+- Actions taken through MCP are operator-initiated, so like dashboard actions
+  they are **not** written to the event log.
+
 ## First run
 
 1. Open the dashboard, verify the instances show **online**.

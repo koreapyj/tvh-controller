@@ -13,13 +13,15 @@
   },
   "dependencies": {
     "@fastify/static": "^8.0.3",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@sinclair/typebox": "^0.34.13",
     "@tvhc/shared": "workspace:*",
     "fastify": "^5.2.0",
     "kysely": "^0.27.5",
     "mysql2": "^3.12.0",
     "ws": "^8.21.0",
-    "yaml": "^2.6.1"
+    "yaml": "^2.6.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
